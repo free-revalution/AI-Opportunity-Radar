@@ -3,6 +3,9 @@
 Reports per-dependency status (postgres, redis, llm, firecrawl, browser_use,
 telegram, n8n). Each check is wrapped so a single failure never breaks the
 overall endpoint.
+
+Phase 2: postgres check now uses a real injected session so the result
+reflects actual DB connectivity rather than a fresh-engine probe.
 """
 
 from __future__ import annotations
@@ -10,22 +13,21 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.db import get_engine
+from app.db import get_session
 from app.utils import get_logger
 
 router = APIRouter()
 logger = get_logger(__name__)
 
 
-async def _check_postgres() -> dict[str, Any]:
+async def _check_postgres(session: AsyncSession) -> dict[str, Any]:
     try:
-        engine = get_engine()
-        async with engine.connect() as conn:
-            await asyncio.wait_for(conn.execute(text("SELECT 1")), timeout=3.0)
+        await asyncio.wait_for(session.execute(text("SELECT 1")), timeout=3.0)
         return {"status": "healthy"}
     except Exception as exc:  # noqa: BLE001
         return {"status": "down", "error": str(exc)[:200]}
@@ -87,15 +89,17 @@ def _check_n8n() -> dict[str, Any]:
     return {"status": "healthy", "url": s.n8n_base_url}
 
 
-async def health(_: Request) -> dict[str, Any]:
-    """Aggregate health check across every external dependency."""
+@router.get("/health", summary="Aggregated health check")
+async def health_endpoint(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
     postgres, redis_ = await asyncio.gather(
-        _check_postgres(),
+        _check_postgres(session),
         _check_redis(),
         return_exceptions=True,
     )
 
-    # Convert unexpected exceptions into a structured response.
     def _safe(value: Any) -> dict[str, Any]:
         if isinstance(value, Exception):
             return {"status": "down", "error": str(value)[:200]}
@@ -125,11 +129,6 @@ async def health(_: Request) -> dict[str, Any]:
         "version": "0.1.0",
         "components": components,
     }
-
-
-@router.get("/health", summary="Aggregated health check")
-async def health_endpoint(request: Request) -> dict[str, Any]:
-    return await health(request)
 
 
 @router.get("/health/live", summary="Liveness probe (no dependency checks)")

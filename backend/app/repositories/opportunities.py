@@ -1,0 +1,88 @@
+"""Async opportunity repository — all DB access for opportunities."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import Any, Optional
+
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models import Opportunity
+
+
+class OpportunityRepository:
+    """Thin async wrapper over the `opportunities` table.
+
+    Repositories own the SQL; services own the business logic. Keeping
+    them split means tests can fake either side independently.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    # ------------------------- queries -------------------------
+    async def list_paginated(
+        self,
+        *,
+        limit: int = 20,
+        offset: int = 0,
+        category: str | None = None,
+        status: str | None = None,
+        min_total_score: float | None = None,
+    ) -> tuple[Sequence[Opportunity], int]:
+        """Return (rows, total_count)."""
+        base = select(Opportunity)
+        count_q = select(func.count()).select_from(Opportunity)
+
+        if category:
+            base = base.where(Opportunity.category == category)
+            count_q = count_q.where(Opportunity.category == category)
+        if status:
+            base = base.where(Opportunity.status == status)
+            count_q = count_q.where(Opportunity.status == status)
+        if min_total_score is not None:
+            base = base.where(Opportunity.total_score >= min_total_score)
+            count_q = count_q.where(Opportunity.total_score >= min_total_score)
+
+        base = base.order_by(Opportunity.total_score.desc(), Opportunity.id.desc())
+        base = base.limit(limit).offset(offset)
+
+        result = await self.session.execute(base)
+        total = await self.session.scalar(count_q) or 0
+        return result.scalars().all(), int(total)
+
+    async def get_by_id(self, opportunity_id: int) -> Optional[Opportunity]:
+        return await self.session.get(Opportunity, opportunity_id)
+
+    async def get_by_slug(self, slug: str) -> Optional[Opportunity]:
+        result = await self.session.execute(
+            select(Opportunity).where(Opportunity.slug == slug)
+        )
+        return result.scalar_one_or_none()
+
+    async def get_by_external_id(self, external_id: str) -> Optional[Opportunity]:
+        """Demo/test helper — matches by stringified id when seeded."""
+        try:
+            return await self.get_by_id(int(external_id))
+        except (ValueError, TypeError):
+            return None
+
+    # ------------------------- commands -------------------------
+    async def create(self, **fields: Any) -> Opportunity:
+        opp = Opportunity(**fields)
+        self.session.add(opp)
+        await self.session.flush()
+        return opp
+
+    async def upsert_by_slug(self, **fields: Any) -> Opportunity:
+        slug = fields.get("slug")
+        if not slug:
+            raise ValueError("slug is required for upsert")
+        existing = await self.get_by_slug(slug)
+        if existing is None:
+            return await self.create(**fields)
+        for key, value in fields.items():
+            setattr(existing, key, value)
+        await self.session.flush()
+        return existing
