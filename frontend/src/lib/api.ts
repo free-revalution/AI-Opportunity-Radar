@@ -1,5 +1,6 @@
 import type {
   HealthResponse,
+  NotificationsResponse,
   OpportunitiesResponse,
   Opportunity,
   ResearchReportData,
@@ -18,6 +19,10 @@ const API_BASE_URL =
 
 async function jsonFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const url = `${API_BASE_URL}${path}`;
+  const nextOption =
+    init && typeof (init as { next?: unknown }).next === "object"
+      ? (init as { next?: object }).next
+      : undefined;
   const res = await fetch(url, {
     ...init,
     headers: {
@@ -25,7 +30,7 @@ async function jsonFetch<T>(path: string, init?: RequestInit): Promise<T> {
       ...(init?.headers ?? {}),
     },
     // SSR-friendly defaults: don't cache mutations, do cache GETs for 30s.
-    next: { revalidate: 30, ...(init as { next?: unknown })?.next },
+    next: { revalidate: 30, ...(nextOption ?? {}) },
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -48,6 +53,18 @@ export async function fetchResearch(id: string): Promise<ResearchReportData> {
 
 export async function fetchHealth(): Promise<HealthResponse> {
   return jsonFetch<HealthResponse>("/api/health");
+}
+
+export async function fetchRecentNotifications(
+  limit: number = 20,
+  channel?: string,
+): Promise<NotificationsResponse> {
+  const params = new URLSearchParams();
+  params.set("limit", String(limit));
+  if (channel) params.set("channel", channel);
+  return jsonFetch<NotificationsResponse>(
+    `/api/notifications/recent?${params.toString()}`,
+  );
 }
 
 export const apiBaseUrl = API_BASE_URL;

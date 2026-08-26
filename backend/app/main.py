@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app import __version__
 from app.api.health import router as health_router
 from app.api.internal import router as internal_router
+from app.api.notifications import router as notifications_router
 from app.api.opportunities import router as opportunities_router
 from app.api.research import router as research_router
 from app.api.sources import router as sources_router
@@ -74,6 +75,7 @@ def create_app() -> FastAPI:
     app.include_router(health_router, prefix="/api", tags=["health"])
     app.include_router(opportunities_router, prefix="/api", tags=["opportunities"])
     app.include_router(research_router, prefix="/api", tags=["research"])
+    app.include_router(notifications_router, prefix="/api", tags=["notifications"])
     app.include_router(sources_router, prefix="/api", tags=["sources"])
     app.include_router(trends_router, prefix="/api", tags=["trends"])
     app.include_router(internal_router, prefix="/api/internal", tags=["internal"])
