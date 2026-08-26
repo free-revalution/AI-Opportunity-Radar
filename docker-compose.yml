@@ -1,0 +1,154 @@
+# =================================================================
+# AI Opportunity Radar — local development stack
+# =================================================================
+# Services:
+#   postgres    primary database
+#   redis       cache / queue
+#   backend     FastAPI (uvicorn) — http://localhost:8000
+#   frontend    Next.js dev server — http://localhost:3000
+#   worker      async job runner (later phases)
+#   n8n         workflow orchestrator — http://localhost:5678
+#
+# Firecrawl / Browser Use / DeepResearch run as managed services
+# (hosted APIs), so they are NOT in this compose file.
+# =================================================================
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: radar-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: radar
+      POSTGRES_PASSWORD: radar
+      POSTGRES_DB: radar
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U radar -d radar"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: radar-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: radar-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Inside docker, hostnames are service names not localhost.
+      DATABASE_URL: postgresql+asyncpg://radar:radar@postgres:5432/radar
+      DATABASE_URL_SYNC: postgresql://radar:radar@postgres:5432/radar
+      REDIS_URL: redis://redis:6379/0
+      REDIS_RESULT_BACKEND: redis://redis:6379/1
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx,sys; sys.exit(0 if httpx.get('http://localhost:8000/api/health').status_code==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: radar-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://radar:radar@postgres:5432/radar
+      DATABASE_URL_SYNC: postgresql://radar:radar@postgres:5432/radar
+      REDIS_URL: redis://redis:6379/0
+      REDIS_RESULT_BACKEND: redis://redis:6379/1
+    volumes:
+      - ./backend:/app
+    command: ["python", "-m", "app.worker"]
+    # No ports — worker is internal only.
+
+  frontend:
+    image: node:20-alpine
+    container_name: radar-frontend
+    restart: unless-stopped
+    working_dir: /app
+    depends_on:
+      backend:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+      API_BASE_URL_INTERNAL: http://backend:8000
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    ports:
+      - "3000:3000"
+    command: ["sh", "-c", "corepack enable && (test -d node_modules || npm install) && npm run dev"]
+
+  n8n:
+    image: n8nio/n8n:1
+    container_name: radar-n8n
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: radar
+      DB_POSTGRESDB_PASSWORD: radar
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_USER:-admin}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_PASSWORD:-change-me}
+      WEBHOOK_URL: http://localhost:5678/
+      GENERIC_TIMEZONE: UTC
+    volumes:
+      - n8ndata:/home/node/.n8n
+      - ./n8n/workflows:/tmp/workflows
+    ports:
+      - "5678:5678"
+
+volumes:
+  pgdata:
+  redisdata:
+  n8ndata:
+  frontend_node_modules:

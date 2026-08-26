@@ -1,0 +1,41 @@
+{
+  "name": "ai-opportunity-radar-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI Opportunity Radar dashboard — Next.js 14 app router + shadcn-style UI.",
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000",
+    "lint": "next lint",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "next": "14.2.5",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "swr": "2.2.5",
+    "zod": "3.23.8",
+    "clsx": "2.1.1",
+    "tailwind-merge": "2.5.2",
+    "class-variance-authority": "0.7.0",
+    "lucide-react": "0.441.0"
+  },
+  "devDependencies": {
+    "@types/node": "20.14.10",
+    "@types/react": "18.3.3",
+    "@types/react-dom": "18.3.0",
+    "autoprefixer": "10.4.19",
+    "eslint": "8.57.0",
+    "eslint-config-next": "14.2.5",
+    "postcss": "8.4.39",
+    "tailwindcss": "3.4.7",
+    "typescript": "5.5.3",
+    "vitest": "2.0.5",
+    "@testing-library/react": "16.0.0",
+    "@testing-library/jest-dom": "6.5.0",
+    "@vitejs/plugin-react": "4.3.1",
+    "jsdom": "25.0.0"
+  }
+}

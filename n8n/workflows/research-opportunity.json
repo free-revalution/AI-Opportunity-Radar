@@ -1,0 +1,60 @@
+{
+  "name": "research-opportunity",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "research-opportunity",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.API_BASE_URL_INTERNAL}}/api/internal/research/trigger",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{$json[\"body\"]}}",
+        "options": {
+          "timeout": 900000,
+          "retry": { "maxTries": 2, "waitBetweenTries": 8000 }
+        }
+      },
+      "id": "trigger-research",
+      "name": "Trigger Backend Research",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [520, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.API_BASE_URL_INTERNAL}}/api/internal/notify/research-complete",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{JSON.stringify({opportunity_id: $json[\"opportunity_id\"], report_url: $json[\"report_url\"]})}}",
+        "options": {}
+      },
+      "id": "notify",
+      "name": "Notify Backend",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [800, 300]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{ "node": "Trigger Backend Research", "type": "main", "index": 0 }]]
+    },
+    "Trigger Backend Research": {
+      "main": [[{ "node": "Notify Backend", "type": "main", "index": 0 }]]
+    }
+  }
+}

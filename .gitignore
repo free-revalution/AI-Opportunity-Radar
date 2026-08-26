@@ -1,0 +1,71 @@
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- Secrets & Local Config ---
+.env
+.env.*.local
+*.pem
+*.key
+secrets/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.venv/
+venv/
+env/
+ENV/
+
+# --- Node / Next.js ---
+node_modules/
+.next/
+.turbo/
+out/
+*.tsbuildinfo
+.pnpm-store/
+
+# --- Logs / Runtime ---
+logs/
+*.log
+*.pid
+*.sock
+
+# --- Data / DB ---
+*.sqlite
+*.sqlite3
+*.db
+data/
+pgdata/
+redisdata/
+n8ndata/
+
+# --- Test / Coverage ---
+coverage/
+.nyc_output/
+
+# --- Docs build ---
+docs/_build/
+site/
+
+# --- Worktrees / Branches ---
+.worktrees/
