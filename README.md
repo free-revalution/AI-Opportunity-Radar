@@ -151,7 +151,9 @@ make clean             # 清理缓存 / 构建产物
 |---|---|---|
 | `DATABASE_URL` | 是(生产) | asyncpg DSN |
 | `REDIS_URL` | 是(生产) | redis DSN |
-| `OPENAI_API_KEY` | 可选 | LLM 提供方 |
+| `MINIMAX_API_KEY` | 默认 LLM | 智谱 GLM(`glm-4.7` / `glm-4-flash`),OpenAI 兼容 |
+| `OPENAI_API_KEY` | 备选 LLM | 当 `LLM_DEFAULT_PROVIDER=openai` 时启用 |
+| `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` | 备选 LLM | 需 `pip install -e .[anthropic]` / `[gemini]` |
 | `FIRECRAWL_API_KEY` | 可选 | Web 数据层 |
 | `BROWSER_USE_API_KEY` | 可选 | 浏览器交互层(Phase 11) |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | 可选 | 每日摘要推送 |

@@ -27,9 +27,7 @@ dependencies = [
     "aiocache>=0.12",
     "feedparser>=6.0.18",
     "python-telegram-bot>=21.3",
-    "openai>=1.40",
-    "anthropic>=0.30",
-    "google-generativeai>=0.7",
+    "openai>=1.40",                  # 同时驱动 OpenAI 与 MiniMax(智谱 GLM,OpenAI 兼容端点)
     "numpy>=1.26",
     "prometheus-client>=0.20",
 ]
@@ -44,6 +42,10 @@ dev = [
     "freezegun>=1.5",
     "respx>=0.21",
 ]
+# 仅在显式启用 Anthropic / Gemini 时才需要装;MiniMax(默认)走 openai SDK。
+anthropic = ["anthropic>=0.30"]
+gemini = ["google-generativeai>=0.7"]
+all-llm = ["anthropic>=0.30", "google-generativeai>=0.7"]
 
 [tool.setuptools.packages.find]
 where = ["."]

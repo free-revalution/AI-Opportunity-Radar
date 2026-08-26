@@ -78,6 +78,7 @@ def test_factory_returns_mock_when_mocking_enabled(settings):
 
 def test_factory_returns_mock_when_no_keys_present(settings):
     settings.mock_external_services = False
+    settings.MiniMax_api_key = ""
     settings.openai_api_key = ""
     settings.anthropic_api_key = ""
     settings.gemini_api_key = ""
@@ -87,9 +88,55 @@ def test_factory_returns_mock_when_no_keys_present(settings):
 
 def test_factory_respects_provider_choice(settings):
     settings.mock_external_services = False
-    settings.openai_api_key = ""  # no key → still mock
-    provider = build_llm_provider(settings, prefer="openai")
+    settings.MiniMax_api_key = ""  # no key → still mock
+    provider = build_llm_provider(settings, prefer="MiniMax")
     assert isinstance(provider, MockLLMProvider)
+
+
+def test_factory_selects_MiniMax_by_default(settings):
+    """When `LLM_DEFAULT_PROVIDER=MiniMax` (the project default) and a key
+    is present, `build_llm_provider` should return a `MiniMaxLLMProvider`."""
+    from app.services.llm import MiniMaxLLMProvider
+
+    settings.mock_external_services = False
+    settings.MiniMax_api_key = "fake-test-key"
+    settings.llm_default_provider = "MiniMax"
+    provider = build_llm_provider(settings)
+    assert isinstance(provider, MiniMaxLLMProvider)
+    assert provider.name == "MiniMax"
+
+
+def test_factory_prefers_MiniMax_when_prefer_arg_set(settings):
+    from app.services.llm import MiniMaxLLMProvider
+
+    settings.mock_external_services = False
+    settings.MiniMax_api_key = "fake-test-key"
+    settings.openai_api_key = "fake-openai"
+    provider = build_llm_provider(settings, prefer="MiniMax")
+    assert isinstance(provider, MiniMaxLLMProvider)
+
+
+def test_MiniMax_provider_requires_api_key():
+    """Empty key MUST raise before any network call."""
+    from app.services.llm import MiniMaxLLMProvider
+    from app.utils import ValidationError
+
+    try:
+        MiniMaxLLMProvider(api_key="", default_model="glm-4.7")
+    except ValidationError as exc:
+        assert "api_key" in str(exc).lower()
+    else:
+        raise AssertionError("MiniMaxLLMProvider should reject empty api_key")
+
+
+def test_MiniMax_provider_uses_configured_base_url(settings):
+    """The provider MUST honour Settings.MiniMax_api_url — no hard-coded URL."""
+    from app.services.llm import build_MiniMax_provider
+
+    settings.MiniMax_api_key = "fake-test-key"
+    settings.MiniMax_api_url = "https://api.example.test/v1"
+    provider = build_MiniMax_provider(settings)
+    assert provider.api_url == "https://api.example.test/v1"
 
 
 def test_provider_is_an_abc_subclass():

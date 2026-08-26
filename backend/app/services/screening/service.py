@@ -138,7 +138,7 @@ class ScreeningService:
             system=SYSTEM_PROMPT,
             user=user_prompt,
             response_schema=RESPONSE_SCHEMA,
-            model=self.settings.openai_model_cheap,
+            model=self.settings.MiniMax_model_cheap,
         )
         result = parse_screening_response(payload)
         await self._apply(opp, result, raw_items)

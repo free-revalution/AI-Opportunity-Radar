@@ -8,13 +8,30 @@ MVP **不** fork、不内置、不再分发任何这些项目。每一个都以*
 
 | 项目 | 仓库 | 许可证 | 使用方式 | 风险 |
 |---|---|---|---|---|
+| **MiniMax(智谱 GLM)** | [MiniMax](https://bigmodel.cn) | 商业 API(自营) | **默认 LLM provider**;通过 OpenAI 兼容端点接入,使用 `glm-4.7` / `glm-4-air` / `glm-4-flash` | 低;key 存于 `.env`(gitignored),仅调用走 HTTPS |
 | Firecrawl | [firecrawl/firecrawl](https://github.com/firecrawl/firecrawl) | **AGPL-3.0** | 托管云 API(REST:`/scrape`、`/crawl`、`/map`、`/search`、`/extract`) | 若自托管并修改则高风险 — MVP 阶段我们不自托管 |
 | Browser Use | [browser-use/browser-use](https://github.com/browser-use/browser-use) | MIT(库)/ Cloud TOS(服务) | 优先使用云 API,可降级到自托管 | 低 |
 | Deep Research | [dzhng/deep-research](https://github.com/dzhng/deep-research) | MIT | 我们**重写实现**研究循环到后端,而非 vendoring | 低 |
 | TrendRadar | [sansan0/TrendRadar](https://github.com/sansan0/TrendRadar) | MIT(商用前需核实) | 仅参考其模式 — 我们自己的连接器是独立的 | 中(商用前需核实) |
 | n8n | [n8n-io/n8n](https://github.com/n8n-io/n8n) | **Sustainable Use License**(2025 年起) | 仅自托管 Docker 编排 | 不能再作为托管产品对外提供 |
+| OpenAI / Anthropic / Gemini | — | 商业 API(各自) | **备选 LLM provider**;填了对应 Key 并设 `LLM_DEFAULT_PROVIDER=<name>` 即可启用 | 低;按用量计费 |
 
 ## 详细发现
+
+### MiniMax(智谱 GLM)— 默认 LLM Provider
+
+- **供应商**:MiniMax([bigmodel.cn](https://bigmodel.cn))。
+- **接入方式**:OpenAI 兼容端点 `https://api.MiniMax.cn/v1`,复用官方 `openai` SDK,
+  仅修改 `base_url` + `api_key`。**不加新依赖**。
+- **默认模型**:`glm-4-flash`(筛选)、`glm-4-air`(中)、`glm-4.7`(深度研究 / 评分)。
+- **嵌入模型**:`embedding-2`(智谱独立端点,生产可替换)。
+- **合规**:商业 API,按 token 计费;Key 存于 `.env`(gitignored);所有调用走 HTTPS;
+  LLM 响应需通过 `app.services.llm.provider.LLMProvider` 抽象层,便于切换备选 Provider。
+- **失败处理**:任何传输 / 鉴权 / 5xx 故障翻译为 `ExternalServiceError`,
+  screening / scoring 服务可统一重试。
+- **禁用 / 切换**:生产要切换到 OpenAI / Anthropic / Gemini 时,
+  装对应 extras(`pip install -e .[anthropic]`),设置 `LLM_DEFAULT_PROVIDER=openai`,
+  并填对应 Key 即可。
 
 ### Firecrawl — AGPL-3.0
 
@@ -64,6 +81,14 @@ MVP **不** fork、不内置、不再分发任何这些项目。每一个都以*
   所有业务逻辑(评分、聚类、研究解析)都留在后端。日后若需要去掉 n8n,
   后端仍可通过 cron + worker 进程继续工作。
 
+### OpenAI / Anthropic / Gemini(备选 LLM)
+
+- 这三家是商业 API,默认不被启用 — 仅当运营填了对应 Key 并把 `LLM_DEFAULT_PROVIDER`
+  改为 `openai` / `anthropic` / `gemini` 时才会被选中。
+- Anthropic / Gemini 还需要额外安装依赖:
+  `pip install -e .[anthropic]` 或 `pip install -e .[gemini]`。
+- 切换理由:MiniMax 中断时降级、地区不可达、需要某家特有模型(例如 Claude 长上下文)。
+
 ## 抽象边界
 
 ```
@@ -74,7 +99,8 @@ MVP **不** fork、不内置、不再分发任何这些项目。每一个都以*
     ├── FallbackWebDataProvider    ← BU → Firecrawl → Mock 链(每一步
     │                                捕获 ExternalServiceError)
     ├── ResearchService            ← 我们自己的迭代循环(借鉴 deep-research)
-    ├── LLMRouter                  ← OpenAI / Anthropic / Gemini
+    ├── MiniMaxLLMProvider   ← 智谱 GLM(OpenAI 兼容端点,默认)
+    ├── OpenAILLMProvider    ← OpenAI(备选)
     ├── 数据源连接器                ← GitHub、Reddit、HN、Product Hunt、RSS、…
     └── TelegramService            ← 仅 bot token,不复制源码
 ```

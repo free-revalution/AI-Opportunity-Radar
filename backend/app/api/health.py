@@ -68,6 +68,7 @@ async def _check_redis_with_client(
 def _check_llm() -> dict[str, Any]:
     settings = get_settings()
     providers = {
+        "MiniMax": bool(settings.MiniMax_api_key),
         "openai": bool(settings.openai_api_key),
         "anthropic": bool(settings.anthropic_api_key),
         "gemini": bool(settings.gemini_api_key),
@@ -75,7 +76,7 @@ def _check_llm() -> dict[str, Any]:
     configured = [name for name, ok in providers.items() if ok]
     if not configured:
         return {"status": "degraded", "note": "no LLM provider configured"}
-    return {"status": "healthy", "providers": configured}
+    return {"status": "healthy", "providers": configured, "default": settings.llm_default_provider}
 
 
 def _probe_url(url: str, *, timeout: float = 3.0) -> tuple[bool, str]:

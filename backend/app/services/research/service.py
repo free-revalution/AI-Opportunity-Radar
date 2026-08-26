@@ -348,7 +348,7 @@ class ResearchService:
             system=SYSTEM_PROMPT,
             user=user_prompt,
             response_schema=RESEARCH_REPORT_SCHEMA,
-            model=self.settings.openai_model_strong,
+            model=self.settings.MiniMax_model_strong,
             max_tokens=min(self.settings.deep_research_max_tokens, 4000),
         )
         return parse_research_report(payload)

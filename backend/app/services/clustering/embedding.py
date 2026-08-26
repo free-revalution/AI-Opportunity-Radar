@@ -6,9 +6,9 @@ et al., 2009). It is **deterministic, dependency-free** (uses stdlib
 captures lexical overlap, which is what matters for "same product on
 GitHub, Reddit, and HN at the same time."
 
-For production semantic similarity we will swap in `OpenAIEmbedder`
-or a hosted sentence-transformers endpoint; the `Embedder` ABC here
-keeps the boundary clean.
+For production semantic similarity we will swap in `MiniMaxEmbedder`
+(MiniMax `embedding-2`) or a hosted sentence-transformers endpoint;
+the `Embedder` ABC here keeps the boundary clean.
 """
 
 from __future__ import annotations

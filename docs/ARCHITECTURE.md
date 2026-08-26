@@ -80,7 +80,8 @@ docker-compose 栈
 
 - `api.firecrawl.dev`(Firecrawl REST)
 - `api.browser-use.com`(Browser Use 云)
-- `api.openai.com` / Anthropic / Gemini(LLM)
+- `api.MiniMax.cn`(智谱 GLM,**默认 LLM**,OpenAI 兼容端点)
+- `api.openai.com` / Anthropic / Gemini(LLM 备选)
 - `api.telegram.org`(Telegram 机器人 API)
 
 ## 为什么不让 n8n 直接写 Postgres?

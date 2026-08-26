@@ -84,7 +84,7 @@ def build_connector(slug: str, settings: Settings, *, mock: bool | None = None) 
 
     if slug == "github":
         return GitHubTrendingConnector(
-            token=settings.openai_api_key or None,  # any non-empty token lowers rate limit
+            token=settings.MiniMax_api_key or None,  # any non-empty token lowers rate limit
             mock=force_mock,
         )
     if slug == "reddit":
