@@ -19,6 +19,7 @@ from app.config import get_settings
 from app.db import get_session
 from app.services.clustering import ClusteringService
 from app.services.ingestion import IngestionService
+from app.services.research import ResearchService
 from app.services.scoring import ScoringService
 from app.services.screening import ScreeningService
 from app.utils import get_logger
@@ -249,3 +250,115 @@ async def score_one(
         "research_job_id": outcome.research_job_id,
         "changed": outcome.changed,
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 — Deep Research
+# ---------------------------------------------------------------------------
+@router.post(
+    "/research/run",
+    summary="Run deep research on every pending ResearchJob",
+)
+async def run_research(
+    body: dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 7 endpoint — called by n8n after `scoring/run`.
+
+    Body (all optional):
+        {
+          "limit": 10,             # max jobs per pass
+          "max_urls": 20,          # cap on URLs scraped per job
+          "use_mock_web": true,    # force MockWebDataProvider
+          "use_mock_llm": true     # force MockResearchLLMProvider
+        }
+    """
+    body = body or {}
+    limit = int(body.get("limit") or 10)
+    max_urls = body.get("max_urls")
+    use_mock_web = bool(body.get("use_mock_web"))
+    use_mock_llm = bool(body.get("use_mock_llm"))
+
+    service = ResearchService(
+        session,
+        limit=limit,
+        max_urls=int(max_urls) if max_urls is not None else None,
+    )
+    if use_mock_web:
+        from app.services.research.mock_web_data import MockWebDataProvider
+
+        service.web = MockWebDataProvider()
+    if use_mock_llm:
+        from app.services.research.mock_llm import MockResearchLLMProvider
+
+        service.llm = MockResearchLLMProvider()
+
+    report = await service.run_once()
+    logger.info("research_run_complete", **report.as_dict())
+    return report.as_dict()
+
+
+@router.post(
+    "/research/run/{job_id}",
+    summary="Run deep research for one specific ResearchJob",
+)
+async def run_one_research_job(
+    job_id: int,
+    body: dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 7 endpoint — explicit single-job research trigger.
+
+    Body (all optional):
+        {
+          "use_mock_web": true,
+          "use_mock_llm": true
+        }
+    """
+    body = body or {}
+    use_mock_web = bool(body.get("use_mock_web"))
+    use_mock_llm = bool(body.get("use_mock_llm"))
+
+    service = ResearchService(session)
+    if use_mock_llm:
+        from app.services.research.mock_llm import MockResearchLLMProvider
+
+        service.llm = MockResearchLLMProvider()
+
+    try:
+        outcome = await service.process_job(job_id, use_mock_web=use_mock_web)
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    return {
+        "job_id": outcome.job_id,
+        "opportunity_id": outcome.opportunity_id,
+        "status": outcome.status,
+        "recommendation": outcome.recommendation,
+        "confidence": outcome.confidence,
+        "sources_count": outcome.sources_count,
+        "warnings": outcome.warnings,
+        "error": outcome.error,
+    }
+
+
+@router.post(
+    "/research/cancel/{job_id}",
+    summary="Cancel a pending or running ResearchJob",
+)
+async def cancel_research_job(
+    job_id: int,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 7 endpoint — marks a non-terminal job as `cancelled`.
+
+    Returns `{"cancelled": true|false}`. Idempotent — re-cancelling a
+    completed/failed job returns `false` instead of erroring.
+    """
+    service = ResearchService(session)
+    cancelled = await service.cancel(job_id)
+    return {"job_id": job_id, "cancelled": cancelled}

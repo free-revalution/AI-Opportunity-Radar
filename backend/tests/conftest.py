@@ -69,7 +69,9 @@ async def client(sqlite_engine: AsyncEngine) -> AsyncIterator[TestClient]:
     """FastAPI test client with the DB session dependency overridden.
 
     Every test starts with an empty SQLite database; tables are created
-    once on engine startup and dropped on teardown.
+    once on engine startup and dropped on teardown. The sessionmaker is
+    exposed via `client.sessionmaker` so tests can seed data without
+    having to round-trip through the HTTP layer.
     """
     sessionmaker = async_sessionmaker(sqlite_engine, expire_on_commit=False)
 
@@ -80,6 +82,7 @@ async def client(sqlite_engine: AsyncEngine) -> AsyncIterator[TestClient]:
     app = create_app()
     app.dependency_overrides[get_session] = _override_session
     with TestClient(app) as c:
+        c.sessionmaker = sessionmaker  # type: ignore[attr-defined]
         yield c
     app.dependency_overrides.clear()
 

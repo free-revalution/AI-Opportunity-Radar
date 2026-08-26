@@ -16,7 +16,7 @@ This repository contains the **full source** of the product. We do **not** vendo
 | 4 | Deduplication + clustering | **done** |
 | 5 | AI screening | **done** |
 | 6 | Opportunity scoring (formula already implemented in code) | **done** |
-| 7 | Deep research engine | planned |
+| 7 | Deep research engine | **done** |
 | 8 | Telegram notifications | planned |
 | 9 | Dashboard polish | planned |
 | 10 | n8n workflows | wired (stubs only) |
