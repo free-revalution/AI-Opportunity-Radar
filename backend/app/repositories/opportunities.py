@@ -68,6 +68,22 @@ class OpportunityRepository:
         except (ValueError, TypeError):
             return None
 
+    async def list_pending_screening(
+        self, *, limit: int = 50
+    ) -> Sequence[Opportunity]:
+        """Opportunities that have not yet been screened.
+
+        The screening service queries this; the worker processes them
+        in batches so the LLM rate limit stays friendly.
+        """
+        result = await self.session.execute(
+            select(Opportunity)
+            .where(Opportunity.status == "detected")
+            .order_by(Opportunity.id.asc())
+            .limit(limit)
+        )
+        return result.scalars().all()
+
     # ------------------------- commands -------------------------
     async def create(self, **fields: Any) -> Opportunity:
         opp = Opportunity(**fields)

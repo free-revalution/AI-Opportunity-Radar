@@ -19,6 +19,7 @@ from app.config import get_settings
 from app.db import get_session
 from app.services.clustering import ClusteringService
 from app.services.ingestion import IngestionService
+from app.services.screening import ScreeningService
 from app.utils import get_logger
 
 router = APIRouter()
@@ -146,4 +147,36 @@ async def run_clustering(
 
     report = await service.run_once()
     logger.info("clustering_run_complete", **report.as_dict())
+    return report.as_dict()
+
+
+@router.post(
+    "/screening/run",
+    summary="Run AI screening against pending opportunities",
+)
+async def run_screening(
+    body: dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 5 endpoint — called by n8n after `clustering/run`.
+
+    Body (all optional):
+        {
+          "limit": 50,            # max opportunities per pass
+          "use_mock": true | false
+        }
+    """
+    body = body or {}
+    limit = int(body.get("limit") or 50)
+    use_mock = bool(body.get("use_mock"))
+
+    service = ScreeningService(session, limit=limit)
+    if use_mock:
+        from app.services.llm import MockLLMProvider
+
+        service.provider = MockLLMProvider()
+
+    report = await service.run_once()
+    logger.info("screening_run_complete", **report.as_dict())
     return report.as_dict()

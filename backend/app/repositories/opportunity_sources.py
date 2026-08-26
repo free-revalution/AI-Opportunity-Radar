@@ -7,7 +7,7 @@ from typing import Any, Sequence
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import OpportunitySource
+from app.models import OpportunitySource, RawItem
 
 
 class OpportunitySourceRepository:
@@ -26,6 +26,21 @@ class OpportunitySourceRepository:
             )
         )
         return result.scalars().all()
+
+    async def list_raw_items_for_opportunity(
+        self, opportunity_id: int
+    ) -> list[RawItem]:
+        """Return RawItems linked to the given opportunity, ordered by relevance desc."""
+        result = await self.session.execute(
+            select(RawItem)
+            .join(
+                OpportunitySource,
+                OpportunitySource.raw_item_id == RawItem.id,
+            )
+            .where(OpportunitySource.opportunity_id == opportunity_id)
+            .order_by(OpportunitySource.relevance.desc())
+        )
+        return list(result.scalars().all())
 
     async def raw_item_ids_in_any_opportunity(self) -> set[int]:
         """Return the set of RawItem ids already linked to an Opportunity.

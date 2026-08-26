@@ -162,6 +162,10 @@ class ClusteringService:
             links += 1
         await self.session.flush()
 
+        # Commit so the writes survive the request boundary — FastAPI
+        # does not auto-commit when the route returns.
+        await self.session.commit()
+
         return {"created": created, "updated": updated, "links": links}
 
 
