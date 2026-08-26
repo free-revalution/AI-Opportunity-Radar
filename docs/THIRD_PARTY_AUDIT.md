@@ -1,68 +1,83 @@
-# Third-Party Components Audit
+# 第三方组件审计
 
-> Generated: 2026-08-26
-> Scope: Validate license, integration mode, and stability of every open-source component the MVP will rely on.
+> 生成时间:2026-08-26
+> 范围:核实 MVP 将依赖的每个开源组件的许可证、集成方式与稳定性。
 
-The MVP **does not** fork, vendor, or re-distribute any of these projects. Each one is consumed as an **external service / API** so we keep our own codebase under a permissive license and avoid copyleft contamination.
+MVP **不** fork、不内置、不再分发任何这些项目。每一个都以**外部服务 / API** 形式消费,
+这样我们可以让自己的代码库保持宽松许可证,并避免 copyleft 污染。
 
-| Project | Repo | License | Usage mode | Risk |
+| 项目 | 仓库 | 许可证 | 使用方式 | 风险 |
 |---|---|---|---|---|
-| Firecrawl | [firecrawl/firecrawl](https://github.com/firecrawl/firecrawl) | **AGPL-3.0** | Hosted Cloud API (REST: `/scrape`, `/crawl`, `/map`, `/search`, `/extract`) | High if self-hosted & modified — we never self-host in MVP |
-| Browser Use | [browser-use/browser-use](https://github.com/browser-use/browser-use) | MIT (library) / Cloud TOS (service) | Cloud API preferred, self-host fallback | Low |
-| Deep Research | [dzhng/deep-research](https://github.com/dzhng/deep-research) | MIT | We **re-implement** the research loop in our backend, not vendoring | Low |
-| TrendRadar | [sansan0/TrendRadar](https://github.com/sansan0/TrendRadar) | MIT (verify before commercialize) | Reference patterns only — our own connectors are independent | Medium (verify before commercialize) |
-| n8n | [n8n-io/n8n](https://github.com/n8n-io/n8n) | **Sustainable Use License** (since 2025) | Self-hosted Docker for orchestration only | Cannot be re-offered as a hosted product |
+| Firecrawl | [firecrawl/firecrawl](https://github.com/firecrawl/firecrawl) | **AGPL-3.0** | 托管云 API(REST:`/scrape`、`/crawl`、`/map`、`/search`、`/extract`) | 若自托管并修改则高风险 — MVP 阶段我们不自托管 |
+| Browser Use | [browser-use/browser-use](https://github.com/browser-use/browser-use) | MIT(库)/ Cloud TOS(服务) | 优先使用云 API,可降级到自托管 | 低 |
+| Deep Research | [dzhng/deep-research](https://github.com/dzhng/deep-research) | MIT | 我们**重写实现**研究循环到后端,而非 vendoring | 低 |
+| TrendRadar | [sansan0/TrendRadar](https://github.com/sansan0/TrendRadar) | MIT(商用前需核实) | 仅参考其模式 — 我们自己的连接器是独立的 | 中(商用前需核实) |
+| n8n | [n8n-io/n8n](https://github.com/n8n-io/n8n) | **Sustainable Use License**(2025 年起) | 仅自托管 Docker 编排 | 不能再作为托管产品对外提供 |
 
-## Detailed Findings
+## 详细发现
 
 ### Firecrawl — AGPL-3.0
 
-- **Why risky**: AGPL-3.0 requires that any modified version exposed over a network must publish source. Self-hosting + modifying the codebase would force us to publish our internal changes.
-- **MVP strategy**:
-  - Use the **hosted API** (`https://api.firecrawl.dev`) only.
-  - Never copy Firecrawl source into our repo.
-  - Keep all Firecrawl access behind an abstraction (`FirecrawlService`) so the implementation can be swapped.
-- **Verification before commercialization**: Re-check Firecrawl LICENSE, Hosted Terms, and trademark guidance. Firecrawl's API may impose additional usage limits or branding requirements.
+- **风险原因**:AGPL-3.0 要求任何通过网络公开的修改版本必须开源。若自托管并修改其代码,
+  会被迫公开内部修改。
+- **MVP 策略**:
+  - 仅使用**托管 API**(`https://api.firecrawl.dev`)。
+  - 永不把 Firecrawl 源码拷入我们的仓库。
+  - 所有 Firecrawl 访问都通过一个抽象层(`FirecrawlService`)以便日后切换实现。
+- **商用前核实**:复核 Firecrawl LICENSE、托管服务条款和商标指引。Firecrawl 的 API
+  可能附带额外的使用限制或品牌要求。
 
 ### Browser Use
 
-- **Library** (`browser-use` on PyPI): MIT-style permissive license, useful as reference.
-- **Cloud service** (`https://api.browser-use.com`): commercial ToS, preferred for MVP because it removes Playwright/Chromium operational burden.
-- **Fallback chain** (mandatory): Browser Use → Firecrawl → offline Mock. Implemented as a `FallbackWebDataProvider` composite in `backend/app/services/research/fallback_provider.py` — every `ExternalServiceError` from Browser Use is caught and the next provider is tried automatically. The chain is always terminated by an offline Mock so a single vendor outage never aborts a research job.
-- **Roadmap**: the audit originally specified Browser Use → Firecrawl → raw HTTP → skip; the raw HTTP step is deferred to a later phase.
+- **库**(`browser-use` on PyPI):类 MIT 的宽松许可证,可作参考。
+- **云服务**(`https://api.browser-use.com`):商业 ToS,MVP 优先使用,因为可省去
+  Playwright / Chromium 的运维负担。
+- **降级链(强制)**:Browser Use → Firecrawl → 离线 Mock。实现为
+  `backend/app/services/research/fallback_provider.py` 中的 `FallbackWebDataProvider`
+  组合器 — 每当 Browser Use 抛出 `ExternalServiceError` 即被捕获,并自动尝试下一个提供方。
+  链的末端始终是离线 Mock,因此单一厂商故障不会中断研究任务。
+- **路线图**:原始审计中规定的 Browser Use → Firecrawl → 原始 HTTP → 跳过 中的
+  原始 HTTP 步骤,推迟到后续阶段。
 
 ### Deep Research (dzhng/deep-research)
 
-- MIT licensed, but the project itself uses Firecrawl + an OpenAI-compatible LLM and runs an iterative **depth+breadth** question loop.
-- We **do not import** the package. We re-implement the loop in `backend/app/services/research/` so:
-  - We can feed it `ResearchContext` (already-fetched URLs/documents) and avoid duplicate fetches.
-  - We can swap the underlying search/crawl provider.
-  - We control the budget (`max_urls`, `max_depth`, `max_llm_calls`, `max_tokens`).
+- MIT 许可证,但该项目本身使用 Firecrawl + 兼容 OpenAI 的 LLM,并运行迭代式
+  **depth+breadth** 问题循环。
+- 我们**不引入**该包。我们在 `backend/app/services/research/` 重写该循环,这样:
+  - 可以喂入 `ResearchContext`(已抓取的 URL/文档),避免重复抓取。
+  - 可替换底层的搜索 / 爬取提供方。
+  - 可控制预算(`max_urls`、`max_depth`、`max_llm_calls`、`max_tokens`)。
 
 ### TrendRadar (sansan0/TrendRadar)
 
-- Multi-platform (11+ Chinese platforms: Weibo, Zhihu, Douyin, Bilibili, Toutiao, etc.) hot-news aggregator with AI analysis and scheduled push.
-- We **do not** clone this project. We borrow the *pattern* (keyword-configurable hot-news collection + AI analysis + scheduled push) and write our own connectors against the same source APIs (or RSS mirrors) under our own data model.
-- Re-check license before commercialization.
+- 多平台(11+ 个中文平台:微博、知乎、抖音、Bilibili、今日头条 等)的热点聚合器,
+  带 AI 分析与定时推送。
+- 我们**不**克隆该项目。我们借鉴其**模式**(关键词可配置的热点采集 + AI 分析 + 定时推送),
+  并基于同一套源 API(或 RSS 镜像)在我们自己的数据模型上编写独立连接器。
+- 商用前复核许可证。
 
 ### n8n
 
-- License changed from Apache 2.0 to **Sustainable Use License** in 2025. Self-hosting for internal use is still permitted, but **we may not offer n8n itself as a hosted service to others** and **may not build a competing product using n8n**.
-- We use n8n purely as a **workflow orchestrator** that calls our own backend HTTP API. All business logic (scoring, clustering, research parsing) stays in the backend. If we later need to drop n8n, the backend keeps working via cron + worker process.
+- 2025 年许可证从 Apache 2.0 改为 **Sustainable Use License**。自托管用于内部使用仍被允许,
+  但**不能把 n8n 本身作为托管服务对外提供**,也**不能用 n8n 构建竞争性产品**。
+- 我们仅把 n8n 当作**工作流编排器**,用来调用我们自己的后端 HTTP API。
+  所有业务逻辑(评分、聚类、研究解析)都留在后端。日后若需要去掉 n8n,
+  后端仍可通过 cron + worker 进程继续工作。
 
-## Abstraction Boundary
+## 抽象边界
 
 ```
-Our Backend (MIT-style, our own code)
-    ├── FirecrawlWebDataProvider   ← talks to firecrawl.dev REST API
-    ├── BrowserUseWebDataProvider  ← talks to api.browser-use.com (or self-host)
-    │     ↑ wrapped by ↓
-    ├── FallbackWebDataProvider    ← BU → Firecrawl → Mock chain (catches
-    │                                ExternalServiceError per step)
-    ├── ResearchService            ← our own iterative loop (inspired by deep-research)
+我们的后端(类 MIT,我们自己的代码)
+    ├── FirecrawlWebDataProvider   ← 调用 firecrawl.dev REST API
+    ├── BrowserUseWebDataProvider  ← 调用 api.browser-use.com(或自托管)
+    │     ↑ 被 ↓ 包装
+    ├── FallbackWebDataProvider    ← BU → Firecrawl → Mock 链(每一步
+    │                                捕获 ExternalServiceError)
+    ├── ResearchService            ← 我们自己的迭代循环(借鉴 deep-research)
     ├── LLMRouter                  ← OpenAI / Anthropic / Gemini
-    ├── Source connectors          ← GitHub, Reddit, HN, Product Hunt, RSS, ...
-    └── TelegramService            ← bot token only, no source code copy
+    ├── 数据源连接器                ← GitHub、Reddit、HN、Product Hunt、RSS、…
+    └── TelegramService            ← 仅 bot token,不复制源码
 ```
 
-Every external dependency is hidden behind a Python `WebDataProvider` (or `LLMProvider`, `TelegramProvider`) interface so tests can substitute a fake implementation.
+每个外部依赖都隐藏在 Python 的 `WebDataProvider`(或 `LLMProvider`、`TelegramProvider`)
+接口后面,这样测试可以替换为假实现。
