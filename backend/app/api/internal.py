@@ -19,6 +19,7 @@ from app.config import get_settings
 from app.db import get_session
 from app.services.clustering import ClusteringService
 from app.services.ingestion import IngestionService
+from app.services.notification import NotificationService
 from app.services.research import ResearchService
 from app.services.scoring import ScoringService
 from app.services.screening import ScreeningService
@@ -362,3 +363,206 @@ async def cancel_research_job(
     service = ResearchService(session)
     cancelled = await service.cancel(job_id)
     return {"job_id": job_id, "cancelled": cancelled}
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 — Telegram Notifications
+# ---------------------------------------------------------------------------
+def _build_notification_service(session: AsyncSession) -> NotificationService:
+    """Inject the mock provider by default — tests + local dev.
+
+    Production callers should set `TELEGRAM_BOT_TOKEN` /
+    `TELEGRAM_CHAT_ID` and `MOCK_EXTERNAL_SERVICES=false` so the real
+    httpx provider is selected by the factory.
+    """
+    settings = get_settings()
+    if getattr(settings, "mock_external_services", False):
+        from app.services.notification.mock_telegram import MockTelegramProvider
+
+        return NotificationService(
+            session, settings=settings, provider=MockTelegramProvider()
+        )
+    return NotificationService(session, settings=settings)
+
+
+@router.post(
+    "/notifications/digest/preview",
+    summary="Preview the daily digest without sending",
+)
+async def preview_digest(
+    body: dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 8 endpoint — returns the MarkdownV2 text + a warnings list.
+
+    Body (all optional):
+        {
+          "max_entries": 5,
+          "per_entry_summary_chars": 240,
+          "min_score": 70.0
+        }
+    """
+    body = body or {}
+    max_entries = int(body.get("max_entries") or 5)
+    per_entry_summary_chars = int(body.get("per_entry_summary_chars") or 240)
+    min_score = body.get("min_score")
+    try:
+        min_score_f = float(min_score) if min_score is not None else None
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"invalid min_score: {exc}",
+        ) from exc
+
+    service = _build_notification_service(session)
+    return await service.build_digest_preview(
+        max_entries=max_entries,
+        per_entry_summary_chars=per_entry_summary_chars,
+        min_score=min_score_f,
+    )
+
+
+@router.post(
+    "/notifications/digest/send",
+    summary="Build + send the daily digest",
+)
+async def send_digest(
+    body: dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 8 endpoint — sends the digest to the configured chat.
+
+    Body (all optional):
+        {
+          "chat_id": "12345",
+          "dry_run": false,
+          "max_entries": 5,
+          "per_entry_summary_chars": 240,
+          "min_score": 70.0
+        }
+    """
+    body = body or {}
+    chat_id = body.get("chat_id")
+    dry_run = bool(body.get("dry_run", False))
+    max_entries = int(body.get("max_entries") or 5)
+    per_entry_summary_chars = int(body.get("per_entry_summary_chars") or 240)
+    min_score = body.get("min_score")
+    try:
+        min_score_f = float(min_score) if min_score is not None else None
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"invalid min_score: {exc}",
+        ) from exc
+
+    service = _build_notification_service(session)
+    summary = await service.send_digest(
+        chat_id=chat_id,
+        dry_run=dry_run,
+        max_entries=max_entries,
+        per_entry_summary_chars=per_entry_summary_chars,
+        min_score=min_score_f,
+    )
+    logger.info("notifications_digest_dispatched", **summary.as_dict())
+    return summary.as_dict()
+
+
+@router.post(
+    "/notifications/opportunity/{opportunity_id}/preview",
+    summary="Preview a single-opportunity alert without sending",
+)
+async def preview_opportunity_alert(
+    opportunity_id: int,
+    body: dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 8 endpoint — returns the MarkdownV2 text for one alert."""
+    body = body or {}
+    max_summary_chars = int(body.get("max_summary_chars") or 600)
+    service = _build_notification_service(session)
+    try:
+        return await service.build_opportunity_preview(
+            opportunity_id, max_summary_chars=max_summary_chars
+        )
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+
+
+@router.post(
+    "/notifications/opportunity/{opportunity_id}/send",
+    summary="Send a single-opportunity alert to the configured chat",
+)
+async def send_opportunity_alert(
+    opportunity_id: int,
+    body: dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 8 endpoint — sends one alert to the chat.
+
+    Body (all optional):
+        {
+          "chat_id": "12345",
+          "dry_run": false,
+          "extra_note": "Launches tomorrow",
+          "max_summary_chars": 600
+        }
+    """
+    body = body or {}
+    chat_id = body.get("chat_id")
+    dry_run = bool(body.get("dry_run", False))
+    extra_note = body.get("extra_note")
+    max_summary_chars = int(body.get("max_summary_chars") or 600)
+
+    service = _build_notification_service(session)
+    outcome = await service.send_opportunity_alert(
+        opportunity_id,
+        chat_id=chat_id,
+        dry_run=dry_run,
+        extra_note=extra_note,
+        max_summary_chars=max_summary_chars,
+    )
+    return {
+        "notification_id": outcome.notification_id,
+        "channel": outcome.channel,
+        "chat_id": outcome.chat_id,
+        "delivered": outcome.delivered,
+        "text_chars": outcome.text_chars,
+        "provider": outcome.provider,
+        "message_id": outcome.message_id,
+        "error": outcome.error,
+    }
+
+
+@router.get(
+    "/notifications/history",
+    summary="List recent notification attempts",
+)
+async def list_notifications(
+    limit: int = 50,
+    channel: str | None = None,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 8 endpoint — recent `Notification` rows for the dashboard."""
+    service = _build_notification_service(session)
+    rows = await service.list_history(limit=limit, channel=channel)
+    return {
+        "count": len(rows),
+        "items": [
+            {
+                "id": r.id,
+                "channel": r.channel,
+                "payload": r.payload,
+                "delivered_at": r.delivered_at.isoformat() if r.delivered_at else None,
+                "error": r.error,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in rows
+        ],
+    }
