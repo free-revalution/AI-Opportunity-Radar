@@ -15,7 +15,7 @@ This repository contains the **full source** of the product. We do **not** vendo
 | 3 | Source connectors (GitHub, Reddit, HN, Product Hunt, RSS) | **done** |
 | 4 | Deduplication + clustering | **done** |
 | 5 | AI screening | **done** |
-| 6 | Opportunity scoring (formula already implemented in code) | planned |
+| 6 | Opportunity scoring (formula already implemented in code) | **done** |
 | 7 | Deep research engine | planned |
 | 8 | Telegram notifications | planned |
 | 9 | Dashboard polish | planned |

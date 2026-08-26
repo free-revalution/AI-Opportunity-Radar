@@ -84,6 +84,38 @@ class OpportunityRepository:
         )
         return result.scalars().all()
 
+    async def list_scored_candidates(
+        self, *, limit: int = 200
+    ) -> Sequence[Opportunity]:
+        """Opportunities whose screening has settled and may need re-scoring.
+
+        Excludes terminal statuses (`research_complete`, `failed`).
+        Returned in id order so the scoring sweeper is deterministic.
+        """
+        result = await self.session.execute(
+            select(Opportunity)
+            .where(Opportunity.status.in_(["screened", "scored", "research_eligible"]))
+            .order_by(Opportunity.id.asc())
+            .limit(limit)
+        )
+        return result.scalars().all()
+
+    async def has_pending_research(self, opportunity_id: int) -> bool:
+        """True if a non-terminal ResearchJob already exists for this Opportunity.
+
+        Prevents duplicate research-job creation when the scoring
+        sweeper runs more than once for the same opportunity.
+        """
+        from app.models import ResearchJob
+
+        result = await self.session.execute(
+            select(ResearchJob).where(
+                ResearchJob.opportunity_id == opportunity_id,
+                ResearchJob.status.in_(["pending", "running"]),
+            )
+        )
+        return result.scalar_one_or_none() is not None
+
     # ------------------------- commands -------------------------
     async def create(self, **fields: Any) -> Opportunity:
         opp = Opportunity(**fields)

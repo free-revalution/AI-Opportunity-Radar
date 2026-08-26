@@ -19,6 +19,7 @@ from app.config import get_settings
 from app.db import get_session
 from app.services.clustering import ClusteringService
 from app.services.ingestion import IngestionService
+from app.services.scoring import ScoringService
 from app.services.screening import ScreeningService
 from app.utils import get_logger
 
@@ -180,3 +181,71 @@ async def run_screening(
     report = await service.run_once()
     logger.info("screening_run_complete", **report.as_dict())
     return report.as_dict()
+
+
+@router.post(
+    "/scoring/run",
+    summary="Re-score screened / scored / research_eligible opportunities",
+)
+async def run_scoring(
+    body: dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 6 endpoint — called by n8n after `screening/run`.
+
+    Body (all optional):
+        {
+          "limit": 200,             # max opportunities per pass
+          "trigger_threshold": 70,  # cosine threshold override
+          "blend_signals": true
+        }
+    """
+    body = body or {}
+    limit = int(body.get("limit") or 200)
+    threshold = body.get("trigger_threshold")
+    blend_signals = bool(body.get("blend_signals", True))
+
+    service = ScoringService(
+        session,
+        limit=limit,
+        blend_signals=blend_signals,
+        trigger_threshold=float(threshold) if threshold is not None else None,
+    )
+    report = await service.run_once()
+    logger.info("scoring_run_complete", **report.as_dict())
+    return report.as_dict()
+
+
+@router.post(
+    "/scoring/score/{opportunity_id}",
+    summary="Re-score a single opportunity explicitly",
+)
+async def score_one(
+    opportunity_id: int,
+    body: dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 6 endpoint — explicit single-opportunity scoring.
+
+    Body (all optional):
+        {"blend_signals": true}
+    """
+    body = body or {}
+    blend_signals = bool(body.get("blend_signals", True))
+    service = ScoringService(session, blend_signals=blend_signals)
+    try:
+        outcome = await service.score_one(opportunity_id)
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from exc
+    return {
+        "opportunity_id": outcome.opportunity_id,
+        "total_score": outcome.total_score,
+        "recommendation": outcome.recommendation,
+        "status": outcome.status,
+        "research_job_id": outcome.research_job_id,
+        "changed": outcome.changed,
+    }
