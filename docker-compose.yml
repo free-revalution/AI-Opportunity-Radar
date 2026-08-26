@@ -129,6 +129,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      backend:
+        condition: service_started
     environment:
       DB_TYPE: postgresdb
       DB_POSTGRESDB_HOST: postgres
@@ -141,6 +143,10 @@ services:
       N8N_BASIC_AUTH_PASSWORD: ${N8N_PASSWORD:-change-me}
       WEBHOOK_URL: http://localhost:5678/
       GENERIC_TIMEZONE: UTC
+      # Variables consumed by the workflow JSON in /n8n/workflows/*.json.
+      # Every HTTP Request node references these via `={{$env.NAME}}`.
+      API_BASE_URL_INTERNAL: http://backend:8000
+      RADAR_WEBHOOK_SECRET: ${RADAR_WEBHOOK_SECRET:-dev-secret-change-me}
     volumes:
       - n8ndata:/home/node/.n8n
       - ./n8n/workflows:/tmp/workflows

@@ -13,7 +13,8 @@ FRONTEND_DIR := frontend
 .DEFAULT_GOAL := help
 
 .PHONY: help install dev backend frontend test test-backend test-frontend \
-        lint format migrate seed docker-up docker-down docker-logs clean
+        lint format migrate seed docker-up docker-down docker-logs clean \
+        n8n-sync n8n-validate
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-22s\033[0m %s\n", $$1, $$2}'
@@ -75,3 +76,9 @@ clean: ## Remove caches and build artifacts
 	find . -type d -name .pytest_cache -prune -exec rm -rf {} +
 	find . -type d -name .next -prune -exec rm -rf {} +
 	rm -rf backend/.mypy_cache backend/.ruff_cache
+
+n8n-validate: ## Validate every n8n/workflows/*.json (no network calls)
+	cd $(BACKEND_DIR) && $(PYTHON) -m scripts.n8n_sync --dry-run
+
+n8n-sync: ## Push n8n/workflows/*.json into the running n8n container (activate)
+	cd $(BACKEND_DIR) && $(PYTHON) -m scripts.n8n_sync --activate

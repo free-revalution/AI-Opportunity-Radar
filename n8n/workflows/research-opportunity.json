@@ -10,7 +10,7 @@
         "options": {}
       },
       "id": "webhook-trigger",
-      "name": "Webhook",
+      "name": "Webhook (POST /research-opportunity)",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 1,
       "position": [240, 300]
@@ -18,43 +18,79 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "={{$env.API_BASE_URL_INTERNAL}}/api/internal/research/trigger",
+        "url": "={{$env.API_BASE_URL_INTERNAL}}/api/internal/research/run/{{$json[\"body\"][\"job_id\"]}}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-Radar-Webhook", "value": "={{$env.RADAR_WEBHOOK_SECRET}}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{$json[\"body\"]}}",
+        "jsonBody": "={{JSON.stringify({use_mock_web: !!$json[\"body\"][\"use_mock_web\"], use_mock_llm: !!$json[\"body\"][\"use_mock_llm\"]})}}",
         "options": {
-          "timeout": 900000,
-          "retry": { "maxTries": 2, "waitBetweenTries": 8000 }
+          "timeout": 1800000,
+          "retry": { "maxTries": 1, "waitBetweenTries": 10000 }
         }
       },
       "id": "trigger-research",
-      "name": "Trigger Backend Research",
+      "name": "Run Research Job",
       "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4,
+      "typeVersion": 4.2,
       "position": [520, 300]
     },
     {
       "parameters": {
         "method": "POST",
-        "url": "={{$env.API_BASE_URL_INTERNAL}}/api/internal/notify/research-complete",
+        "url": "={{$env.API_BASE_URL_INTERNAL}}/api/internal/notifications/opportunity/{{$json[\"opportunity_id\"]}}/send",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-Radar-Webhook", "value": "={{$env.RADAR_WEBHOOK_SECRET}}" }
+          ]
+        },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{JSON.stringify({opportunity_id: $json[\"opportunity_id\"], report_url: $json[\"report_url\"]})}}",
-        "options": {}
+        "jsonBody": "={{JSON.stringify({extra_note: \"Deep research complete\"})}}",
+        "options": {
+          "timeout": 60000,
+          "retry": { "maxTries": 2, "waitBetweenTries": 5000 }
+        }
       },
       "id": "notify",
-      "name": "Notify Backend",
+      "name": "Send Telegram Alert",
       "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4,
+      "typeVersion": 4.2,
       "position": [800, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{JSON.stringify({status: 'ok', research: $json})}}",
+        "options": {}
+      },
+      "id": "respond",
+      "name": "Respond to caller",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1080, 300]
     }
   ],
   "connections": {
-    "Webhook": {
-      "main": [[{ "node": "Trigger Backend Research", "type": "main", "index": 0 }]]
+    "Webhook (POST /research-opportunity)": {
+      "main": [[{ "node": "Run Research Job", "type": "main", "index": 0 }]]
     },
-    "Trigger Backend Research": {
-      "main": [[{ "node": "Notify Backend", "type": "main", "index": 0 }]]
+    "Run Research Job": {
+      "main": [[{ "node": "Send Telegram Alert", "type": "main", "index": 0 }]]
+    },
+    "Send Telegram Alert": {
+      "main": [[{ "node": "Respond to caller", "type": "main", "index": 0 }]]
     }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all"
   }
 }

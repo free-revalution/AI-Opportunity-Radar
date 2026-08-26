@@ -1,17 +1,18 @@
 {
-  "name": "daily-opportunity-discovery",
-  "active": true,
+  "name": "manual-pipeline",
+  "active": false,
   "nodes": [
     {
       "parameters": {
-        "rule": {
-          "cronExpression": "0 2 * * *"
-        }
+        "httpMethod": "POST",
+        "path": "manual-pipeline",
+        "responseMode": "responseNode",
+        "options": {}
       },
-      "id": "cron-trigger",
-      "name": "Cron (daily 02:00 UTC)",
-      "type": "n8n-nodes-base.scheduleTrigger",
-      "typeVersion": 1.2,
+      "id": "webhook-trigger",
+      "name": "Webhook (POST /manual-pipeline)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
       "position": [240, 300]
     },
     {
@@ -27,17 +28,17 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "{\"sources\": [\"github\",\"reddit\",\"hackernews\",\"producthunt\",\"rss\"]}",
+        "jsonBody": "={{JSON.stringify({sources: $json[\"body\"][\"sources\"] || ['github','reddit','hackernews','producthunt','rss'], mock: !!$json[\"body\"][\"mock\"]})}}",
         "options": {
           "timeout": 600000,
-          "retry": { "maxTries": 3, "waitBetweenTries": 5000 }
+          "retry": { "maxTries": 1 }
         }
       },
       "id": "step-discovery",
-      "name": "1. Discovery (sources)",
+      "name": "1. Discovery",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [520, 300]
+      "position": [520, 200]
     },
     {
       "parameters": {
@@ -51,17 +52,17 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "{\"raw_item_limit\": 500, \"threshold\": 0.82}",
+        "jsonBody": "={{JSON.stringify({raw_item_limit: $json[\"body\"][\"raw_item_limit\"] || 500, threshold: $json[\"body\"][\"threshold\"] || 0.82})}}",
         "options": {
           "timeout": 600000,
-          "retry": { "maxTries": 2, "waitBetweenTries": 8000 }
+          "retry": { "maxTries": 1 }
         }
       },
       "id": "step-clustering",
       "name": "2. Clustering",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [800, 300]
+      "position": [520, 360]
     },
     {
       "parameters": {
@@ -75,17 +76,17 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "{\"limit\": 50}",
+        "jsonBody": "={{JSON.stringify({limit: $json[\"body\"][\"limit\"] || 50, use_mock: !!$json[\"body\"][\"use_mock\"]})}}",
         "options": {
           "timeout": 600000,
-          "retry": { "maxTries": 2, "waitBetweenTries": 8000 }
+          "retry": { "maxTries": 1 }
         }
       },
       "id": "step-screening",
       "name": "3. Screening",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1080, 300]
+      "position": [520, 520]
     },
     {
       "parameters": {
@@ -99,17 +100,17 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "{\"limit\": 200, \"trigger_threshold\": 70}",
+        "jsonBody": "={{JSON.stringify({limit: $json[\"body\"][\"limit\"] || 200, trigger_threshold: 70})}}",
         "options": {
           "timeout": 300000,
-          "retry": { "maxTries": 2, "waitBetweenTries": 8000 }
+          "retry": { "maxTries": 1 }
         }
       },
       "id": "step-scoring",
       "name": "4. Scoring",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1360, 300]
+      "position": [520, 680]
     },
     {
       "parameters": {
@@ -123,17 +124,17 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "{\"limit\": 10, \"max_urls\": 20}",
+        "jsonBody": "={{JSON.stringify({limit: $json[\"body\"][\"research_limit\"] || 5, max_urls: $json[\"body\"][\"max_urls\"] || 20, use_mock_web: !!$json[\"body\"][\"use_mock_web\"], use_mock_llm: !!$json[\"body\"][\"use_mock_llm\"]})}}",
         "options": {
           "timeout": 1800000,
-          "retry": { "maxTries": 1, "waitBetweenTries": 15000 }
+          "retry": { "maxTries": 1 }
         }
       },
       "id": "step-research",
       "name": "5. Deep Research",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1640, 300]
+      "position": [520, 840]
     },
     {
       "parameters": {
@@ -147,44 +148,67 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "{\"max_entries\": 5, \"per_entry_summary_chars\": 240, \"min_score\": 70.0}",
+        "jsonBody": "={{JSON.stringify({max_entries: $json[\"body\"][\"max_entries\"] || 5, dry_run: !!$json[\"body\"][\"dry_run\"]})}}",
         "options": {
           "timeout": 120000,
-          "retry": { "maxTries": 2, "waitBetweenTries": 5000 }
+          "retry": { "maxTries": 1 }
         }
       },
-      "id": "step-digest-send",
+      "id": "step-digest",
       "name": "6. Digest -> Telegram",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1920, 300]
+      "position": [520, 1000]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{JSON.stringify({status: 'pipeline_complete', results: $json})}}",
+        "options": {}
+      },
+      "id": "respond",
+      "name": "Respond to caller",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [820, 300]
     }
   ],
   "connections": {
-    "Cron (daily 02:00 UTC)": {
-      "main": [[{ "node": "1. Discovery (sources)", "type": "main", "index": 0 }]]
+    "Webhook (POST /manual-pipeline)": {
+      "main": [
+        [
+          { "node": "1. Discovery", "type": "main", "index": 0 },
+          { "node": "2. Clustering", "type": "main", "index": 0 },
+          { "node": "3. Screening", "type": "main", "index": 0 },
+          { "node": "4. Scoring", "type": "main", "index": 0 },
+          { "node": "5. Deep Research", "type": "main", "index": 0 },
+          { "node": "6. Digest -> Telegram", "type": "main", "index": 0 }
+        ]
+      ]
     },
-    "1. Discovery (sources)": {
-      "main": [[{ "node": "2. Clustering", "type": "main", "index": 0 }]]
+    "1. Discovery": {
+      "main": [[{ "node": "Respond to caller", "type": "main", "index": 0 }]]
     },
     "2. Clustering": {
-      "main": [[{ "node": "3. Screening", "type": "main", "index": 0 }]]
+      "main": [[{ "node": "Respond to caller", "type": "main", "index": 0 }]]
     },
     "3. Screening": {
-      "main": [[{ "node": "4. Scoring", "type": "main", "index": 0 }]]
+      "main": [[{ "node": "Respond to caller", "type": "main", "index": 0 }]]
     },
     "4. Scoring": {
-      "main": [[{ "node": "5. Deep Research", "type": "main", "index": 0 }]]
+      "main": [[{ "node": "Respond to caller", "type": "main", "index": 0 }]]
     },
     "5. Deep Research": {
-      "main": [[{ "node": "6. Digest -> Telegram", "type": "main", "index": 0 }]]
+      "main": [[{ "node": "Respond to caller", "type": "main", "index": 0 }]]
+    },
+    "6. Digest -> Telegram": {
+      "main": [[{ "node": "Respond to caller", "type": "main", "index": 0 }]]
     }
   },
   "settings": {
     "executionOrder": "v1",
     "saveDataSuccessExecution": "all",
     "saveDataErrorExecution": "all",
-    "timezone": "UTC",
-    "errorWorkflow": ""
+    "timezone": "UTC"
   }
 }

@@ -19,7 +19,7 @@ This repository contains the **full source** of the product. We do **not** vendo
 | 7 | Deep research engine | **done** |
 | 8 | Telegram notifications | **done** |
 | 9 | Dashboard polish | **done** |
-| 10 | n8n workflows | wired (stubs only) |
+| 10 | n8n workflows | **done** |
 | 11 | Browser Use integration | planned |
 | 12 | Monitoring + ops | planned |
 
