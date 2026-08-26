@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator
 
 import pytest
@@ -14,10 +15,17 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from app.config import get_settings
-from app.db import get_session
-from app.main import create_app
-from app.models import Base
+# Disable webhook auth + force mock mode for tests BEFORE app modules are
+# imported — they cache settings via @lru_cache.
+os.environ.setdefault("APP_SECRET_KEY", "")
+os.environ.setdefault("MOCK_EXTERNAL_SERVICES", "true")
+os.environ.setdefault("TELEGRAM_BOT_TOKEN", "")
+os.environ.setdefault("TELEGRAM_CHAT_ID", "")
+
+from app.config import get_settings  # noqa: E402
+from app.db import get_session  # noqa: E402
+from app.main import create_app  # noqa: E402
+from app.models import Base  # noqa: E402
 
 
 @pytest.fixture
