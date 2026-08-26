@@ -11,9 +11,9 @@ This repository contains the **full source** of the product. We do **not** vendo
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Project init / Docker / Backend skeleton / Frontend skeleton / Tests | **done** |
-| 2 | Alembic migrations + repositories | next |
-| 3 | Source connectors (GitHub, Reddit, HN, Product Hunt, RSS) | planned |
-| 4 | Deduplication + clustering | planned |
+| 2 | Alembic migrations + repositories | **done** |
+| 3 | Source connectors (GitHub, Reddit, HN, Product Hunt, RSS) | **done** |
+| 4 | Deduplication + clustering | **done** |
 | 5 | AI screening | planned |
 | 6 | Opportunity scoring (formula already implemented in code) | planned |
 | 7 | Deep research engine | planned |

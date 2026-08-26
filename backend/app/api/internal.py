@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.db import get_session
+from app.services.clustering import ClusteringService
 from app.services.ingestion import IngestionService
 from app.utils import get_logger
 
@@ -105,3 +106,44 @@ async def build_digest(
         ],
         "total_opportunities": total,
     }
+
+
+@router.post(
+    "/clustering/run",
+    summary="Embed + cluster unclustered RawItems into Opportunities",
+)
+async def run_clustering(
+    body: dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 4 endpoint — called by n8n after `discovery/run`.
+
+    Body (all optional):
+        {
+          "raw_item_limit": 500,    # cap items per pass
+          "threshold": 0.82          # cosine threshold override
+        }
+    """
+    body = body or {}
+    raw_item_limit = int(body.get("raw_item_limit") or 500)
+    threshold_override = body.get("threshold")
+
+    service = ClusteringService(
+        session,
+        raw_item_limit=raw_item_limit,
+    )
+    if threshold_override is not None:
+        try:
+            from app.services.clustering import Clusterer
+
+            service.clusterer = Clusterer(threshold=float(threshold_override))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"invalid threshold: {exc}",
+            ) from exc
+
+    report = await service.run_once()
+    logger.info("clustering_run_complete", **report.as_dict())
+    return report.as_dict()

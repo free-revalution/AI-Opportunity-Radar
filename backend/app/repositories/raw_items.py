@@ -14,11 +14,10 @@ import hashlib
 from typing import Any, Optional
 
 from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError  # noqa: F401 — kept for callers
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import RawItem
+from app.models import OpportunitySource, RawItem
 
 
 def compute_content_hash(url: str, title: str) -> str:
@@ -46,6 +45,27 @@ class RawItemRepository:
             select(RawItem).where(RawItem.content_hash == content_hash)
         )
         return result.scalar_one_or_none()
+
+    async def list_recent(self, limit: int = 200) -> list[RawItem]:
+        """Return the most recently fetched RawItems (no cluster filter)."""
+        result = await self.session.execute(
+            select(RawItem).order_by(RawItem.fetched_at.desc()).limit(limit)
+        )
+        return list(result.scalars().all())
+
+    async def list_unclustered(self, limit: int = 200) -> list[RawItem]:
+        """RawItems not yet linked to any Opportunity.
+
+        Used by the clustering service — keeps the pipeline idempotent.
+        """
+        linked_ids_subquery = select(OpportunitySource.raw_item_id)
+        result = await self.session.execute(
+            select(RawItem)
+            .where(RawItem.id.notin_(linked_ids_subquery))
+            .order_by(RawItem.fetched_at.desc())
+            .limit(limit)
+        )
+        return list(result.scalars().all())
 
     async def create(self, *, content_hash: str, **fields: Any) -> RawItem:
         item = RawItem(content_hash=content_hash, **fields)
