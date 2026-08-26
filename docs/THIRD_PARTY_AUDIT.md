@@ -28,7 +28,8 @@ The MVP **does not** fork, vendor, or re-distribute any of these projects. Each 
 
 - **Library** (`browser-use` on PyPI): MIT-style permissive license, useful as reference.
 - **Cloud service** (`https://api.browser-use.com`): commercial ToS, preferred for MVP because it removes Playwright/Chromium operational burden.
-- **Fallback chain** (required): Browser Use → Firecrawl → raw HTTP → skip. Never let a browser-use failure take down a research job.
+- **Fallback chain** (mandatory): Browser Use → Firecrawl → offline Mock. Implemented as a `FallbackWebDataProvider` composite in `backend/app/services/research/fallback_provider.py` — every `ExternalServiceError` from Browser Use is caught and the next provider is tried automatically. The chain is always terminated by an offline Mock so a single vendor outage never aborts a research job.
+- **Roadmap**: the audit originally specified Browser Use → Firecrawl → raw HTTP → skip; the raw HTTP step is deferred to a later phase.
 
 ### Deep Research (dzhng/deep-research)
 
@@ -53,12 +54,15 @@ The MVP **does not** fork, vendor, or re-distribute any of these projects. Each 
 
 ```
 Our Backend (MIT-style, our own code)
-    ├── FirecrawlService   ← talks to firecrawl.dev REST API
-    ├── BrowserUseService  ← talks to api.browser-use.com (or self-host)
-    ├── ResearchService    ← our own iterative loop (inspired by deep-research)
-    ├── LLMRouter          ← OpenAI / Anthropic / Gemini
-    ├── Source connectors  ← GitHub, Reddit, HN, Product Hunt, RSS, ...
-    └── TelegramService    ← bot token only, no source code copy
+    ├── FirecrawlWebDataProvider   ← talks to firecrawl.dev REST API
+    ├── BrowserUseWebDataProvider  ← talks to api.browser-use.com (or self-host)
+    │     ↑ wrapped by ↓
+    ├── FallbackWebDataProvider    ← BU → Firecrawl → Mock chain (catches
+    │                                ExternalServiceError per step)
+    ├── ResearchService            ← our own iterative loop (inspired by deep-research)
+    ├── LLMRouter                  ← OpenAI / Anthropic / Gemini
+    ├── Source connectors          ← GitHub, Reddit, HN, Product Hunt, RSS, ...
+    └── TelegramService            ← bot token only, no source code copy
 ```
 
-Every external dependency is hidden behind a Python `Protocol` interface so tests can substitute a fake implementation.
+Every external dependency is hidden behind a Python `WebDataProvider` (or `LLMProvider`, `TelegramProvider`) interface so tests can substitute a fake implementation.

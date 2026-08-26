@@ -280,6 +280,7 @@ async def run_research(
     max_urls = body.get("max_urls")
     use_mock_web = bool(body.get("use_mock_web"))
     use_mock_llm = bool(body.get("use_mock_llm"))
+    web_prefer = body.get("web_prefer")
 
     service = ResearchService(
         session,
@@ -290,6 +291,12 @@ async def run_research(
         from app.services.research.mock_web_data import MockWebDataProvider
 
         service.web = MockWebDataProvider()
+    elif web_prefer:
+        from app.services.research.web_data import build_web_data_provider
+
+        service.web = build_web_data_provider(
+            get_settings(), prefer=str(web_prefer)
+        )
     if use_mock_llm:
         from app.services.research.mock_llm import MockResearchLLMProvider
 
@@ -321,8 +328,15 @@ async def run_one_research_job(
     body = body or {}
     use_mock_web = bool(body.get("use_mock_web"))
     use_mock_llm = bool(body.get("use_mock_llm"))
+    web_prefer = body.get("web_prefer")
 
     service = ResearchService(session)
+    if web_prefer and not use_mock_web:
+        from app.services.research.web_data import build_web_data_provider
+
+        service.web = build_web_data_provider(
+            get_settings(), prefer=str(web_prefer)
+        )
     if use_mock_llm:
         from app.services.research.mock_llm import MockResearchLLMProvider
 

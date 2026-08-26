@@ -61,18 +61,47 @@ def _check_llm() -> dict[str, Any]:
     return {"status": "healthy", "providers": configured}
 
 
+def _probe_url(url: str, *, timeout: float = 3.0) -> tuple[bool, str]:
+    """Best-effort synchronous GET against *url*.
+
+    Returns `(ok, detail)`. Never raises — any exception becomes
+    `ok=False` with the message attached. The endpoint is wired so a
+    probe failure can never break the overall health response.
+    """
+    try:
+        import httpx  # local import — the app must boot without it
+
+        with httpx.Client(timeout=timeout) as client:
+            response = client.get(url)
+        if 200 <= response.status_code < 300:
+            return True, ""
+        return False, f"HTTP {response.status_code}: {response.text[:120]}"
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)[:200]
+
+
 def _check_firecrawl() -> dict[str, Any]:
     s = get_settings()
     if not s.firecrawl_api_key:
         return {"status": "degraded", "note": "FIRECRAWL_API_KEY not set"}
-    return {"status": "healthy"}
+    ok, detail = _probe_url(f"{s.firecrawl_api_url.rstrip('/')}/api/v1/health")
+    if ok:
+        return {"status": "healthy"}
+    return {"status": "degraded", "note": "firecrawl probe failed", "detail": detail}
 
 
 def _check_browser_use() -> dict[str, Any]:
     s = get_settings()
     if not s.browser_use_api_key:
         return {"status": "degraded", "note": "BROWSER_USE_API_KEY not set"}
-    return {"status": "healthy"}
+    ok, detail = _probe_url(f"{s.browser_use_api_url.rstrip('/')}/healthz")
+    if ok:
+        return {"status": "healthy"}
+    return {
+        "status": "degraded",
+        "note": "browser_use probe failed",
+        "detail": detail,
+    }
 
 
 def _check_telegram() -> dict[str, Any]:

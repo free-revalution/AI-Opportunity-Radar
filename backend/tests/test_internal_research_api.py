@@ -113,6 +113,57 @@ async def test_research_run_noop_when_no_pending_jobs(client):
     assert body["jobs_completed"] == 0
 
 
+async def test_research_run_web_prefer_overrides_service_web(
+    client, monkeypatch
+) -> None:
+    """When `web_prefer` is supplied, the endpoint must rebuild the
+    web provider through the factory (same seam as `use_mock_web`).
+    """
+    job_id = await _seed_research_job(client)
+    captured: dict[str, object] = {}
+
+    def fake_build(settings, *, prefer: str = "auto"):
+        captured["prefer"] = prefer
+        return _RecordingWebProvider("recorder")
+
+    from app.services.research import web_data as web_data_mod
+
+    monkeypatch.setattr(web_data_mod, "build_web_data_provider", fake_build)
+    response = client.post(
+        "/api/internal/research/run",
+        json={"web_prefer": "browser_use", "use_mock_llm": True},
+    )
+    assert response.status_code == 200
+    assert captured["prefer"] == "browser_use"
+
+
+async def test_research_run_use_mock_web_beats_web_prefer(
+    client, monkeypatch
+) -> None:
+    """`use_mock_web=True` must always win over `web_prefer` — back-compat."""
+    job_id = await _seed_research_job(client)
+    called = {"factory": 0}
+
+    def fake_build(settings, *, prefer: str = "auto"):
+        called["factory"] += 1
+        return _RecordingWebProvider("recorder")
+
+    from app.services.research import web_data as web_data_mod
+
+    monkeypatch.setattr(web_data_mod, "build_web_data_provider", fake_build)
+    response = client.post(
+        "/api/internal/research/run",
+        json={
+            "use_mock_web": True,
+            "web_prefer": "browser_use",
+            "use_mock_llm": True,
+        },
+    )
+    assert response.status_code == 200
+    # Factory should NOT have been consulted when use_mock_web wins.
+    assert called["factory"] == 0
+
+
 # ---------------------------------------------------------------------------
 # /api/internal/research/run/{job_id}
 # ---------------------------------------------------------------------------
@@ -191,3 +242,47 @@ async def test_research_cancel_after_completion_returns_false(client):
     response = client.post(f"/api/internal/research/cancel/{job_id}")
     assert response.status_code == 200
     assert response.json()["cancelled"] is False
+
+
+# ---------------------------------------------------------------------------
+# Phase 11 — web_prefer on the single-job endpoint
+# ---------------------------------------------------------------------------
+async def test_research_run_one_job_web_prefer_overrides_service_web(
+    client, monkeypatch
+) -> None:
+    """The /{job_id} endpoint must also honour web_prefer."""
+    job_id = await _seed_research_job(client)
+    captured: dict[str, object] = {}
+
+    def fake_build(settings, *, prefer: str = "auto"):
+        captured["prefer"] = prefer
+        return _RecordingWebProvider("recorder")
+
+    from app.services.research import web_data as web_data_mod
+
+    monkeypatch.setattr(web_data_mod, "build_web_data_provider", fake_build)
+    response = client.post(
+        f"/api/internal/research/run/{job_id}",
+        json={"web_prefer": "browser_use"},
+    )
+    assert response.status_code == 200
+    assert captured["prefer"] == "browser_use"
+
+
+# ---------------------------------------------------------------------------
+# Test helpers
+# ---------------------------------------------------------------------------
+class _RecordingWebProvider:
+    """Tiny stand-in WebDataProvider — exists so we can verify the
+    factory is called and assigned to `service.web`."""
+
+    name = "recorder"
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        return
+
+    async def search(self, query: str, *, limit: int = 5) -> list:  # pragma: no cover
+        return []
+
+    async def scrape(self, url: str):  # pragma: no cover
+        raise NotImplementedError

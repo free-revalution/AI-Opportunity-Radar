@@ -1,4 +1,4 @@
-"""Research service package — Phase 7.
+"""Research service package — Phase 7 / Phase 11.
 
 Public surface:
 
@@ -6,10 +6,14 @@ Public surface:
     ResearchReportSummary     batch outcome
     ResearchReportOutcome     per-job outcome
     parse_research_report     strict LLM-output validator
-    build_web_data_provider   picks the configured WebDataProvider
-    WebDataProvider / SourceDoc / FirecrawlWebDataProvider / MockWebDataProvider
+    build_web_data_provider   picks the configured WebDataProvider chain
+    WebDataProvider / SourceDoc
+    FirecrawlWebDataProvider / BrowserUseWebDataProvider / FallbackWebDataProvider
+    MockWebDataProvider / MockResearchLLMProvider
 """
 
+from app.services.research.browser_use_provider import BrowserUseWebDataProvider
+from app.services.research.fallback_provider import FallbackWebDataProvider
 from app.services.research.firecrawl_provider import FirecrawlWebDataProvider
 from app.services.research.mock_llm import MockResearchLLMProvider
 from app.services.research.mock_web_data import MockWebDataProvider
@@ -31,6 +35,8 @@ from app.services.research.web_data import (
 )
 
 __all__ = [
+    "BrowserUseWebDataProvider",
+    "FallbackWebDataProvider",
     "FirecrawlWebDataProvider",
     "MockResearchLLMProvider",
     "MockWebDataProvider",

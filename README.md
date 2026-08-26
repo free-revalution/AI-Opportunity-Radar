@@ -20,7 +20,7 @@ This repository contains the **full source** of the product. We do **not** vendo
 | 8 | Telegram notifications | **done** |
 | 9 | Dashboard polish | **done** |
 | 10 | n8n workflows | **done** |
-| 11 | Browser Use integration | planned |
+| 11 | Browser Use integration | **done** |
 | 12 | Monitoring + ops | planned |
 
 ---
@@ -34,10 +34,13 @@ Internet
               └── AI screening (LLM)
                     └── Signal rows
                           └── Opportunity scoring (deterministic formula)
-                                └── Deep Research (LLM + Firecrawl)
+                                └── Deep Research (LLM + Firecrawl + Browser Use*)
                                       └── ResearchReport rows
                                             └── Telegram digest (daily 02:00 UTC)
                                             └── Next.js dashboard
+
+\* Phase 11 — the `FallbackWebDataProvider` composite automatically falls
+through Browser Use → Firecrawl → offline Mock on any `ExternalServiceError`.
 ```
 
 Five independent open-source projects are **consumed as services**:
@@ -146,7 +149,7 @@ See [.env.example](.env.example). The key flags:
 | `REDIS_URL` | yes (prod) | redis DSN |
 | `OPENAI_API_KEY` | optional | LLM provider |
 | `FIRECRAWL_API_KEY` | optional | web data layer |
-| `BROWSER_USE_API_KEY` | optional | browser interaction layer |
+| `BROWSER_USE_API_KEY` | optional | browser interaction layer (Phase 11) |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | optional | daily digest push |
 | `N8N_BASE_URL` / `N8N_API_KEY` | optional | workflow orchestration |
 | `MOCK_EXTERNAL_SERVICES` | yes (local) | when true, services fall back to fixtures |
