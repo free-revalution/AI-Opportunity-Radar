@@ -22,6 +22,7 @@ expansion is left as a no-op stub for a later phase.
 from __future__ import annotations
 
 import dataclasses
+import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -188,6 +189,9 @@ class ResearchService:
 
             web = MockWebDataProvider()
 
+        from app.metrics import observe_research_job
+
+        started = time.perf_counter()
         try:
             urls, source_docs = await self._gather_sources(opp, web)
             parsed = await self._synthesise(opp, source_docs)
@@ -215,8 +219,10 @@ class ResearchService:
                 sources=outcome.sources_count,
                 warnings=len(warnings),
             )
+            observe_research_job(time.perf_counter() - started)
             return outcome
         except Exception as exc:  # noqa: BLE001
+            observe_research_job(time.perf_counter() - started)
             logger.exception(
                 "research_job_error",
                 job_id=job_obj.id,

@@ -103,6 +103,13 @@ class Settings(BaseSettings):
         default_factory=lambda: ["github", "reddit", "hackernews", "producthunt", "rss"]
     )
 
+    # ---------- Observability (Phase 12) ----------
+    prometheus_metrics_enabled: bool = True
+
+    # ---------- Backups (Phase 12) ----------
+    backup_container_name: str = "radar-postgres"
+    backup_output_dir: str = "./backups"
+
     # ---------- Validators ----------
     @field_validator("cors_allow_origins", "enabled_sources", mode="before")
     @classmethod

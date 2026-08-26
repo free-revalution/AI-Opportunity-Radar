@@ -11,13 +11,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from app import __version__
 from app.api.health import router as health_router
 from app.api.internal import router as internal_router
+from app.api.metrics import router as metrics_router
 from app.api.notifications import router as notifications_router
 from app.api.opportunities import router as opportunities_router
+from app.api.readiness import router as readiness_router
 from app.api.research import router as research_router
 from app.api.sources import router as sources_router
 from app.api.trends import router as trends_router
 from app.config import get_settings
 from app.db import close_db, init_db
+from app.middleware import HTTPMetricsMiddleware
 from app.utils import configure_logging, get_logger
 
 logger = get_logger(__name__)
@@ -70,14 +73,21 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    # Phase 12: HTTP request count + latency. Pure ASGI so it does not
+    # interfere with streaming responses (Starlette's BaseHTTPMiddleware
+    # has known issues there). Always-on — `prometheus_metrics_enabled`
+    # gates only the `/api/metrics` exposition endpoint.
+    app.add_middleware(HTTPMetricsMiddleware)
 
     # Routers
     app.include_router(health_router, prefix="/api", tags=["health"])
+    app.include_router(readiness_router, prefix="/api", tags=["health"])
     app.include_router(opportunities_router, prefix="/api", tags=["opportunities"])
     app.include_router(research_router, prefix="/api", tags=["research"])
     app.include_router(notifications_router, prefix="/api", tags=["notifications"])
     app.include_router(sources_router, prefix="/api", tags=["sources"])
     app.include_router(trends_router, prefix="/api", tags=["trends"])
+    app.include_router(metrics_router, prefix="/api", tags=["metrics"])
     app.include_router(internal_router, prefix="/api/internal", tags=["internal"])
 
     return app

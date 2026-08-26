@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.db import get_session
+from app.metrics import record_pipeline_run
 from app.services.clustering import ClusteringService
 from app.services.ingestion import IngestionService
 from app.services.notification import NotificationService
@@ -75,7 +76,7 @@ async def run_discovery(
     mock = body.get("mock")
 
     service = IngestionService(session, source_slugs=sources, mock=mock)
-    report = await service.run_once()
+    report = await record_pipeline_run("discovery", service.run_once)
 
     logger.info(
         "ingestion_run_complete",
@@ -148,7 +149,7 @@ async def run_clustering(
                 detail=f"invalid threshold: {exc}",
             ) from exc
 
-    report = await service.run_once()
+    report = await record_pipeline_run("clustering", service.run_once)
     logger.info("clustering_run_complete", **report.as_dict())
     return report.as_dict()
 
@@ -180,7 +181,7 @@ async def run_screening(
 
         service.provider = MockLLMProvider()
 
-    report = await service.run_once()
+    report = await record_pipeline_run("screening", service.run_once)
     logger.info("screening_run_complete", **report.as_dict())
     return report.as_dict()
 
@@ -214,7 +215,7 @@ async def run_scoring(
         blend_signals=blend_signals,
         trigger_threshold=float(threshold) if threshold is not None else None,
     )
-    report = await service.run_once()
+    report = await record_pipeline_run("scoring", service.run_once)
     logger.info("scoring_run_complete", **report.as_dict())
     return report.as_dict()
 
@@ -302,7 +303,7 @@ async def run_research(
 
         service.llm = MockResearchLLMProvider()
 
-    report = await service.run_once()
+    report = await record_pipeline_run("research", service.run_once)
     logger.info("research_run_complete", **report.as_dict())
     return report.as_dict()
 
@@ -472,12 +473,15 @@ async def send_digest(
         ) from exc
 
     service = _build_notification_service(session)
-    summary = await service.send_digest(
-        chat_id=chat_id,
-        dry_run=dry_run,
-        max_entries=max_entries,
-        per_entry_summary_chars=per_entry_summary_chars,
-        min_score=min_score_f,
+    summary = await record_pipeline_run(
+        "notifications",
+        lambda: service.send_digest(
+            chat_id=chat_id,
+            dry_run=dry_run,
+            max_entries=max_entries,
+            per_entry_summary_chars=per_entry_summary_chars,
+            min_score=min_score_f,
+        ),
     )
     logger.info("notifications_digest_dispatched", **summary.as_dict())
     return summary.as_dict()

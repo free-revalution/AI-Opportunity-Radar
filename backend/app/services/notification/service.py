@@ -13,15 +13,16 @@ and what failed.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Optional
+from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
+from app.metrics import record_notification
 from app.models import Notification, Opportunity, ResearchReport
 from app.repositories import OpportunityRepository
 from app.services.notification.formatting import (
@@ -47,14 +48,14 @@ logger = get_logger(__name__)
 class NotificationOutcome:
     """Outcome of one `send_*` call."""
 
-    notification_id: Optional[int]
+    notification_id: int | None
     channel: str
     chat_id: str
     delivered: bool
     text_chars: int
     provider: str
-    error: Optional[str] = None
-    message_id: Optional[str] = None
+    error: str | None = None
+    message_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -64,10 +65,10 @@ class DigestSendSummary:
     notifications_attempted: int = 0
     notifications_delivered: int = 0
     notifications_failed: int = 0
-    chat_id: Optional[str] = None
+    chat_id: str | None = None
     text_chars: int = 0
     errors: list[str] = field(default_factory=list)
-    preview: Optional[str] = None
+    preview: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return dataclasses.asdict(self)
@@ -103,7 +104,7 @@ class NotificationService:
         *,
         max_entries: int = 5,
         per_entry_summary_chars: int = 240,
-        min_score: Optional[float] = None,
+        min_score: float | None = None,
     ) -> dict[str, Any]:
         """Compose the digest text + return it without sending."""
         entries = await self._collect_digest_entries(
@@ -146,11 +147,11 @@ class NotificationService:
     async def send_digest(
         self,
         *,
-        chat_id: Optional[str] = None,
+        chat_id: str | None = None,
         dry_run: bool = False,
         max_entries: int = 5,
         per_entry_summary_chars: int = 240,
-        min_score: Optional[float] = None,
+        min_score: float | None = None,
     ) -> DigestSendSummary:
         """Build + send the daily digest."""
         target_chat = (chat_id or self.settings.telegram_chat_id or "").strip()
@@ -200,9 +201,9 @@ class NotificationService:
         self,
         opportunity_id: int,
         *,
-        chat_id: Optional[str] = None,
+        chat_id: str | None = None,
         dry_run: bool = False,
-        extra_note: Optional[str] = None,
+        extra_note: str | None = None,
         max_summary_chars: int = 600,
     ) -> NotificationOutcome:
         """Send a single-opportunity alert to `chat_id`."""
@@ -263,7 +264,7 @@ class NotificationService:
         )
 
     async def list_history(
-        self, *, limit: int = 50, channel: Optional[str] = None
+        self, *, limit: int = 50, channel: str | None = None
     ) -> list[Notification]:
         result = await self.session.execute(
             select(Notification)
@@ -282,7 +283,7 @@ class NotificationService:
         self,
         *,
         max_entries: int,
-        min_score: Optional[float],
+        min_score: float | None,
     ) -> list[DigestEntry]:
         repo = OpportunityRepository(self.session)
         rows, _total = await repo.list_paginated(
@@ -332,7 +333,7 @@ class NotificationService:
 
     async def _entry_for_opportunity(
         self, opportunity_id: int
-    ) -> Optional[DigestEntry]:
+    ) -> DigestEntry | None:
         repo = OpportunityRepository(self.session)
         r = await repo.get_by_id(opportunity_id)
         if r is None:
@@ -395,7 +396,7 @@ class NotificationService:
                 "provider": result.provider,
                 "message_id": result.message_id,
             },
-            delivered_at=datetime.now(timezone.utc) if result.ok else None,
+            delivered_at=datetime.now(UTC) if result.ok else None,
             error=None if result.ok else (result.error or "unknown error")[:2000],
         )
         self.session.add(notification)
@@ -410,6 +411,11 @@ class NotificationService:
             text_chars=len(text or ""),
             notification_id=notification.id,
             kind=payload.get("kind"),
+        )
+        record_notification(
+            kind=str(payload.get("kind") or "unknown"),
+            provider=result.provider,
+            outcome="success" if result.ok else "error",
         )
 
         return NotificationOutcome(

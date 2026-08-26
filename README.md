@@ -21,7 +21,7 @@ This repository contains the **full source** of the product. We do **not** vendo
 | 9 | Dashboard polish | **done** |
 | 10 | n8n workflows | **done** |
 | 11 | Browser Use integration | **done** |
-| 12 | Monitoring + ops | planned |
+| 12 | Monitoring + ops | **done** |
 
 ---
 
@@ -41,6 +41,10 @@ Internet
 
 \* Phase 11 — the `FallbackWebDataProvider` composite automatically falls
 through Browser Use → Firecrawl → offline Mock on any `ExternalServiceError`.
+
+† Phase 12 — the backend exposes Prometheus text-format on `/api/metrics`
+and a strict readiness probe at `/api/health/ready`. See
+[`docs/RUNBOOK.md`](docs/RUNBOOK.md) + [`docs/ALERTS.md`](docs/ALERTS.md).
 ```
 
 Five independent open-source projects are **consumed as services**:
@@ -153,6 +157,19 @@ See [.env.example](.env.example). The key flags:
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | optional | daily digest push |
 | `N8N_BASE_URL` / `N8N_API_KEY` | optional | workflow orchestration |
 | `MOCK_EXTERNAL_SERVICES` | yes (local) | when true, services fall back to fixtures |
+
+## Observability (Phase 12)
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/health/live` | Liveness probe — always 200 while the process is up |
+| `GET /api/health/ready` | Readiness probe — 200 only when Postgres + Redis are healthy |
+| `GET /api/health` | Deep per-dependency status (every external + DB + cache) |
+| `GET /api/metrics` | Prometheus text-format exposition — scrape with your own monitoring stack |
+
+`make backup`, `make restore`, `make backup-dry`, `make metrics-scrape`
+for day-to-day operator actions. See [`docs/RUNBOOK.md`](docs/RUNBOOK.md)
+and [`docs/ALERTS.md`](docs/ALERTS.md).
 
 When `MOCK_EXTERNAL_SERVICES=true` and an API key is missing, the connector returns
 fixture data so you can develop without paying for external services.

@@ -35,15 +35,32 @@ async def _check_postgres(session: AsyncSession) -> dict[str, Any]:
 
 async def _check_redis() -> dict[str, Any]:
     """Cheap Redis ping using an inline client (avoids hard dependency at import time)."""
-    try:
-        import redis.asyncio as redis_async  # type: ignore[import-not-found]
+    return await _check_redis_with_client()
 
-        client = redis_async.from_url(get_settings().redis_url, decode_responses=True)
-        try:
-            pong = await asyncio.wait_for(client.ping(), timeout=3.0)
-            return {"status": "healthy" if pong else "down"}
-        finally:
-            await client.aclose()
+
+async def _check_redis_with_client(
+    client: object | None = None,
+) -> dict[str, Any]:
+    """Ping Redis; tests inject a fake client to exercise the healthy branch.
+
+    Without a client we build an inline `redis.asyncio` connection from
+    `settings.redis_url` and dispose it on exit. Any error becomes
+    `{"status": "down"}` with the message attached.
+    """
+    try:
+        if client is None:
+            import redis.asyncio as redis_async  # type: ignore[import-not-found]
+
+            owned = redis_async.from_url(
+                get_settings().redis_url, decode_responses=True
+            )
+            try:
+                pong = await asyncio.wait_for(owned.ping(), timeout=3.0)
+                return {"status": "healthy" if pong else "down"}
+            finally:
+                await owned.aclose()
+        pong = await asyncio.wait_for(client.ping(), timeout=3.0)
+        return {"status": "healthy" if pong else "down"}
     except Exception as exc:  # noqa: BLE001
         return {"status": "down", "error": str(exc)[:200]}
 

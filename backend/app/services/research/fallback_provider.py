@@ -16,8 +16,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
 
+from app.metrics import (
+    record_external_error,
+    record_web_data_call,
+)
 from app.services.research.web_data import SourceDoc, WebDataProvider
 from app.utils import ExternalServiceError, get_logger
 
@@ -68,15 +71,18 @@ class FallbackWebDataProvider(WebDataProvider):
     # ------------------------------------------------------------------
     async def search(self, query: str, *, limit: int = 5) -> list[SourceDoc]:
         last_error: ExternalServiceError | None = None
+        chain = self.chain
         for provider in self._providers:
             pname = getattr(provider, "name", "?")
             try:
                 docs = await provider.search(query, limit=limit)
             except ExternalServiceError as exc:
+                record_web_data_call(pname, "search", "error", chain)
+                record_external_error(pname, type(exc).__name__)
                 logger.warning(
                     "web_fallback_search_step_failed",
                     provider=pname,
-                    chain=self.chain,
+                    chain=chain,
                     error=str(exc),
                 )
                 last_error = exc
@@ -84,37 +90,44 @@ class FallbackWebDataProvider(WebDataProvider):
             if not docs:
                 # Empty isn't an error — but try the next provider in case
                 # it can produce richer results.
+                record_web_data_call(pname, "search", "empty", chain)
                 logger.info(
                     "web_fallback_search_empty",
                     provider=pname,
-                    chain=self.chain,
+                    chain=chain,
                 )
                 continue
+            record_web_data_call(pname, "search", "success", chain)
             return docs
 
         if last_error is not None:
             self._raise_chained(last_error)
         # All providers returned empty; surface as no results (the engine
         # already tolerates an empty list, but we want to log it).
-        logger.warning("web_fallback_search_all_empty", chain=self.chain)
+        logger.warning("web_fallback_search_all_empty", chain=chain)
         return []
 
     async def scrape(self, url: str) -> SourceDoc:
         last_error: ExternalServiceError | None = None
+        chain = self.chain
         for provider in self._providers:
             pname = getattr(provider, "name", "?")
             try:
-                return await provider.scrape(url)
+                doc = await provider.scrape(url)
             except ExternalServiceError as exc:
+                record_web_data_call(pname, "scrape", "error", chain)
+                record_external_error(pname, type(exc).__name__)
                 logger.warning(
                     "web_fallback_scrape_step_failed",
                     provider=pname,
-                    chain=self.chain,
+                    chain=chain,
                     error=str(exc),
                     url=url,
                 )
                 last_error = exc
                 continue
+            record_web_data_call(pname, "scrape", "success", chain)
+            return doc
 
         # Unreachable if the chain is non-empty — defend against None.
         if last_error is None:  # pragma: no cover

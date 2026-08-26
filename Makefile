@@ -14,7 +14,7 @@ FRONTEND_DIR := frontend
 
 .PHONY: help install dev backend frontend test test-backend test-frontend \
         lint format migrate seed docker-up docker-down docker-logs clean \
-        n8n-sync n8n-validate
+        n8n-sync n8n-validate backup backup-dry restore restore-dry metrics-scrape
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-22s\033[0m %s\n", $$1, $$2}'
@@ -82,3 +82,18 @@ n8n-validate: ## Validate every n8n/workflows/*.json (no network calls)
 
 n8n-sync: ## Push n8n/workflows/*.json into the running n8n container (activate)
 	cd $(BACKEND_DIR) && $(PYTHON) -m scripts.n8n_sync --activate
+
+backup: ## Dump the Postgres container to ./backups/radar-<UTC>.sql
+	cd $(BACKEND_DIR) && bash scripts/backup_postgres.sh
+
+backup-dry: ## Show what `make backup` would do without running docker
+	cd $(BACKEND_DIR) && bash scripts/backup_postgres.sh --dry-run
+
+restore: ## Restore a SQL dump into the Postgres container (use --file=path)
+	cd $(BACKEND_DIR) && bash scripts/restore_postgres.sh
+
+restore-dry: ## Show what `make restore` would do (pass --file=path)
+	cd $(BACKEND_DIR) && bash scripts/restore_postgres.sh
+
+metrics-scrape: ## Curl the Prometheus metrics endpoint and grep for radar_*
+	@curl -sf http://localhost:8000/api/metrics | grep '^radar_' | head -40 || echo "(backend not running on localhost:8000)"
