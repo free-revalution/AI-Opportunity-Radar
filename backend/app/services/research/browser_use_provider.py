@@ -9,23 +9,25 @@ engine can swap providers transparently and so the
 Endpoints (hosted cloud API at `BROWSER_USE_API_URL`,
 default `https://api.browser-use.com`):
 
-  * `POST /api/v1/search` — body `{"query": str, "limit": int}`
-    response: `{"results": [{"url", "title", "description"}], ...}`
-  * `POST /api/v1/scrape` — body `{"url": str}`
-    response: `{"markdown": str, "title": str, ...}`
+  * `POST /api/v2/tasks` — body `{"task": str, "llm": str (optional)}`
+    returns `{"id": str, "sessionId": str}` (async — caller polls)
+  * `GET  /api/v2/tasks/{task_id}` — returns the current task state
+    including `status` (`pending|started|finished|failed`), `output`,
+    `steps`, `cost`, `isSuccess`.
+  * `POST /api/v2/tasks/{task_id}/stop` — cancel a running task.
 
-The exact paths are best-effort against the public cloud API; the
-provider is unit-tested with a stubbed httpx transport so we can patch
-the constants below without breaking callers. Every error is surfaced
-as `ExternalServiceError(provider="browser_use", ...)` — that is what
-makes the fallback chain work uniformly.
+Authentication uses `X-Browser-Use-API-Key: <key>` (NOT `Authorization: Bearer`).
+Tasks take seconds-to-minutes; we poll `/api/v2/tasks/{id}` until the
+status flips to `finished` or `failed`, bounded by `poll_timeout` seconds.
 
-# TODO(verify-endpoints): confirm `/api/v1/search` and `/api/v1/scrape`
-# against the live docs at https://docs.browser-use.com when convenient.
+Every error is surfaced as `ExternalServiceError(provider="browser_use", ...)`
+so the fallback chain in `app.services.research.fallback_provider` can
+swap providers uniformly.
 """
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -35,9 +37,9 @@ from app.utils import ExternalServiceError, assert_safe_url, get_logger
 
 logger = get_logger(__name__)
 
-# Cloud REST endpoints — see module docstring.
-_SEARCH_PATH = "/api/v1/search"
-_SCRAPE_PATH = "/api/v1/scrape"
+# Cloud REST endpoints — v2 (see module docstring).
+_TASK_PATH = "/api/v2/tasks"
+_TASK_POLL_INTERVAL = 2.0  # seconds between status polls
 
 
 class BrowserUseWebDataProvider(WebDataProvider):
@@ -51,6 +53,7 @@ class BrowserUseWebDataProvider(WebDataProvider):
         api_key: str,
         base_url: str = "https://api.browser-use.com",
         timeout: float = 30.0,
+        poll_timeout: float = 120.0,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         if not api_key:
@@ -58,68 +61,40 @@ class BrowserUseWebDataProvider(WebDataProvider):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.poll_timeout = poll_timeout
         self._client = client
         self._owns_client = client is None
 
     # ------------------------------------------------------------------
-    # public API
+    # public API — WebDataProvider contract
     # ------------------------------------------------------------------
     async def search(self, query: str, *, limit: int = 5) -> list[SourceDoc]:
-        client = self._client or httpx.AsyncClient(timeout=self.timeout)
-        owns = self._client is None
-        try:
-            response = await client.post(
-                f"{self.base_url}{_SEARCH_PATH}",
-                json={"query": query, "limit": limit},
-                headers=self._headers(),
-            )
-        except httpx.HTTPError as exc:
-            raise ExternalServiceError(
-                f"browser_use search failed: {exc}",
-                provider=self.name,
-                operation="search",
-            ) from exc
-        finally:
-            if owns:
-                await client.aclose()
-
-        if response.status_code != 200:
-            raise ExternalServiceError(
-                f"browser_use search returned {response.status_code}",
-                provider=self.name,
-                operation="search",
-                body=response.text[:200],
-            )
-
-        payload: dict[str, Any] = response.json()
-        docs: list[SourceDoc] = []
-        # The cloud API returns `{"results": [...]}`; tolerate a bare list
-        # body too — useful for mock mirrors and contract drift.
-        raw = payload.get("results") if isinstance(payload, dict) else None
-        if raw is None and isinstance(payload, list):
-            raw = payload
-        for entry in raw or []:
-            if not isinstance(entry, dict):
-                continue
-            docs.append(
-                SourceDoc(
-                    url=entry.get("url") or "",
-                    title=entry.get("title") or "",
-                    content=(
-                        entry.get("description")
-                        or entry.get("markdown")
-                        or entry.get("snippet")
-                        or ""
-                    ),
-                    via_provider=self.name,
-                    metadata={
-                        "score": entry.get("score"),
-                    },
-                )
-            )
-        return docs
+        """Browser Use has no native search — model a search as a task that
+        asks the browser to enumerate public sources. Returned as a single
+        result because v2 tasks don't produce structured lists.
+        """
+        task = (
+            f"Search the web for: {query!r}. "
+            f"Return the top {limit} URLs with their titles and a one-sentence "
+            f"snippet for each. Format the answer as a JSON array of "
+            f'{{"url", "title", "snippet"}}.'
+        )
+        output = await self._run_task(task)
+        # Best-effort: the model might not return strict JSON; tolerate text.
+        return [SourceDoc(
+            url="",
+            title=f"browser_use search: {query}",
+            content=output,
+            via_provider=self.name,
+            metadata={"query": query, "limit": limit},
+        )]
 
     async def scrape(self, url: str) -> SourceDoc:
+        """Scrape a URL by handing it to Browser Use as a task.
+
+        The task asks for clean markdown — the orchestrator gets a single
+        SourceDoc regardless of whether the page is static or JS-heavy.
+        """
         # SSRF guard — block private / loopback hosts before any HTTP.
         try:
             assert_safe_url(url)
@@ -130,49 +105,127 @@ class BrowserUseWebDataProvider(WebDataProvider):
                 operation="scrape",
             ) from exc
 
+        task = (
+            f"Open {url} and return the full page content as clean markdown, "
+            f"including the page title and main body text. Do not summarise."
+        )
+        output = await self._run_task(task)
+        return SourceDoc(
+            url=url,
+            title="",
+            content=output,
+            via_provider=self.name,
+            metadata={"status_code": 200},
+        )
+
+    # ------------------------------------------------------------------
+    # internals — v2 async task lifecycle
+    # ------------------------------------------------------------------
+    async def _run_task(self, task_description: str) -> str:
+        """Submit a task and block until it finishes (or times out)."""
         client = self._client or httpx.AsyncClient(timeout=self.timeout)
-        owns = self._client is None
+        owns = self._owns_client
         try:
-            response = await client.post(
-                f"{self.base_url}{_SCRAPE_PATH}",
-                json={"url": url},
-                headers=self._headers(),
-            )
-        except httpx.HTTPError as exc:
-            raise ExternalServiceError(
-                f"browser_use scrape failed: {exc}",
-                provider=self.name,
-                operation="scrape",
-                url=url,
-            ) from exc
+            task_id = await self._create_task(client, task_description)
+            return await self._poll_task(client, task_id)
         finally:
             if owns:
                 await client.aclose()
 
-        if response.status_code != 200:
+    async def _create_task(self, client: httpx.AsyncClient, task: str) -> str:
+        try:
+            response = await client.post(
+                f"{self.base_url}{_TASK_PATH}",
+                json={"task": task},
+                headers=self._headers(),
+            )
+        except httpx.HTTPError as exc:
             raise ExternalServiceError(
-                f"browser_use scrape returned {response.status_code}",
+                f"browser_use create_task failed: {exc}",
                 provider=self.name,
-                operation="scrape",
-                url=url,
+                operation="create_task",
+            ) from exc
+
+        if response.status_code not in (200, 201, 202):
+            raise ExternalServiceError(
+                f"browser_use create_task returned {response.status_code}",
+                provider=self.name,
+                operation="create_task",
                 body=response.text[:200],
             )
 
-        payload = response.json() if isinstance(response.json(), dict) else {}
-        return SourceDoc(
-            url=url,
-            title=payload.get("title") or "",
-            content=payload.get("markdown") or payload.get("html") or "",
-            via_provider=self.name,
-            metadata={"status_code": response.status_code},
-        )
+        payload = response.json()
+        task_id = payload.get("id")
+        if not task_id:
+            raise ExternalServiceError(
+                "browser_use create_task response missing 'id'",
+                provider=self.name,
+                operation="create_task",
+                body=str(payload)[:200],
+            )
+        logger.info("browser_use_task_created", task_id=task_id)
+        return str(task_id)
 
-    # ------------------------------------------------------------------
-    # internals
-    # ------------------------------------------------------------------
+    async def _poll_task(self, client: httpx.AsyncClient, task_id: str) -> str:
+        deadline = asyncio.get_event_loop().time() + self.poll_timeout
+        while True:
+            if asyncio.get_event_loop().time() >= deadline:
+                raise ExternalServiceError(
+                    f"browser_use task timed out after {self.poll_timeout}s",
+                    provider=self.name,
+                    operation="poll_task",
+                    task_id=task_id,
+                )
+
+            try:
+                response = await client.get(
+                    f"{self.base_url}{_TASK_PATH}/{task_id}",
+                    headers=self._headers(),
+                )
+            except httpx.HTTPError as exc:
+                raise ExternalServiceError(
+                    f"browser_use poll_task failed: {exc}",
+                    provider=self.name,
+                    operation="poll_task",
+                    task_id=task_id,
+                ) from exc
+
+            if response.status_code != 200:
+                raise ExternalServiceError(
+                    f"browser_use poll_task returned {response.status_code}",
+                    provider=self.name,
+                    operation="poll_task",
+                    task_id=task_id,
+                    body=response.text[:200],
+                )
+
+            payload = response.json()
+            status = (payload.get("status") or "").lower()
+
+            if status in {"finished", "complete", "completed", "succeeded"}:
+                output = payload.get("output") or payload.get("result") or ""
+                logger.info(
+                    "browser_use_task_finished",
+                    task_id=task_id,
+                    output_chars=len(str(output)),
+                )
+                return str(output)
+
+            if status in {"failed", "error", "cancelled", "canceled"}:
+                raise ExternalServiceError(
+                    f"browser_use task {status}",
+                    provider=self.name,
+                    operation="poll_task",
+                    task_id=task_id,
+                    body=str(payload)[:200],
+                )
+
+            await asyncio.sleep(_TASK_POLL_INTERVAL)
+
     def _headers(self) -> dict[str, str]:
         return {
-            "Authorization": f"Bearer {self.api_key}",
+            # Browser Use v2 expects this header — NOT `Authorization: Bearer`.
+            "X-Browser-Use-API-Key": self.api_key,
             "Content-Type": "application/json",
             "User-Agent": "ai-opportunity-radar/0.1",
         }

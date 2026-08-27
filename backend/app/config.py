@@ -6,10 +6,10 @@ Centralised here so every module imports a single typed Settings object.
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -48,15 +48,22 @@ class Settings(BaseSettings):
     redis_result_backend: str = "redis://localhost:6379/1"
 
     # ---------- LLM ----------
-    # Primary provider is MiniMax(MiniMax-M3 / M2 / M1),
-    # OpenAI-compatible chat endpoint at https://api.MiniMax.io/v1.
+    # Primary provider is MiniMax(MiniMax), Anthropic-compatible chat endpoint at
+    # https://api.minimaxi.com/anthropic. Reuses the official `anthropic` SDK
+    # with a custom base_url — no fork. Available models (from /v1/models):
+    #   MiniMax-M3                       (strongest, 2026-06)
+    #   MiniMax-M2.7       / -highspeed  (mid)
+    #   MiniMax-M2.5       / -highspeed
+    #   MiniMax-M2.1       / -highspeed
+    #   MiniMax-M2                        (older)
+    # There is no "M1" — we use M2.7-highspeed as the cheap tier.
     # OpenAI / Anthropic / Gemini are kept as fallbacks; the runtime picks
     # one via `build_llm_provider`.
     MiniMax_api_key: str = ""
-    MiniMax_model_cheap: str = "MiniMax-M1"
-    MiniMax_model_mid: str = "MiniMax-M2"
+    MiniMax_model_cheap: str = "MiniMax-M2.7-highspeed"
+    MiniMax_model_mid: str = "MiniMax-M2.7"
     MiniMax_model_strong: str = "MiniMax-M3"
-    MiniMax_api_url: str = "https://api.MiniMax.io/v1"
+    MiniMax_api_url: str = "https://api.minimaxi.com/anthropic"
 
     openai_api_key: str = ""
     openai_model_cheap: str = "gpt-4o-mini"
@@ -103,13 +110,19 @@ class Settings(BaseSettings):
     n8n_api_key: str = ""
 
     # ---------- CORS ----------
-    cors_allow_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
+    # `NoDecode` prevents pydantic-settings from JSON-parsing the env var
+    # before our `mode="before"` validator runs. Without it the raw CSV
+    # string fails with "error parsing value for field ..." on Settings().
+    cors_allow_origins: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["http://localhost:3000"]
+    )
 
     # ---------- Rate Limit ----------
     rate_limit_per_minute: int = 120
 
     # ---------- Sources ----------
-    enabled_sources: list[str] = Field(
+    # Same NoDecode treatment — comma-separated list, not JSON.
+    enabled_sources: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["github", "reddit", "hackernews", "producthunt", "rss"]
     )
 

@@ -24,6 +24,12 @@ _BLOCKED_HOSTNAMES = frozenset(
 )
 
 # CIDR ranges that are unsafe to call from server-side fetchers.
+# NOTE: 198.18.0.0/15 (RFC 7595 benchmarking) is intentionally NOT blocked —
+# Surge / Clash / V2RayN fake-IP mode returns 198.18.0.0/15 for every
+# intercepted DNS query, and is unreachable on the public internet. Treating
+# it as "private" causes a hard SSRF failure for any user behind such a
+# proxy. If you operate in an environment where you don't trust the local
+# resolver, override `radar_ssrf_strict_dns` in settings (see config.py).
 _BLOCKED_CIDRS = [
     ipaddress.ip_network("0.0.0.0/8"),
     ipaddress.ip_network("10.0.0.0/8"),
@@ -33,7 +39,6 @@ _BLOCKED_CIDRS = [
     ipaddress.ip_network("172.16.0.0/12"),       # private
     ipaddress.ip_network("192.0.0.0/24"),
     ipaddress.ip_network("192.168.0.0/16"),      # private
-    ipaddress.ip_network("198.18.0.0/15"),
     ipaddress.ip_network("224.0.0.0/4"),         # multicast
     ipaddress.ip_network("240.0.0.0/4"),         # reserved
     ipaddress.ip_network("::1/128"),             # IPv6 loopback

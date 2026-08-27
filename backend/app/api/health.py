@@ -85,13 +85,21 @@ def _probe_url(url: str, *, timeout: float = 3.0) -> tuple[bool, str]:
     Returns `(ok, detail)`. Never raises — any exception becomes
     `ok=False` with the message attached. The endpoint is wired so a
     probe failure can never break the overall health response.
+
+    An HTTP response is treated as "reachable" regardless of status code —
+    a 401/403/404 from the root still proves the service is up and
+    answering; only a connection error or 5xx is treated as down. This
+    keeps the probe useful for APIs (Firecrawl, Browser Use) that don't
+    expose a public unauthenticated health endpoint.
     """
     try:
         import httpx  # local import — the app must boot without it
 
         with httpx.Client(timeout=timeout) as client:
             response = client.get(url)
-        if 200 <= response.status_code < 300:
+        # 2xx/3xx → healthy; 4xx → reachable but not authorised (still healthy
+        # enough for ops); 5xx → server broken.
+        if response.status_code < 500:
             return True, ""
         return False, f"HTTP {response.status_code}: {response.text[:120]}"
     except Exception as exc:  # noqa: BLE001
@@ -102,7 +110,9 @@ def _check_firecrawl() -> dict[str, Any]:
     s = get_settings()
     if not s.firecrawl_api_key:
         return {"status": "degraded", "note": "FIRECRAWL_API_KEY not set"}
-    ok, detail = _probe_url(f"{s.firecrawl_api_url.rstrip('/')}/api/v1/health")
+    # Firecrawl exposes no public health endpoint; the root returns the
+    # landing page (200). Treat any <500 as reachable.
+    ok, detail = _probe_url(f"{s.firecrawl_api_url.rstrip('/')}/")
     if ok:
         return {"status": "healthy"}
     return {"status": "degraded", "note": "firecrawl probe failed", "detail": detail}
@@ -112,7 +122,7 @@ def _check_browser_use() -> dict[str, Any]:
     s = get_settings()
     if not s.browser_use_api_key:
         return {"status": "degraded", "note": "BROWSER_USE_API_KEY not set"}
-    ok, detail = _probe_url(f"{s.browser_use_api_url.rstrip('/')}/healthz")
+    ok, detail = _probe_url(f"{s.browser_use_api_url.rstrip('/')}/")
     if ok:
         return {"status": "healthy"}
     return {

@@ -24,6 +24,10 @@ services:
       POSTGRES_DB: radar
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # First-run bootstrap: create secondary databases (n8n, etc.) so the
+      # sibling containers have somewhere to land. Runs once when pgdata is
+      # empty; subsequent boots reuse the data directory and skip it.
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
     ports:
       - "5432:5432"
     healthcheck:
@@ -66,6 +70,14 @@ services:
       DATABASE_URL_SYNC: postgresql://radar:radar@postgres:5432/radar
       REDIS_URL: redis://redis:6379/0
       REDIS_RESULT_BACKEND: redis://redis:6379/1
+    # Use real upstream DNS so the SSRF guard (which blocks private IPs)
+    # works on public hostnames. Some local proxies intercept DNS via
+    # fake-IP mode and return 198.18.0.0/15 — that's the proxy's normal
+    # range and would otherwise trigger the SSRF block on every URL.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+      - 9.9.9.9
     volumes:
       - ./backend:/app
     ports:
@@ -97,6 +109,11 @@ services:
       DATABASE_URL_SYNC: postgresql://radar:radar@postgres:5432/radar
       REDIS_URL: redis://redis:6379/0
       REDIS_RESULT_BACKEND: redis://redis:6379/1
+    # Real upstream DNS — same reason as `backend` (see above).
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+      - 9.9.9.9
     volumes:
       - ./backend:/app
     command: ["python", "-m", "app.worker"]
@@ -120,7 +137,11 @@ services:
       - frontend_node_modules:/app/node_modules
     ports:
       - "3000:3000"
-    command: ["sh", "-c", "corepack enable && (test -d node_modules || npm install) && npm run dev"]
+    # Check for `next` itself (not just `node_modules`) — the volume mount
+    # above creates an empty `node_modules/` dir, so `test -d node_modules`
+    # would always be true and the install would be skipped. Without
+    # `next` installed, `npm run dev` fails with "next: not found".
+    command: ["sh", "-c", "corepack enable && (test -x node_modules/.bin/next || npm install) && npm run dev"]
 
   n8n:
     image: n8nio/n8n:1

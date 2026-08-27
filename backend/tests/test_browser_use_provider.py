@@ -1,4 +1,4 @@
-"""Tests for the Phase 11 BrowserUseWebDataProvider (auth + SSRF + endpoints)."""
+"""Tests for the BrowserUseWebDataProvider (v2 async task API)."""
 
 from __future__ import annotations
 
@@ -13,36 +13,57 @@ from app.utils import ExternalServiceError
 
 
 class _MockTransport(httpx.AsyncBaseTransport):
-    """Stub httpx transport — canned responses for /api/v1/{search,scrape}."""
+    """Stub httpx transport — simulates the Browser Use v2 async task API.
+
+    POST /api/v2/tasks               — creates a task, returns {"id": "..."}
+    GET  /api/v2/tasks/{id}          — polls, returns {"status": ..., "output": ...}
+    POST /api/v2/tasks/{id}/stop     — cancels (unused here)
+    """
 
     def __init__(
         self,
         *,
-        search_payload: dict[str, Any] | list[Any] | None = None,
-        scrape_payload: dict[str, Any] | None = None,
+        task_output: str = "",
+        task_status: str = "finished",
         status_code: int = 200,
         raise_on: set[str] | None = None,
+        poll_responses: list[dict[str, Any]] | None = None,
     ) -> None:
-        self.search_payload = search_payload if search_payload is not None else {
-            "results": []
-        }
-        self.scrape_payload = scrape_payload or {"title": "", "markdown": ""}
+        self.task_output = task_output
+        self.task_status = task_status
         self.status_code = status_code
         self.raise_on = raise_on or set()
+        # Optional scripted responses for the poll sequence. If provided,
+        # they're returned one by one then we fall back to task_status.
+        self.poll_responses = list(poll_responses or [])
         self.calls: list[httpx.Request] = []
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         self.calls.append(request)
         path = request.url.path
+        method = request.method.upper()
+
         if path in self.raise_on:
             raise httpx.ConnectError("simulated outage")
-        if path.endswith("/api/v1/search"):
-            body = json.dumps(self.search_payload)
-        elif path.endswith("/api/v1/scrape"):
-            body = json.dumps(self.scrape_payload)
-        else:
-            body = "{}"
-        return httpx.Response(self.status_code, content=body.encode())
+
+        # POST /api/v2/tasks — create
+        if method == "POST" and path == "/api/v2/tasks":
+            body = json.dumps({"id": "task-abc123", "sessionId": "sess-xyz"})
+            return httpx.Response(self.status_code, content=body.encode())
+
+        # GET /api/v2/tasks/{id} — poll
+        if method == "GET" and path.startswith("/api/v2/tasks/"):
+            if self.poll_responses:
+                payload = self.poll_responses.pop(0)
+            else:
+                payload = {
+                    "status": self.task_status,
+                    "output": self.task_output,
+                }
+            return httpx.Response(self.status_code, content=json.dumps(payload).encode())
+
+        body = "{}"
+        return httpx.Response(404, content=body.encode())
 
 
 def _make_provider(
@@ -57,6 +78,7 @@ def _make_provider(
             if transport is not None
             else None
         ),
+        poll_timeout=5.0,  # bound test runtime
         **kwargs,
     )
 
@@ -76,73 +98,86 @@ def test_name_is_browser_use() -> None:
 
 
 # ---------------------------------------------------------------------------
-# search()
+# search() — wraps Browser Use as a task, polls until finished.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_search_hits_correct_endpoint_with_bearer_auth() -> None:
+async def test_search_creates_task_then_polls_with_correct_auth() -> None:
     transport = _MockTransport(
-        search_payload={
-            "results": [
-                {
-                    "url": "https://example.com/a",
-                    "title": "A",
-                    "description": "snippet a",
-                }
-            ]
-        }
+        task_output="[{\"url\": \"https://example.com/a\", \"title\": \"A\", \"snippet\": \"snippet a\"}]"
     )
     provider = _make_provider(transport)
     docs = await provider.search("ai tooling", limit=3)
     assert len(docs) == 1
     doc = docs[0]
-    assert doc.url == "https://example.com/a"
-    assert doc.title == "A"
-    assert doc.content == "snippet a"
+    # search wraps the response in a single SourceDoc with the raw output.
+    assert doc.title == "browser_use search: ai tooling"
+    assert "snippet a" in doc.content
     assert doc.via_provider == "browser_use"
 
-    request = transport.calls[0]
-    assert request.method == "POST"
-    assert request.url.path.endswith("/api/v1/search")
-    body = json.loads(request.content)
-    assert body == {"query": "ai tooling", "limit": 3}
-    assert request.headers["Authorization"] == "Bearer bu_test_key"
-    assert request.headers["Content-Type"] == "application/json"
+    # First call: POST /api/v2/tasks with the natural-language task body
+    create_call = transport.calls[0]
+    assert create_call.method == "POST"
+    assert create_call.url.path == "/api/v2/tasks"
+    body = json.loads(create_call.content)
+    assert body["task"].startswith("Search the web for:")
+    assert "ai tooling" in body["task"]
+    # v2 uses X-Browser-Use-API-Key, NOT Authorization: Bearer.
+    assert create_call.headers["X-Browser-Use-API-Key"] == "bu_test_key"
+    assert create_call.headers["Content-Type"] == "application/json"
+    assert "Authorization" not in create_call.headers
+
+    # Second call: GET /api/v2/tasks/{id} poll
+    poll_call = transport.calls[1]
+    assert poll_call.method == "GET"
+    assert poll_call.url.path == "/api/v2/tasks/task-abc123"
+    assert poll_call.headers["X-Browser-Use-API-Key"] == "bu_test_key"
 
 
 @pytest.mark.asyncio
-async def test_search_tolerates_bare_list_payload() -> None:
-    """Some mirrors return `[]` at the top level — accept either shape."""
-    transport = _MockTransport(
-        search_payload=[
-            {"url": "https://x", "title": "t", "description": "d"}
-        ]
-    )
-    docs = await _make_provider(transport).search("q")
-    assert len(docs) == 1 and docs[0].url == "https://x"
-
-
-@pytest.mark.asyncio
-async def test_search_maps_non_200_to_external_service_error() -> None:
-    transport = _MockTransport(
-        status_code=401,
-        search_payload={"error": "unauthorized"},
-    )
+async def test_search_maps_create_task_non_200_to_external_service_error() -> None:
+    transport = _MockTransport(status_code=401)
     with pytest.raises(ExternalServiceError) as exc:
         await _make_provider(transport).search("q")
     assert exc.value.context.get("provider") == "browser_use"
-    assert exc.value.context.get("operation") == "search"
+    assert exc.value.context.get("operation") == "create_task"
     assert "401" in str(exc.value)
 
 
 @pytest.mark.asyncio
 async def test_search_maps_transport_error() -> None:
-    transport = _MockTransport(raise_on={"/api/v1/search"})
+    transport = _MockTransport(raise_on={"/api/v2/tasks"})
     with pytest.raises(ExternalServiceError) as exc:
         await _make_provider(transport).search("q")
     assert exc.value.context.get("provider") == "browser_use"
     assert "simulated outage" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_search_polls_until_finished() -> None:
+    """Two pending polls then `finished` on the third — provider must keep polling."""
+    transport = _MockTransport(
+        poll_responses=[
+            {"status": "started", "output": ""},
+            {"status": "pending", "output": ""},
+            {"status": "finished", "output": "final answer"},
+        ]
+    )
+    docs = await _make_provider(transport).search("q")
+    assert "final answer" in docs[0].content
+    # 1 create + 3 polls = 4 calls.
+    assert len(transport.calls) == 4
+
+
+@pytest.mark.asyncio
+async def test_search_maps_task_failure_to_external_service_error() -> None:
+    transport = _MockTransport(task_status="failed", task_output="model refused")
+    with pytest.raises(ExternalServiceError) as exc:
+        await _make_provider(transport).search("q")
+    assert exc.value.context.get("provider") == "browser_use"
+    assert exc.value.context.get("operation") == "poll_task"
+    assert "failed" in str(exc.value).lower()
 
 
 # ---------------------------------------------------------------------------
@@ -151,24 +186,17 @@ async def test_search_maps_transport_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_scrape_returns_markdown_and_title() -> None:
-    transport = _MockTransport(
-        scrape_payload={
-            "title": "Example Domain",
-            "markdown": "# Hello\nworld",
-        }
-    )
+async def test_scrape_returns_output_from_task() -> None:
+    transport = _MockTransport(task_output="# Hello\nworld markdown body")
     doc = await _make_provider(transport).scrape("https://example.com/")
     assert doc.url == "https://example.com/"
-    assert doc.title == "Example Domain"
     assert doc.content.startswith("# Hello")
     assert doc.via_provider == "browser_use"
 
-    request = transport.calls[0]
-    assert request.url.path.endswith("/api/v1/scrape")
-    body = json.loads(request.content)
-    assert body == {"url": "https://example.com/"}
-    assert request.headers["Authorization"] == "Bearer bu_test_key"
+    create_call = transport.calls[0]
+    assert create_call.url.path == "/api/v2/tasks"
+    body = json.loads(create_call.content)
+    assert "Open https://example.com/" in body["task"]
 
 
 @pytest.mark.asyncio
@@ -191,18 +219,17 @@ async def test_scrape_enforces_ssrf_preflight() -> None:
 
 
 @pytest.mark.asyncio
-async def test_scrape_maps_non_200() -> None:
+async def test_scrape_maps_create_non_200() -> None:
     transport = _MockTransport(status_code=502)
     with pytest.raises(ExternalServiceError) as exc:
         await _make_provider(transport).scrape("https://example.com/")
     assert exc.value.context.get("provider") == "browser_use"
-    assert exc.value.context.get("operation") == "scrape"
-    assert exc.value.context.get("url") == "https://example.com/"
+    assert exc.value.context.get("operation") == "create_task"
 
 
 @pytest.mark.asyncio
 async def test_scrape_maps_transport_error() -> None:
-    transport = _MockTransport(raise_on={"/api/v1/scrape"})
+    transport = _MockTransport(raise_on={"/api/v2/tasks"})
     with pytest.raises(ExternalServiceError) as exc:
         await _make_provider(transport).scrape("https://example.com/")
     assert exc.value.context.get("provider") == "browser_use"
@@ -220,32 +247,27 @@ async def test_provider_creates_and_closes_its_own_client() -> None:
     import app.services.research.browser_use_provider as mod
 
     transport = _MockTransport(
-        search_payload={"results": [{"url": "https://x", "title": "t", "description": "d"}]}
+        poll_responses=[{"status": "finished", "output": "done"}]
     )
     created: list[httpx.AsyncClient] = []
     closed: list[httpx.AsyncClient] = []
 
-    class _Spy(httpx.AsyncClient):
-        def __init__(self, *a: Any, **kw: Any) -> None:
-            super().__init__(*a, **kw)
-            created.append(self)
+    def _factory(*a: Any, **kw: Any) -> httpx.AsyncClient:
+        kw.setdefault("transport", transport)
+        kw.setdefault("timeout", 5.0)
+        spy = _SpyClient(*a, **kw)
+        created.append(spy)
+        return spy
 
+    class _SpyClient(httpx.AsyncClient):
         async def aclose(self) -> None:
             closed.append(self)
             await super().aclose()
 
     original = mod.httpx.AsyncClient
-    mod.httpx.AsyncClient = _Spy  # type: ignore[assignment]
+    mod.httpx.AsyncClient = _factory  # type: ignore[assignment]
     try:
-        # Pass the same transport to every Spy instance so the test doesn't
-        # hit the real network.
-        def _factory(*a: Any, **kw: Any) -> httpx.AsyncClient:
-            kw.setdefault("transport", transport)
-            kw.setdefault("timeout", 5.0)
-            return _Spy(*a, **kw)
-
-        mod.httpx.AsyncClient = _factory  # type: ignore[assignment]
-        await _make_provider().search("q")
+        await _make_provider().scrape("https://example.com/")
     finally:
         mod.httpx.AsyncClient = original  # type: ignore[assignment]
 

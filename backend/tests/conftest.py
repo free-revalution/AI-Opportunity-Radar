@@ -17,10 +17,15 @@ from sqlalchemy.ext.asyncio import (
 
 # Disable webhook auth + force mock mode for tests BEFORE app modules are
 # imported — they cache settings via @lru_cache.
-os.environ.setdefault("APP_SECRET_KEY", "")
-os.environ.setdefault("MOCK_EXTERNAL_SERVICES", "true")
-os.environ.setdefault("TELEGRAM_BOT_TOKEN", "")
-os.environ.setdefault("TELEGRAM_CHAT_ID", "")
+# NOTE: webhook auth in app/api/internal.py reads `settings.app_secret_key`
+# first, then `RADAR_WEBHOOK_SECRET` from os.environ. Both must be empty for
+# `_check_webhook_secret` to short-circuit and accept the call. Direct
+# assignment (not setdefault) because compose injects these from .env.
+os.environ["APP_SECRET_KEY"] = ""
+os.environ["RADAR_WEBHOOK_SECRET"] = ""
+os.environ["MOCK_EXTERNAL_SERVICES"] = "true"
+os.environ["TELEGRAM_BOT_TOKEN"] = ""
+os.environ["TELEGRAM_CHAT_ID"] = ""
 
 from app.config import get_settings  # noqa: E402
 from app.db import get_session  # noqa: E402
