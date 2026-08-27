@@ -13,6 +13,7 @@ import os
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -684,3 +685,174 @@ async def send_feishu_digest(
             pass
 
     return summary.as_dict()
+
+
+@router.get(
+    "/content/by_opportunity",
+    summary="List opportunities with their generated content per channel",
+)
+async def list_content_by_opportunity(
+    only_qualified: bool = True,
+    limit: int = 20,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 3 (v2.0) — Content Center backend.
+
+    Returns one row per opportunity (top `limit` by score), each with the
+    most-recent generated content for every sales channel
+    (feishu / xianyu / xiaohongshu / wechat_article). The frontend uses
+    this to render the Content Center page.
+    """
+    from app.models import Notification, Opportunity
+
+    stmt = select(Opportunity).order_by(Opportunity.total_score.desc())
+    if only_qualified:
+        stmt = stmt.where(
+            Opportunity.commercial_status.in_(["qualified", "promising"])
+        )
+    stmt = stmt.limit(limit)
+    opportunities = list((await session.execute(stmt)).scalars().all())
+
+    if not opportunities:
+        return {"generated_at": _utc_now_iso(), "items": []}
+
+    opp_ids = [o.id for o in opportunities]
+    notif_stmt = (
+        select(Notification)
+        .where(Notification.payload["opportunity_id"].as_integer().in_(opp_ids))
+        # `id DESC` is the tie-breaker — `created_at` defaults to
+        # `func.now()` server-side and two rows inserted within the
+        # same second share a timestamp.
+        .order_by(Notification.created_at.desc(), Notification.id.desc())
+    )
+    notifications = list((await session.execute(notif_stmt)).scalars().all())
+
+    # Group notifications per opportunity per channel — keep only the latest.
+    grouped: dict[int, dict[str, dict[str, Any]]] = {oid: {} for oid in opp_ids}
+    for n in notifications:
+        try:
+            oid = int((n.payload or {}).get("opportunity_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if oid not in grouped:
+            continue
+        if n.channel in grouped[oid]:
+            continue  # keep only the latest per channel
+        grouped[oid][n.channel] = {
+            "notification_id": n.id,
+            "channel": n.channel,
+            "title": (n.payload or {}).get("title") or "",
+            "body": (n.payload or {}).get("body") or "",
+            "metadata": (n.payload or {}).get("metadata") or {},
+            "generator": (n.payload or {}).get("generator") or "",
+            "format": (n.payload or {}).get("format") or "",
+            "created_at": n.created_at.isoformat() if n.created_at else None,
+        }
+
+    items: list[dict[str, Any]] = []
+    for opp in opportunities:
+        items.append(
+            {
+                "opportunity": {
+                    "id": opp.id,
+                    "title": opp.title,
+                    "slug": opp.slug,
+                    "summary": opp.summary,
+                    "total_score": float(opp.total_score or 0.0),
+                    "content_status": opp.content_status,
+                    "commercial_status": opp.commercial_status,
+                    "target_customer": opp.target_customer,
+                    "market_size": opp.market_size,
+                    "mvp_days": int(opp.mvp_days or 0),
+                    "difficulty": opp.difficulty,
+                    "monetization_model": opp.monetization_model,
+                    "china_gap": opp.china_gap,
+                },
+                "content": grouped.get(opp.id, {}),
+            }
+        )
+
+    return {"generated_at": _utc_now_iso(), "items": items}
+
+
+@router.post(
+    "/content/{opportunity_id}/mark_published",
+    summary="Mark an opportunity's content as published (manual operator action)",
+)
+async def mark_content_published(
+    opportunity_id: int,
+    body: dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 3 (v2.0) — flip an Opportunity's `content_status` to `published`.
+
+    Body (all optional):
+        { "commercial_status": "promising" }   # override the next stage
+
+    Returns the new state.
+    """
+    from app.models import Opportunity
+
+    opp = await session.get(Opportunity, opportunity_id)
+    if opp is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"opportunity {opportunity_id} not found",
+        )
+
+    opp.content_status = "published"
+    body = body or {}
+    next_stage = body.get("commercial_status")
+    if next_stage in {"promising", "qualified", "unqualified"}:
+        opp.commercial_status = next_stage
+    await session.commit()
+
+    return {
+        "opportunity_id": opportunity_id,
+        "content_status": opp.content_status,
+        "commercial_status": opp.commercial_status,
+    }
+
+
+@router.post(
+    "/content/{opportunity_id}/mark_sold",
+    summary="Mark an opportunity's content as sold (revenue attribution)",
+)
+async def mark_content_sold(
+    opportunity_id: int,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 3 (v2.0) — flip `content_status` to `sold`.
+
+    Lightweight hook to record a manual sale without forcing Phase 4's
+    full order system. `commercial_status` is bumped to `promising`
+    so the dashboard can highlight it.
+    """
+    from app.models import Opportunity
+
+    opp = await session.get(Opportunity, opportunity_id)
+    if opp is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"opportunity {opportunity_id} not found",
+        )
+
+    opp.content_status = "sold"
+    opp.commercial_status = "promising"
+    await session.commit()
+
+    return {
+        "opportunity_id": opportunity_id,
+        "content_status": opp.content_status,
+        "commercial_status": opp.commercial_status,
+    }
+
+
+def _utc_now_iso() -> str:
+    """ISO-8601 UTC timestamp — helper for response envelopes."""
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()

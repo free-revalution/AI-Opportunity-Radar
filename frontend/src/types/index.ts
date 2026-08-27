@@ -118,3 +118,43 @@ export interface NotificationsResponse {
   count: number;
   items: NotificationItem[];
 }
+
+// ---------------------------------------------------------------------------
+// Content Center (Phase 3 v2.0)
+// ---------------------------------------------------------------------------
+export interface ContentPiece {
+  notification_id: number;
+  channel: string; // feishu | xianyu | xiaohongshu | wechat_article
+  title: string;
+  body: string;
+  metadata: Record<string, unknown>;
+  generator: string;
+  format: string; // markdown | json | ...
+  created_at: string | null;
+}
+
+export interface ContentCenterOpportunity {
+  id: number;
+  title: string;
+  slug: string;
+  summary: string | null;
+  total_score: number;
+  content_status: string; // new | generated | published | sold
+  commercial_status: string; // unqualified | promising | qualified
+  target_customer: string | null;
+  market_size: string | null;
+  mvp_days: number;
+  difficulty: string | null;
+  monetization_model: string | null;
+  china_gap: string | null;
+}
+
+export interface ContentCenterItem {
+  opportunity: ContentCenterOpportunity;
+  content: Record<string, ContentPiece>; // keyed by channel
+}
+
+export interface ContentCenterResponse {
+  generated_at: string;
+  items: ContentCenterItem[];
+}

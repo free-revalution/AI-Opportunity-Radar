@@ -32,7 +32,7 @@ export default function LandingPage() {
       </section>
 
       <section className="mt-16">
-        <h2 className="text-2xl font-semibold">Today's top picks (live data from the backend)</h2>
+        <h2 className="text-2xl font-semibold">Today&rsquo;s top picks (live data from the backend)</h2>
         <p className="mt-2 text-sm text-muted-foreground">
           The list below is fetched server-side from the FastAPI backend so it stays in sync with
           every signal the pipeline produces.

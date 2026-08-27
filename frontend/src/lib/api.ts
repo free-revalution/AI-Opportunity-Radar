@@ -68,3 +68,85 @@ export async function fetchRecentNotifications(
 }
 
 export const apiBaseUrl = API_BASE_URL;
+
+// ---------------------------------------------------------------------------
+// Content Center (Phase 3 v2.0)
+// ---------------------------------------------------------------------------
+import type { ContentCenterResponse } from "@/types";
+
+/** Header value for internal API auth. Browser-side we read it from
+ * `NEXT_PUBLIC_RADAR_WEBHOOK_SECRET` (falling back to the literal the
+ * dev `.env.example` ships). If unset, the request still goes through —
+ * the backend short-circuits auth when no secret is configured. */
+const WEBHOOK_SECRET: string | undefined =
+  process.env.NEXT_PUBLIC_RADAR_WEBHOOK_SECRET ||
+  process.env.NEXT_PUBLIC_APP_SECRET_KEY ||
+  undefined;
+
+async function jsonFetchWithSecret<T>(
+  path: string,
+  init?: RequestInit,
+): Promise<T> {
+  const url = `${API_BASE_URL}${path}`;
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    ...(init?.headers as Record<string, string> | undefined),
+  };
+  if (WEBHOOK_SECRET) {
+    headers["X-Radar-Webhook"] = WEBHOOK_SECRET;
+  }
+  const res = await fetch(url, {
+    ...init,
+    headers,
+    cache: "no-store", // operator-facing data — never stale
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`API ${res.status} ${res.statusText}: ${text || url}`);
+  }
+  return (await res.json()) as T;
+}
+
+export async function fetchContentCenter(
+  only_qualified: boolean = true,
+  limit: number = 20,
+): Promise<ContentCenterResponse> {
+  const params = new URLSearchParams({
+    only_qualified: String(only_qualified),
+    limit: String(limit),
+  });
+  return jsonFetchWithSecret<ContentCenterResponse>(
+    `/api/internal/content/by_opportunity?${params.toString()}`,
+  );
+}
+
+export interface MarkContentResult {
+  opportunity_id: number;
+  content_status: string;
+  commercial_status: string;
+}
+
+export async function markContentPublished(
+  opportunityId: number,
+  commercialStatus?: string,
+): Promise<MarkContentResult> {
+  return jsonFetchWithSecret<MarkContentResult>(
+    `/api/internal/content/${opportunityId}/mark_published`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(
+        commercialStatus ? { commercial_status: commercialStatus } : {},
+      ),
+    },
+  );
+}
+
+export async function markContentSold(
+  opportunityId: number,
+): Promise<MarkContentResult> {
+  return jsonFetchWithSecret<MarkContentResult>(
+    `/api/internal/content/${opportunityId}/mark_sold`,
+    { method: "POST" },
+  );
+}

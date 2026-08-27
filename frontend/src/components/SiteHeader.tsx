@@ -51,6 +51,9 @@ export async function SiteHeader() {
           <Link href="/opportunities" className="hover:text-accent">
             Opportunities
           </Link>
+          <Link href="/content-center" className="hover:text-accent">
+            Content Center
+          </Link>
           <Link href="/settings" className="hover:text-accent">
             Settings
           </Link>
