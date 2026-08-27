@@ -242,3 +242,50 @@ export async function updateOrderStatus(
     },
   );
 }
+
+// ---------------------------------------------------------------------------
+// On-demand deep research (Phase 5 v2.0)
+// ---------------------------------------------------------------------------
+import type {
+  OnDemandCreatePayload,
+  OnDemandCreateResponse,
+  OnDemandDetailResponse,
+  OnDemandListResponse,
+} from "@/types";
+
+export type {
+  OnDemandCreatePayload,
+  OnDemandCreateResponse,
+  OnDemandDetailResponse,
+  OnDemandListResponse,
+};
+
+export async function createOnDemandResearch(
+  payload: OnDemandCreatePayload,
+): Promise<OnDemandCreateResponse> {
+  return jsonFetchWithSecret<OnDemandCreateResponse>(
+    "/api/internal/research/on_demand",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function fetchOnDemandRecent(
+  limit: number = 20,
+): Promise<OnDemandListResponse> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  return jsonFetchWithSecret<OnDemandListResponse>(
+    `/api/internal/research/on_demand/recent?${params.toString()}`,
+  );
+}
+
+export async function fetchOnDemandDetail(
+  jobId: number,
+): Promise<OnDemandDetailResponse> {
+  return jsonFetchWithSecret<OnDemandDetailResponse>(
+    `/api/internal/research/on_demand/${jobId}`,
+  );
+}

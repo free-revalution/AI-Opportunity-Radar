@@ -224,3 +224,72 @@ export interface OrderCreatePayload {
   notes?: string | null;
   mark_opportunity_sold?: boolean;
 }
+
+// ---------------------------------------------------------------------------
+// On-demand deep research (Phase 5 v2.0)
+// ---------------------------------------------------------------------------
+export type OnDemandSeedKind = "url" | "topic";
+
+export interface OnDemandCreatePayload {
+  url?: string;
+  topic?: string;
+  // Optional in-line order — the same fields as OrderCreatePayload minus
+  // `mark_opportunity_sold` (the on-demand path always flips the opp).
+  customer_name?: string;
+  customer_contact?: string;
+  amount_cny?: number;
+  channel?: OrderChannel;
+  payment_method?: string;
+  payment_reference?: string;
+  notes?: string;
+}
+
+export interface OnDemandCreateResponse {
+  opportunity_id: number;
+  opportunity_title: string;
+  opportunity_slug: string;
+  job_id: number;
+  status: "pending" | "running" | "completed" | "failed";
+  recommendation?: Recommendation | null;
+  confidence: number;
+  sources_count: number;
+  executive_summary?: string | null;
+  order_id?: number | null;
+}
+
+export interface OnDemandListItem {
+  job_id: number;
+  opportunity_id: number;
+  status: string;
+  recommendation?: Recommendation | null;
+  confidence: number;
+  sources_count: number;
+  error?: string | null;
+  seed_url?: string | null;
+  seed_topic?: string | null;
+  executive_summary?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+}
+
+export interface OnDemandListResponse {
+  generated_at: string;
+  items: OnDemandListItem[];
+  total: number;
+}
+
+export interface OnDemandDetailResponse {
+  job_id: number;
+  opportunity_id: number;
+  opportunity_title: string;
+  status: string;
+  recommendation?: Recommendation | null;
+  confidence: number;
+  sources_count: number;
+  error?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  seed_url?: string | null;
+  seed_topic?: string | null;
+  report: ResearchReportData | null;
+}

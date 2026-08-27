@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.db import get_session
 from app.metrics import record_pipeline_run
+from app.schemas.on_demand import OnDemandResearchRequest
 from app.schemas.order import (
     OrderCreateRequest,
     OrderListResponse,
@@ -1147,3 +1148,344 @@ async def update_order_status(
     title = opp.title if opp else None
     await session.commit()
     return _serialize_order(order, opportunity_title=title)
+
+
+# ---------------------------------------------------------------------------
+# v2.0 Phase 5 — on-demand research reports
+# ---------------------------------------------------------------------------
+def _on_demand_slug() -> str:
+    """Stable, unique slug for an on-demand opportunity.
+
+    Real opportunities use AI-extracted slugs; the on-demand path
+    bypasses that and just needs a unique value to satisfy the DB
+    constraint. UUID4 hex is short enough to read in logs and
+    guaranteed unique.
+    """
+    import uuid
+
+    return f"on-demand-{uuid.uuid4().hex[:16]}"
+
+
+def _on_demand_seed_field(opportunity: Any, body: dict[str, Any] | None) -> tuple[str | None, str | None]:
+    """Return (seed_url, seed_topic) from the body, falling back to the
+    opportunity summary if the body is missing. The endpoint always
+    sets one of these on the opportunity's summary field so the
+    `/recent` listing can reconstruct the original input without
+    needing a parallel column.
+    """
+    url = (body or {}).get("url")
+    topic = (body or {}).get("topic")
+    if url:
+        return url, None
+    if topic:
+        return None, topic
+    # Fall back: parse summary which the endpoint writes as
+    # "(on-demand) url=<...>" or "topic=<...>".
+    summary = opportunity.summary or ""
+    if summary.startswith("(on-demand) url="):
+        return summary.removeprefix("(on-demand) url="), None
+    if summary.startswith("(on-demand) topic="):
+        return None, summary.removeprefix("(on-demand) topic=")
+    return None, None
+
+
+@router.post(
+    "/research/on_demand",
+    summary="Run an ad-hoc deep-research report from a URL or topic (Phase 5)",
+)
+async def run_on_demand_research(
+    body: OnDemandResearchRequest,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 5 — pay-per-report service.
+
+    Body:
+        {
+          "url": "https://example.com/ai-product",     # OR
+          "topic": "AI 法律合同审核",
+          "customer_name": "李四",                      # optional
+          "customer_contact": "wechat:lisi",
+          "amount_cny": 299,
+          "channel": "wechat",
+          ...
+        }
+
+    Flow:
+      1. Validate exactly one of `url` / `topic`.
+      2. Bootstrap a fresh Opportunity (no source linkage — this is
+         operator-driven, not pipeline-driven).
+      3. Run ResearchService inline with `seed_urls` derived from the
+         URL directly OR from a quick `web.search(topic)` call.
+      4. If `customer_name` + `amount_cny` were provided, attach an
+         Order in the same transaction and flip the opportunity's
+         `content_status` to `sold`.
+      5. Return a compact preview (job_id + report excerpt).
+
+    Synchronous by design — customers expect a "report ready now"
+    experience. If we ever need long-tail async, the existing
+    `/research/run` worker pattern already covers it.
+    """
+    from app.models import Opportunity, ResearchJob, ResearchReport
+    from app.repositories import OpportunityRepository
+    from app.repositories.orders import OrderRepository
+    from app.services.research import ResearchService
+
+    body_dict = body.model_dump()
+    seed_url = body_dict.get("url")
+    seed_topic = body_dict.get("topic")
+
+    # ---- 1. Build / load seed URLs -----------------------------------------
+    seed_urls: list[str] = []
+    if seed_url:
+        seed_urls = [seed_url]
+    else:
+        # Topic → quick web search to pick 3-5 anchors.
+        from app.services.research.web_data import build_web_data_provider
+
+        web = build_web_data_provider(get_settings())
+        try:
+            extra = await web.search(seed_topic or "", limit=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("on_demand_search_failed", error=str(exc))
+            extra = []
+        seed_urls = [d.url for d in extra if d.url][:5]
+        if not seed_urls:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    "no search results for the given topic — try a URL "
+                    "instead, or refine the topic"
+                ),
+            )
+
+    # ---- 2. Bootstrap an Opportunity --------------------------------------
+    title = (seed_url or seed_topic or "On-demand research")[:255]
+    summary_marker = f"(on-demand) url={seed_url}" if seed_url else f"(on-demand) topic={seed_topic}"
+    opp_repo = OpportunityRepository(session=session)
+    opp = await opp_repo.create(
+        title=title,
+        slug=_on_demand_slug(),
+        summary=summary_marker,
+        # Treat on-demand as already "research eligible" so the
+        # ResearchService picks it up cleanly.
+        status="research_eligible",
+        commercial_status="qualified",  # the customer is paying for it
+        content_status="new",
+    )
+
+    # ---- 3. Create the ResearchJob + run inline ---------------------------
+    job = ResearchJob(
+        opportunity_id=opp.id,
+        status=ResearchService.JOB_PENDING,
+    )
+    session.add(job)
+    await session.flush()
+
+    service = ResearchService(session=session)
+    outcome = await service.process_job(job.id, seed_urls=seed_urls)
+
+    # `process_job` commits on its own (success or failure path).
+    # We re-load the job + report for the response.
+    job = await session.get(ResearchJob, job.id)
+    report = (
+        await session.execute(
+            select(ResearchReport)
+            .where(ResearchReport.opportunity_id == opp.id)
+            .order_by(ResearchReport.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    # ---- 4. Optionally attach an Order ------------------------------------
+    order_id: int | None = None
+    has_order_fields = bool(body.customer_name and body.amount_cny is not None)
+    if has_order_fields and outcome.status == ResearchService.JOB_COMPLETED:
+        order_repo = OrderRepository(session=session)
+        order = await order_repo.create(
+            opportunity_id=opp.id,
+            customer_name=body.customer_name or "",
+            customer_contact=body.customer_contact,
+            amount_cny=Decimal(str(body.amount_cny)),
+            channel=body.channel or "direct",
+            payment_method=body.payment_method,
+            payment_reference=body.payment_reference,
+            delivery_status="delivered",  # report is generated = delivered
+            notes=body.notes,
+            commercial_status_snapshot=opp.commercial_status,
+        )
+        await session.refresh(order)
+        opp.content_status = "sold"
+        opp.commercial_status = "promising"
+        await session.commit()
+        order_id = order.id
+    elif has_order_fields:
+        # Order requested but research failed — still record the partial work.
+        await session.commit()
+
+    return {
+        "opportunity_id": opp.id,
+        "opportunity_title": opp.title,
+        "opportunity_slug": opp.slug,
+        "job_id": job.id if job else None,
+        "status": outcome.status,
+        "recommendation": outcome.recommendation,
+        "confidence": float(outcome.confidence),
+        "sources_count": outcome.sources_count,
+        "executive_summary": (report.executive_summary if report else None),
+        "order_id": order_id,
+    }
+
+
+@router.get(
+    "/research/on_demand/recent",
+    summary="List recent on-demand research jobs (Phase 5)",
+)
+async def list_on_demand_research(
+    limit: int = 20,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 5 — `/on-demand` dashboard list.
+
+    Returns the most recent on-demand jobs (those whose opportunity was
+    tagged with the on-demand summary marker) with a compact report
+    preview.
+    """
+    from app.models import Opportunity, ResearchJob, ResearchReport
+
+    # Two-step load — avoids SQLAlchemy's auto-correlation complaints on
+    # the scalar subquery (the inline `order_by().limit(1)` wrapper
+    # conflates the FROM clause under some SQLite versions).
+    jobs_stmt = (
+        select(ResearchJob, Opportunity)
+        .join(Opportunity, ResearchJob.opportunity_id == Opportunity.id)
+        .where(Opportunity.summary.like("(on-demand)%"))
+        .order_by(ResearchJob.id.desc())
+        .limit(limit)
+    )
+    rows = (await session.execute(jobs_stmt)).all()
+
+    # Bulk-load the latest report per opportunity.
+    opp_ids = [opp.id for _, opp in rows]
+    latest_report_by_opp: dict[int, ResearchReport] = {}
+    if opp_ids:
+        report_stmt = (
+            select(ResearchReport)
+            .where(ResearchReport.opportunity_id.in_(opp_ids))
+            .order_by(
+                ResearchReport.opportunity_id.asc(),
+                ResearchReport.id.desc(),
+            )
+        )
+        for r in (await session.execute(report_stmt)).scalars().all():
+            latest_report_by_opp.setdefault(r.opportunity_id, r)
+
+    items = []
+    for job, opp in rows:
+        report = latest_report_by_opp.get(opp.id)
+        seed_url, seed_topic = _on_demand_seed_field(opp, None)
+        items.append(
+            {
+                "job_id": job.id,
+                "opportunity_id": opp.id,
+                "status": job.status,
+                "recommendation": report.recommendation if report else None,
+                "confidence": float(report.confidence) if report else 0.0,
+                "sources_count": (
+                    len(report.sources_json.get("items", []))
+                    if report and report.sources_json
+                    else 0
+                ),
+                "error": job.error,
+                "seed_url": seed_url,
+                "seed_topic": seed_topic,
+                "executive_summary": (report.executive_summary if report else None),
+                "started_at": job.started_at.isoformat() if job.started_at else None,
+                "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            }
+        )
+
+    return {
+        "generated_at": _utc_now_iso(),
+        "items": items,
+        "total": len(items),
+    }
+
+
+@router.get(
+    "/research/on_demand/{job_id}",
+    summary="Get a single on-demand research job with full report (Phase 5)",
+)
+async def get_on_demand_research(
+    job_id: int,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 5 — single-job detail view.
+
+    Returns the full report payload (all 7 sections + sources + raw
+    metadata). The frontend uses this to render the report inline on
+    the `/on-demand` page after submission.
+    """
+    from app.models import Opportunity, ResearchJob, ResearchReport
+
+    job = await session.get(ResearchJob, job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"research job {job_id} not found",
+        )
+
+    opp = await session.get(Opportunity, job.opportunity_id)
+    if opp is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"opportunity {job.opportunity_id} not found for job {job_id}",
+        )
+
+    report = (
+        await session.execute(
+            select(ResearchReport)
+            .where(ResearchReport.opportunity_id == opp.id)
+            .order_by(ResearchReport.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    seed_url, seed_topic = _on_demand_seed_field(opp, None)
+
+    report_payload = None
+    if report is not None:
+        report_payload = {
+            "executive_summary": report.executive_summary,
+            "market_analysis": report.market_analysis,
+            "competition_analysis": report.competition_analysis,
+            "china_analysis": report.china_analysis,
+            "monetization_analysis": report.monetization_analysis,
+            "mvp_analysis": report.mvp_analysis,
+            "risk_analysis": report.risk_analysis,
+            "recommendation": report.recommendation,
+            "confidence": float(report.confidence),
+            "sources": (report.sources_json or {}).get("items", []),
+        }
+
+    return {
+        "job_id": job.id,
+        "opportunity_id": opp.id,
+        "opportunity_title": opp.title,
+        "status": job.status,
+        "recommendation": report.recommendation if report else None,
+        "confidence": float(report.confidence) if report else 0.0,
+        "sources_count": (
+            len((report.sources_json or {}).get("items", []))
+            if report
+            else 0
+        ),
+        "error": job.error,
+        "started_at": job.started_at.isoformat() if job.started_at else None,
+        "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+        "seed_url": seed_url,
+        "seed_topic": seed_topic,
+        "report": report_payload,
+    }

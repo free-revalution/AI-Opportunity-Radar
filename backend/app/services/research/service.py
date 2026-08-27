@@ -166,8 +166,16 @@ class ResearchService:
         job: ResearchJob | int,
         *,
         use_mock_web: bool = False,
+        seed_urls: list[str] | None = None,
     ) -> ResearchReportOutcome:
-        """Process one job end-to-end. Returns the structured outcome."""
+        """Process one job end-to-end. Returns the structured outcome.
+
+        `seed_urls` (Phase 5 v2.0) — when provided, overrides the default
+        seed-URL sourcing (`opportunity_sources → raw_items`). Used by
+        the on-demand research flow which bootstraps an Opportunity
+        from a single customer-supplied URL or topic without going
+        through the discovery → screening pipeline.
+        """
         job_obj = await self._resolve_job(job)
         if job_obj is None:
             raise LookupError(f"research job not found: {job}")
@@ -193,7 +201,7 @@ class ResearchService:
 
         started = time.perf_counter()
         try:
-            urls, source_docs = await self._gather_sources(opp, web)
+            urls, source_docs = await self._gather_sources(opp, web, seed_urls=seed_urls)
             parsed = await self._synthesise(opp, source_docs)
             warnings = validate_research_report(parsed)
 
@@ -260,9 +268,20 @@ class ResearchService:
         self,
         opp: Opportunity,
         web: WebDataProvider,
+        *,
+        seed_urls: list[str] | None = None,
     ) -> tuple[list[str], list[SourceDoc]]:
-        """Return (urls_attempted, source_docs)."""
-        seed_urls = await self._seed_urls_from_opp(opp)
+        """Return (urls_attempted, source_docs).
+
+        When `seed_urls` is provided (Phase 5 on-demand path), it
+        overrides the default `opportunity_sources → raw_items` lookup —
+        the on-demand opportunity has no upstream sources by design.
+        """
+        if seed_urls is not None:
+            candidate_urls = list(dict.fromkeys(seed_urls))
+        else:
+            seed_urls = await self._seed_urls_from_opp(opp)
+            candidate_urls = list(dict.fromkeys(seed_urls))
 
         # Iterative expansion — depth-N, but the MVP only does depth=0.
         # We always run search() at least once to enrich the seed list.
@@ -278,7 +297,6 @@ class ResearchService:
                     error=str(exc),
                 )
 
-        candidate_urls: list[str] = list(dict.fromkeys(seed_urls))
         candidate_urls.extend(d.url for d in extra_docs if d.url)
         # Dedupe + cap.
         candidate_urls = list(dict.fromkeys(candidate_urls))[: self.max_urls]
