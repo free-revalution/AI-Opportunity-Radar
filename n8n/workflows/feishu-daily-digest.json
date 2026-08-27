@@ -1,0 +1,59 @@
+{
+  "name": "feishu-daily-digest",
+  "active": true,
+  "nodes": [
+    {
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "mode": "cronExpression",
+              "expression": "30 2 * * *",
+              "timezone": "UTC"
+            }
+          ]
+        }
+      },
+      "id": "cron-trigger",
+      "name": "Cron (daily 02:30 UTC, after discovery)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.API_BASE_URL_INTERNAL}}/api/internal/feishu/digest/send",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-Radar-Webhook", "value": "={{$env.APP_SECRET_KEY}}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"limit\": 5, \"only_qualified\": true, \"window_hours\": 24, \"auto_generate_content\": false, \"title_prefix\": \"AI 机会雷达日报\"}",
+        "options": {
+          "timeout": 300000,
+          "retry": { "maxTries": 2, "waitBetweenTries": 5000 }
+        }
+      },
+      "id": "step-feishu-send",
+      "name": "Send Feishu digest",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [520, 300]
+    }
+  ],
+  "connections": {
+    "Cron (daily 02:30 UTC, after discovery)": {
+      "main": [
+        [
+          { "node": "Send Feishu digest", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "settings": { "executionOrder": "v1" }
+}

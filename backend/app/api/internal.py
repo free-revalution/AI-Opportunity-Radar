@@ -625,3 +625,62 @@ async def run_content_generation(
             only_qualified=bool(body.get("only_qualified", True)),
         )
     return result.as_dict()
+
+
+@router.post(
+    "/feishu/digest/send",
+    summary="Send the daily AI-opportunity digest to a Feishu custom robot",
+)
+async def send_feishu_digest(
+    body: dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 2 (v2.0) — push the top opportunities to a Feishu group.
+
+    Body (all optional):
+        {
+          "limit": 5,                          # top N by score
+          "only_qualified": true,              # skip 'unqualified' rows
+          "window_hours": 24,                  # only opps from the last N hours; null = all-time
+          "auto_generate_content": false,      # run content_generator first
+          "title_prefix": "AI 机会雷达日报"     # override header
+        }
+
+    Returns a `FeishuDigestSummary`. If no Feishu webhook is configured
+    the underlying provider falls back to the mock and the request still
+    succeeds — useful for local dev.
+    """
+    body = body or {}
+    from app.services.feishu import FeishuBot, build_feishu_provider
+    from app.config import get_settings
+
+    settings = get_settings()
+    provider = build_feishu_provider(settings)
+    bot = FeishuBot(
+        session=session,
+        provider=provider,
+        cta_base_url="http://localhost:3000/opportunities",
+    )
+
+    summary = await bot.send_digest(
+        limit=int(body.get("limit", 5)),
+        only_qualified=bool(body.get("only_qualified", True)),
+        window_hours=(
+            int(body["window_hours"])
+            if body.get("window_hours") is not None
+            else None
+        ),
+        auto_generate_content=bool(body.get("auto_generate_content", False)),
+        title_prefix=str(body["title_prefix"]) if body.get("title_prefix") else None,
+    )
+
+    # Close the provider's httpx client if it owns one — avoids resource leaks.
+    close = getattr(provider, "aclose", None)
+    if callable(close):
+        try:
+            await close()
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            pass
+
+    return summary.as_dict()

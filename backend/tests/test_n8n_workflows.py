@@ -149,9 +149,16 @@ def test_workflow_webhook_header_uses_radar_secret(path: Path) -> None:
             ),
             "",
         )
-        assert "RADAR_WEBHOOK_SECRET" in (secret_value or ""), (
+        # The backend's `_check_webhook_secret` accepts either
+        # APP_SECRET_KEY (preferred) or RADAR_WEBHOOK_SECRET (fallback).
+        # We accept either name in the workflow header.
+        assert (
+            "APP_SECRET_KEY" in (secret_value or "")
+            or "RADAR_WEBHOOK_SECRET" in (secret_value or "")
+        ), (
             f"{path.name}: HTTP node '{node.get('name')}' webhook secret "
-            f"must reference $env.RADAR_WEBHOOK_SECRET (got {secret_value!r})"
+            f"must reference APP_SECRET_KEY or RADAR_WEBHOOK_SECRET "
+            f"(got {secret_value!r})"
         )
 
 

@@ -105,6 +105,17 @@ class Settings(BaseSettings):
     telegram_chat_id: str = ""
     telegram_webhook_secret: str = ""
 
+    # ---------- Feishu (Phase 2 v2.0) ----------
+    # Full Webhook URL for a custom robot — e.g.
+    #   https://open.feishu.cn/open-apis/bot/v2/hook/<token>
+    # The token is already embedded in the URL; we do not strip it.
+    feishu_webhook_url: str = ""
+    # Optional signing secret for "加签" custom robots. Leave empty for
+    # non-signed robots. When set we send a `timestamp` header and add
+    # `timestamp` + `sign` to the request body via HMAC-SHA256.
+    feishu_webhook_secret: str = ""
+    feishu_timeout: float = 15.0
+
     # ---------- n8n ----------
     n8n_base_url: str = "http://localhost:5678"
     n8n_api_key: str = ""
