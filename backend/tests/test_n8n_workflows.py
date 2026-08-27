@@ -71,9 +71,23 @@ def test_workflow_cron_triggers_have_a_cron_expression(path: Path) -> None:
     for node in payload["nodes"]:
         if not node.get("type", "").endswith(".scheduleTrigger"):
             continue
-        rule = node.get("parameters", {}).get("rule", {})
-        # An empty `interval: [{}]` is invalid — accept a real cronExpression.
-        cron = rule.get("cronExpression")
+        params = node.get("parameters", {})
+        # n8n 0.x used `rule.cronExpression`; n8n 1.x uses
+        # `triggerTimes.item[].expression` with `mode: cronExpression`.
+        # We accept both shapes — the new one is what we shipped.
+        cron: str | None = None
+        rule = params.get("rule", {})
+        if isinstance(rule, dict):
+            cron = rule.get("cronExpression")
+        if not cron:
+            for item in params.get("triggerTimes", {}).get("item", []):
+                if (
+                    isinstance(item, dict)
+                    and item.get("mode") == "cronExpression"
+                    and isinstance(item.get("expression"), str)
+                ):
+                    cron = item["expression"]
+                    break
         assert isinstance(cron, str) and cron.strip(), (
             f"{path.name}: schedule trigger '{node.get('name')}' "
             "must declare a cronExpression"

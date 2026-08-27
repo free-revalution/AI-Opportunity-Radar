@@ -139,6 +139,35 @@ class Opportunity(Base):
     execution_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     total_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False, index=True)
 
+    # ---- commercial enrichment (Phase 1 v2.0) ------------------------
+    # Filled by the content_generator pipeline after Deep Research.
+    # `target_customer` and `target_user` are intentionally separate:
+    #   * target_user      — the *user* the product serves (existing field)
+    #   * target_customer  — the *persona* / paying customer description
+    #     used by sales copy (e.g. "海外 SaaS 创始人, 月营收 10k-50k USD")
+    target_customer: Mapped[Optional[str]] = mapped_column(String(512))
+    market_size: Mapped[Optional[str]] = mapped_column(String(64))  # e.g. "100M-500M USD"
+    mvp_days: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    difficulty: Mapped[Optional[str]] = mapped_column(String(32))   # easy / medium / hard
+    monetization_model: Mapped[Optional[str]] = mapped_column(String(128))
+    china_gap: Mapped[Optional[str]] = mapped_column(Text)          # free-text gap description
+    # content_status    — lifecycle for the auto-generated sales copy.
+    #   new          — never run a content generator
+    #   generated    — content written, not yet posted anywhere
+    #   published    — at least one channel posted
+    #   sold         — converted to a paying customer
+    content_status: Mapped[str] = mapped_column(
+        String(32), default="new", nullable=False, index=True
+    )
+    # commercial_status — sales-pipeline qualifier (Phase 4 will add
+    # payment/delivery fields next to it).
+    #   unqualified  — doesn't meet our basic thresholds
+    #   qualified    — meets thresholds, worth generating content for
+    #   promising    — strong signal, prioritised
+    commercial_status: Mapped[str] = mapped_column(
+        String(32), default="unqualified", nullable=False, index=True
+    )
+
     status: Mapped[str] = mapped_column(String(32), default="detected", nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

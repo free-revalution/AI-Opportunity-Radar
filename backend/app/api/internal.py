@@ -19,7 +19,9 @@ from app.config import get_settings
 from app.db import get_session
 from app.metrics import record_pipeline_run
 from app.services.clustering import ClusteringService
+from app.services.content_generator import ContentGeneratorService
 from app.services.ingestion import IngestionService
+from app.services.llm import build_llm_provider
 from app.services.notification import NotificationService
 from app.services.research import ResearchService
 from app.services.scoring import ScoringService
@@ -584,3 +586,42 @@ async def list_notifications(
             for r in rows
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# v2.0 — content generation pipeline
+# ---------------------------------------------------------------------------
+@router.post(
+    "/content/generate",
+    summary="Run all content generators on the top opportunities",
+)
+async def run_content_generation(
+    body: dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 1 (v2.0) — fan-out content production.
+
+    Body (all optional):
+        {
+          "limit": 5,                              # top N opportunities to process
+          "only_qualified": true,                  # skip 'unqualified' rows
+          "opportunity_ids": [1, 2, 3],            # OR explicit IDs
+          "generators": ["daily_report", ...]      # OR restrict to subset
+        }
+
+    Returns a summary; per-opportunity errors are surfaced inline so
+    one failure doesn't abort the rest.
+    """
+    body = body or {}
+    llm = build_llm_provider(settings=get_settings())
+    service = ContentGeneratorService(session=session, llm=llm)
+
+    if body.get("opportunity_ids"):
+        result = await service.run_for_ids([int(x) for x in body["opportunity_ids"]])
+    else:
+        result = await service.run_for_top_opportunities(
+            limit=int(body.get("limit", 5)),
+            only_qualified=bool(body.get("only_qualified", True)),
+        )
+    return result.as_dict()
