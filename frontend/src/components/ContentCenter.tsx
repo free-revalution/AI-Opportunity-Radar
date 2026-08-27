@@ -22,9 +22,14 @@ import {
   markContentPublished,
   markContentSold,
 } from "@/lib/api";
-import type { ContentCenterItem, ContentPiece } from "@/types";
+import type {
+  ContentCenterItem,
+  ContentPiece,
+  OrderCreatePayload,
+} from "@/types";
 
 import { ContentPieceCard } from "./ContentPieceCard";
+import { OrderDialog } from "./OrderDialog";
 
 const CHANNEL_ORDER = ["feishu", "xianyu", "xiaohongshu", "wechat_article"] as const;
 const CHANNEL_LABELS: Record<(typeof CHANNEL_ORDER)[number], string> = {
@@ -49,6 +54,10 @@ export function ContentCenter({
     null,
   );
   const [refreshing, setRefreshing] = useState(false);
+  const [soldDialogFor, setSoldDialogFor] = useState<{
+    opportunityId: number;
+    title: string;
+  } | null>(null);
 
   const showToast = useCallback(
     (kind: "ok" | "err", text: string) => {
@@ -91,15 +100,20 @@ export function ContentCenter({
   );
 
   const handleMarkSold = useCallback(
-    async (oppId: number) => {
+    async (oppId: number, order: OrderCreatePayload) => {
       setBusyId(oppId);
       try {
-        const result = await markContentSold(oppId);
+        const result = await markContentSold(oppId, order);
         updateItem(oppId, {
           content_status: result.content_status,
           commercial_status: result.commercial_status,
         });
-        showToast("ok", "已标记为已售出 🎉");
+        showToast(
+          "ok",
+          result.order
+            ? `已记录销售 ¥${order.amount_cny} · ${order.channel}`
+            : "已标记为已售出 🎉",
+        );
       } catch (err) {
         showToast("err", (err as Error).message);
       } finally {
@@ -108,6 +122,14 @@ export function ContentCenter({
     },
     [updateItem, showToast],
   );
+
+  const openSoldDialog = useCallback((oppId: number, title: string) => {
+    setSoldDialogFor({ opportunityId: oppId, title });
+  }, []);
+
+  const closeSoldDialog = useCallback(() => {
+    setSoldDialogFor(null);
+  }, []);
 
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -223,7 +245,7 @@ export function ContentCenter({
                       {opp.content_status === "published" ? "已发布 ✓" : "标记已发布"}
                     </button>
                     <button
-                      onClick={() => handleMarkSold(opp.id)}
+                      onClick={() => openSoldDialog(opp.id, opp.title)}
                       disabled={busyId === opp.id || opp.content_status === "sold"}
                       className="rounded-md border border-emerald-500/60 px-3 py-1.5 text-xs font-semibold text-emerald-400 hover:bg-emerald-500/10 disabled:cursor-not-allowed disabled:opacity-40"
                       data-testid={`mark-sold-${opp.id}`}
@@ -252,6 +274,19 @@ export function ContentCenter({
           })}
         </ul>
       )}
+
+      <OrderDialog
+        open={soldDialogFor !== null}
+        onClose={closeSoldDialog}
+        onSubmit={(order) => {
+          if (!soldDialogFor) return Promise.resolve();
+          return handleMarkSold(soldDialogFor.opportunityId, order).then(() => {
+            setSoldDialogFor(null);
+          });
+        }}
+        busy={busyId !== null}
+        opportunityTitle={soldDialogFor?.title ?? ""}
+      />
     </div>
   );
 }

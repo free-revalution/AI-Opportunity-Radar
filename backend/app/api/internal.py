@@ -10,15 +10,24 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+from decimal import Decimal
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.db import get_session
 from app.metrics import record_pipeline_run
+from app.schemas.order import (
+    OrderCreateRequest,
+    OrderListResponse,
+    OrderResponse,
+    OrderStatsResponse,
+    OrderStatusUpdateRequest,
+)
 from app.services.clustering import ClusteringService
 from app.services.content_generator import ContentGeneratorService
 from app.services.ingestion import IngestionService
@@ -822,16 +831,32 @@ async def mark_content_published(
 )
 async def mark_content_sold(
     opportunity_id: int,
+    body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
     _secret: None = Depends(_check_webhook_secret),
 ) -> dict[str, Any]:
-    """Phase 3 (v2.0) — flip `content_status` to `sold`.
+    """Phase 3 / 4 (v2.0) — flip `content_status` to `sold`.
 
-    Lightweight hook to record a manual sale without forcing Phase 4's
-    full order system. `commercial_status` is bumped to `promising`
-    so the dashboard can highlight it.
+    Backwards-compatible body shape: empty / None body → just flips the
+    flag, same as Phase 3.
+
+    Phase 4 body (optional, used by the Content Center's Mark Sold
+    dialog):
+        {
+          "order": {
+            "customer_name": "张三",
+            "customer_contact": "wechat:abc",
+            "amount_cny": 49,
+            "channel": "xianyu",
+            "payment_method": "wechat",
+            "notes": "..."
+          }
+        }
+    When `order` is present, an `orders` row is created in the same
+    transaction and the response includes the order payload.
     """
     from app.models import Opportunity
+    from app.repositories.orders import OrderRepository
 
     opp = await session.get(Opportunity, opportunity_id)
     if opp is None:
@@ -840,15 +865,58 @@ async def mark_content_sold(
             detail=f"opportunity {opportunity_id} not found",
         )
 
+    body = body or {}
+    order_payload = body.get("order")
+    created_order: dict[str, Any] | None = None
+
+    if order_payload:
+        try:
+            req = OrderCreateRequest(
+                opportunity_id=opportunity_id,
+                # Default delivery_status='pending' so the operator can
+                # explicitly mark it delivered/confirmed/refunded later.
+                mark_opportunity_sold=True,
+                **order_payload,
+            )
+        except ValidationError as exc:
+            # `exc.errors()` may surface Decimal / datetime values that
+            # aren't JSON-serialisable on their own — round-trip through
+            # `default=str` so the 422 response is always JSON-safe.
+            import json as _json
+
+            safe_errors = _json.loads(_json.dumps(exc.errors(), default=str))
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"order": safe_errors},
+            ) from exc
+
+        repo = OrderRepository(session=session)
+        order = await repo.create(
+            opportunity_id=opportunity_id,
+            customer_name=req.customer_name,
+            customer_contact=req.customer_contact,
+            amount_cny=Decimal(str(req.amount_cny)),
+            channel=req.channel,
+            payment_method=req.payment_method,
+            payment_reference=req.payment_reference,
+            delivery_status=req.delivery_status,
+            notes=req.notes,
+            commercial_status_snapshot=opp.commercial_status,
+        )
+        created_order = _serialize_order(order, opportunity_title=opp.title)
+
     opp.content_status = "sold"
     opp.commercial_status = "promising"
     await session.commit()
 
-    return {
+    response: dict[str, Any] = {
         "opportunity_id": opportunity_id,
         "content_status": opp.content_status,
         "commercial_status": opp.commercial_status,
     }
+    if created_order:
+        response["order"] = created_order
+    return response
 
 
 def _utc_now_iso() -> str:
@@ -856,3 +924,226 @@ def _utc_now_iso() -> str:
     from datetime import datetime, timezone
 
     return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# v2.0 Phase 4 — commercial orders
+# ---------------------------------------------------------------------------
+def _serialize_order(order: Any, *, opportunity_title: str | None = None) -> dict[str, Any]:
+    """Format an Order row for JSON output.
+
+    `amount_cny` is Numeric(10, 2) in SQL — coerce to float so JSON
+    clients don't have to round-trip a Decimal.
+    """
+    return {
+        "id": order.id,
+        "opportunity_id": order.opportunity_id,
+        "opportunity_title": opportunity_title,
+        "customer_name": order.customer_name,
+        "customer_contact": order.customer_contact,
+        "amount_cny": float(order.amount_cny),
+        "channel": order.channel,
+        "payment_method": order.payment_method,
+        "payment_reference": order.payment_reference,
+        "delivery_status": order.delivery_status,
+        "commercial_status_snapshot": order.commercial_status_snapshot,
+        "notes": order.notes,
+        "created_at": order.created_at.isoformat() if order.created_at else None,
+        "updated_at": order.updated_at.isoformat() if order.updated_at else None,
+    }
+
+
+@router.post(
+    "/orders",
+    summary="Record a commercial order (Phase 4 v2.0)",
+)
+async def create_order(
+    body: OrderCreateRequest,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 4 — record one sale of an Opportunity.
+
+    Body:
+        {
+          "opportunity_id": 1,
+          "customer_name": "张三",
+          "customer_contact": "wechat:zx",
+          "amount_cny": 49,
+          "channel": "xianyu",
+          "payment_method": "wechat",
+          "delivery_status": "pending",
+          "notes": "...",
+          "mark_opportunity_sold": true
+        }
+
+    Returns the new order. When `mark_opportunity_sold=true` (default),
+    also flips the anchor opportunity's `content_status` to `'sold'`
+    and bumps `commercial_status` to `'promising'`.
+    """
+    from app.models import Opportunity
+    from app.repositories.orders import OrderRepository
+
+    opp = await session.get(Opportunity, body.opportunity_id)
+    if opp is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"opportunity {body.opportunity_id} not found",
+        )
+
+    repo = OrderRepository(session=session)
+    order = await repo.create(
+        opportunity_id=body.opportunity_id,
+        customer_name=body.customer_name,
+        customer_contact=body.customer_contact,
+        amount_cny=Decimal(str(body.amount_cny)),
+        channel=body.channel,
+        payment_method=body.payment_method,
+        payment_reference=body.payment_reference,
+        delivery_status=body.delivery_status,
+        notes=body.notes,
+        commercial_status_snapshot=opp.commercial_status,
+    )
+
+    if body.mark_opportunity_sold:
+        opp.content_status = "sold"
+        opp.commercial_status = "promising"
+
+    await session.commit()
+    return _serialize_order(order, opportunity_title=opp.title)
+
+
+@router.get(
+    "/orders",
+    summary="List orders (newest first)",
+)
+async def list_orders(
+    channel: str | None = None,
+    delivery_status: str | None = None,
+    opportunity_id: int | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 4 — paginated order list for the /orders dashboard.
+
+    All filters are optional and ANDed together.
+    """
+    from app.repositories.orders import OrderRepository
+
+    repo = OrderRepository(session=session)
+    rows, total = await repo.list_paginated(
+        limit=limit,
+        offset=offset,
+        channel=channel,
+        delivery_status=delivery_status,
+        opportunity_id=opportunity_id,
+    )
+
+    # Resolve opportunity titles in a single batched query so the
+    # frontend doesn't have to make N round-trips to render the table.
+    opp_ids = {r.opportunity_id for r in rows}
+    title_by_id: dict[int, str] = {}
+    if opp_ids:
+        from app.models import Opportunity
+
+        title_rows = (
+            await session.execute(
+                select(Opportunity.id, Opportunity.title).where(
+                    Opportunity.id.in_(opp_ids)
+                )
+            )
+        ).all()
+        title_by_id = {int(r[0]): r[1] for r in title_rows}
+
+    return {
+        "generated_at": _utc_now_iso(),
+        "items": [
+            _serialize_order(r, opportunity_title=title_by_id.get(r.opportunity_id))
+            for r in rows
+        ],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@router.get(
+    "/orders/stats",
+    summary="Aggregated sales stats for the /orders dashboard",
+)
+async def get_order_stats(
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 4 — totals, by-channel breakdown, by-delivery-status counts."""
+    from app.repositories.orders import OrderRepository
+
+    repo = OrderRepository(session=session)
+    return await repo.stats()
+
+
+@router.get(
+    "/orders/{order_id}",
+    summary="Get one order by id",
+)
+async def get_order(
+    order_id: int,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 4 — single-order detail view."""
+    from app.models import Opportunity
+    from app.repositories.orders import OrderRepository
+
+    repo = OrderRepository(session=session)
+    order = await repo.get_by_id(order_id)
+    if order is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"order {order_id} not found",
+        )
+
+    opp = await session.get(Opportunity, order.opportunity_id)
+    title = opp.title if opp else None
+    return _serialize_order(order, opportunity_title=title)
+
+
+@router.post(
+    "/orders/{order_id}/status",
+    summary="Update an order's delivery_status (Phase 4)",
+)
+async def update_order_status(
+    order_id: int,
+    body: OrderStatusUpdateRequest,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 4 — flip an order's `delivery_status`.
+
+    Allowed transitions (any → any; not strict because the operator
+    knows their reality better than the model does):
+        pending → delivered → confirmed
+        pending → cancelled
+        delivered/confirmed → refunded
+
+    Returns the updated order.
+    """
+    from app.models import Opportunity
+    from app.repositories.orders import OrderRepository
+
+    repo = OrderRepository(session=session)
+    order = await repo.get_by_id(order_id)
+    if order is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"order {order_id} not found",
+        )
+
+    await repo.update_status(order, body.delivery_status)
+
+    opp = await session.get(Opportunity, order.opportunity_id)
+    title = opp.title if opp else None
+    await session.commit()
+    return _serialize_order(order, opportunity_title=title)

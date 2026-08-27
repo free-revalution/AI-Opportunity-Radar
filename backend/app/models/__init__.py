@@ -17,6 +17,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -179,6 +180,9 @@ class Opportunity(Base):
     sources: Mapped[list["OpportunitySource"]] = relationship(
         back_populates="opportunity", cascade="all, delete-orphan"
     )
+    orders: Mapped[list["Order"]] = relationship(
+        back_populates="opportunity", cascade="all, delete-orphan"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +285,71 @@ class SystemJob(Base):
     )
 
 
+# ---------------------------------------------------------------------------
+# orders (Phase 4 v2.0)
+# ---------------------------------------------------------------------------
+# A real-world sale of the auto-generated content (or any other revenue
+# event tied to an opportunity). Kept intentionally lightweight — only
+# the three fields the spec calls out (`customer`, `payment`,
+# `delivery_status`) plus the small set of metadata needed for the
+# /orders dashboard (channel, snapshot of the opportunity's
+# commercial_status at sale time, free-form notes).
+#
+# One opportunity can have many orders (repeat customers, different
+# channels, refunds + re-sells). `delivery_status` mirrors a real
+# fulfilment flow:
+#   pending     — order recorded, goods not yet delivered
+#   delivered   — digital asset / link sent to customer
+#   confirmed   — customer acknowledged receipt
+#   refunded    — money returned (closed-loop), opportunity stays 'sold'
+#   cancelled   — operator aborted before delivery
+#
+# The opportunity's `content_status='sold'` is the high-water mark;
+# individual orders live or die on `delivery_status`.
+class Order(Base):
+    __tablename__ = "orders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    opportunity_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("opportunities.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # customer ---------------------------------------------------------
+    customer_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    customer_contact: Mapped[Optional[str]] = mapped_column(String(255))
+
+    # payment ----------------------------------------------------------
+    # Stored in CNY (yuan) because all current sales channels are
+    # domestic platforms. Use Numeric(10, 2) for currency.
+    amount_cny: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    channel: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    payment_method: Mapped[Optional[str]] = mapped_column(String(64))
+    payment_reference: Mapped[Optional[str]] = mapped_column(String(255))
+
+    # delivery ---------------------------------------------------------
+    delivery_status: Mapped[str] = mapped_column(
+        String(32), default="pending", nullable=False, index=True
+    )
+
+    # meta -------------------------------------------------------------
+    # Snapshot of Opportunity.commercial_status at sale time so we can
+    # build historical conversion reports even if the opportunity later
+    # gets re-classified.
+    commercial_status_snapshot: Mapped[Optional[str]] = mapped_column(String(32))
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    opportunity: Mapped[Opportunity] = relationship(back_populates="orders")
+
+
 __all__ = [
     "Base",
     "User",
@@ -293,4 +362,5 @@ __all__ = [
     "ResearchReport",
     "Notification",
     "SystemJob",
+    "Order",
 ]

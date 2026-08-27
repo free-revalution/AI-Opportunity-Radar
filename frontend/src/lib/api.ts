@@ -144,9 +144,101 @@ export async function markContentPublished(
 
 export async function markContentSold(
   opportunityId: number,
-): Promise<MarkContentResult> {
-  return jsonFetchWithSecret<MarkContentResult>(
+  order?: OrderCreatePayload,
+): Promise<MarkContentResult & { order?: OrderRecord }> {
+  return jsonFetchWithSecret<MarkContentResult & { order?: OrderRecord }>(
     `/api/internal/content/${opportunityId}/mark_sold`,
-    { method: "POST" },
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(order ? { order } : {}),
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Commercial orders (Phase 4 v2.0)
+// ---------------------------------------------------------------------------
+// Types live in `@/types` — re-imported here so the api helpers can name
+// them in their return signatures without redefining a parallel shape.
+import type {
+  OrderChannel,
+  OrderRecord,
+  DeliveryStatus,
+  OrderCreatePayload,
+  OrderStatsResponse,
+} from "@/types";
+
+export type {
+  OrderChannel,
+  DeliveryStatus,
+  OrderCreatePayload,
+  OrderRecord,
+  OrderStatsResponse,
+};
+
+export async function createOrder(
+  payload: OrderCreatePayload,
+): Promise<OrderRecord> {
+  return jsonFetchWithSecret<OrderRecord>(`/api/internal/orders`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function fetchOrders(
+  params: {
+    channel?: string;
+    delivery_status?: string;
+    opportunity_id?: number;
+    limit?: number;
+    offset?: number;
+  } = {},
+): Promise<{
+  generated_at: string;
+  items: OrderRecord[];
+  total: number;
+  limit: number;
+  offset: number;
+}> {
+  const search = new URLSearchParams();
+  if (params.channel) search.set("channel", params.channel);
+  if (params.delivery_status) search.set("delivery_status", params.delivery_status);
+  if (typeof params.opportunity_id === "number") {
+    search.set("opportunity_id", String(params.opportunity_id));
+  }
+  search.set("limit", String(params.limit ?? 50));
+  search.set("offset", String(params.offset ?? 0));
+  const qs = search.toString();
+  return jsonFetchWithSecret(`/api/internal/orders${qs ? `?${qs}` : ""}`);
+}
+
+export async function fetchOrderStats(): Promise<OrderStatsResponse> {
+  return jsonFetchWithSecret<OrderStatsResponse>("/api/internal/orders/stats");
+}
+
+export async function fetchOrder(orderId: number): Promise<OrderRecord> {
+  return jsonFetchWithSecret<OrderRecord>(
+    `/api/internal/orders/${orderId}`,
+  );
+}
+
+export async function updateOrderStatus(
+  orderId: number,
+  deliveryStatus:
+    | "pending"
+    | "delivered"
+    | "confirmed"
+    | "refunded"
+    | "cancelled",
+): Promise<OrderRecord> {
+  return jsonFetchWithSecret<OrderRecord>(
+    `/api/internal/orders/${orderId}/status`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ delivery_status: deliveryStatus }),
+    },
   );
 }

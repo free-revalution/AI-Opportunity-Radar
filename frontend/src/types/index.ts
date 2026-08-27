@@ -158,3 +158,69 @@ export interface ContentCenterResponse {
   generated_at: string;
   items: ContentCenterItem[];
 }
+
+// ---------------------------------------------------------------------------
+// Commercial orders (Phase 4 v2.0)
+// ---------------------------------------------------------------------------
+export type OrderChannel =
+  | "xianyu"
+  | "xiaohongshu"
+  | "wechat"
+  | "wechat_article"
+  | "feishu"
+  | "direct"
+  | "other";
+
+export type DeliveryStatus =
+  | "pending"
+  | "delivered"
+  | "confirmed"
+  | "refunded"
+  | "cancelled";
+
+export interface OrderRecord {
+  id: number;
+  opportunity_id: number;
+  opportunity_title?: string | null;
+  customer_name: string;
+  customer_contact?: string | null;
+  amount_cny: number;
+  channel: string; // widened on the wire — backend returns OrderChannel
+  payment_method?: string | null;
+  payment_reference?: string | null;
+  delivery_status: DeliveryStatus;
+  commercial_status_snapshot?: string | null;
+  notes?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface OrderStatsResponse {
+  total_orders: number;
+  total_revenue_cny: number;
+  delivered_count: number;
+  confirmed_count: number;
+  pending_count: number;
+  by_channel: Array<{ channel: string; count: number; revenue_cny: number }>;
+  by_delivery_status: Record<string, number>;
+}
+
+export interface OrderListResponse {
+  generated_at: string;
+  items: OrderRecord[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface OrderCreatePayload {
+  customer_name: string;
+  customer_contact?: string | null;
+  amount_cny: number;
+  channel: OrderChannel;
+  payment_method?: string | null;
+  payment_reference?: string | null;
+  delivery_status?: DeliveryStatus;
+  notes?: string | null;
+  mark_opportunity_sold?: boolean;
+}

@@ -146,11 +146,40 @@ describe("ContentCenter", () => {
     await waitFor(() => expect(markContentPublished).toHaveBeenCalledWith(1));
   });
 
-  it("calls markContentSold when the sold button is clicked", async () => {
+  it("opens the OrderDialog when the sold button is clicked", async () => {
+    render(
+      <ContentCenter
+        initialItems={[makeItem()]}
+        onlyQualified
+        limit={20}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId("mark-sold-1"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("order-dialog")).toBeInTheDocument(),
+    );
+    // Pre-filled defaults are visible.
+    expect(screen.getByTestId("order-customer-name")).toBeInTheDocument();
+    expect(screen.getByTestId("order-amount")).toHaveValue(49);
+  });
+
+  it("calls markContentSold with an order payload when the dialog submits", async () => {
     markContentSold.mockResolvedValueOnce({
       opportunity_id: 1,
       content_status: "sold",
       commercial_status: "promising",
+      order: {
+        id: 99,
+        opportunity_id: 1,
+        opportunity_title: "AI 法律合同审核",
+        customer_name: "李四",
+        amount_cny: 99,
+        channel: "wechat",
+        payment_method: "wechat",
+        delivery_status: "pending",
+      },
     });
 
     render(
@@ -162,8 +191,32 @@ describe("ContentCenter", () => {
     );
 
     fireEvent.click(screen.getByTestId("mark-sold-1"));
+    await waitFor(() =>
+      expect(screen.getByTestId("order-dialog")).toBeInTheDocument(),
+    );
 
-    await waitFor(() => expect(markContentSold).toHaveBeenCalledWith(1));
+    fireEvent.change(screen.getByTestId("order-customer-name"), {
+      target: { value: "李四" },
+    });
+    fireEvent.change(screen.getByTestId("order-amount"), {
+      target: { value: "99" },
+    });
+    fireEvent.change(screen.getByTestId("order-channel"), {
+      target: { value: "wechat" },
+    });
+    fireEvent.click(screen.getByTestId("order-submit"));
+
+    await waitFor(() =>
+      expect(markContentSold).toHaveBeenCalledWith(
+        1,
+        expect.objectContaining({
+          customer_name: "李四",
+          amount_cny: 99,
+          channel: "wechat",
+          mark_opportunity_sold: true,
+        }),
+      ),
+    );
   });
 
   it("disables mark-published when status is already published", () => {
