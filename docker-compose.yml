@@ -165,12 +165,13 @@ services:
       DB_POSTGRESDB_DATABASE: n8n
       DB_POSTGRESDB_USER: radar
       DB_POSTGRESDB_PASSWORD: radar
-      # n8n basic auth — user MUST be email-format (n8n validates this).
-      # Skipping owner setup so basic auth is the only gate; no in-app
-      # email/password form to fill in.
-      N8N_BASIC_AUTH_ACTIVE: "true"
-      N8N_BASIC_AUTH_USER: ${N8N_USER:-admin@radar.local}
-      N8N_BASIC_AUTH_PASSWORD: ${N8N_PASSWORD:-change-me}
+      # Owner credentials are seeded via direct DB write (the n8n setup wizard
+      # is disabled by SKIP_OWNER_SETUP). User management stays ENABLED so
+      # n8n presents the email/password login form — basic auth at the HTTP
+      # layer in 1.x does NOT actually enforce (verified empirically: every
+      # request returns 200 even with wrong creds). The owner row in the
+      # `user` table is what gates access.
+      N8N_BASIC_AUTH_ACTIVE: "false"
       N8N_SKIP_OWNER_SETUP: "true"
       WEBHOOK_URL: http://localhost:5678/
       GENERIC_TIMEZONE: UTC
