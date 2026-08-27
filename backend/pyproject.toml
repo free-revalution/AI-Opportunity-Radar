@@ -27,7 +27,7 @@ dependencies = [
     "aiocache>=0.12",
     "feedparser>=6.0.18",
     "python-telegram-bot>=21.3",
-    "openai>=1.40",                  # 同时驱动 OpenAI 与 MiniMax(智谱 GLM,OpenAI 兼容端点)
+    "openai>=1.40",                  # 同时驱动 OpenAI 与 MiniMax(MiniMax,OpenAI 兼容端点)
     "numpy>=1.26",
     "prometheus-client>=0.20",
 ]

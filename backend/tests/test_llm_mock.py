@@ -122,7 +122,7 @@ def test_MiniMax_provider_requires_api_key():
     from app.utils import ValidationError
 
     try:
-        MiniMaxLLMProvider(api_key="", default_model="glm-4.7")
+        MiniMaxLLMProvider(api_key="", default_model="MiniMax-M3")
     except ValidationError as exc:
         assert "api_key" in str(exc).lower()
     else:

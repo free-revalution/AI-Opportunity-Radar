@@ -7,7 +7,7 @@ captures lexical overlap, which is what matters for "same product on
 GitHub, Reddit, and HN at the same time."
 
 For production semantic similarity we will swap in `MiniMaxEmbedder`
-(MiniMax `embedding-2`) or a hosted sentence-transformers endpoint;
+(MiniMax `MiniMax-Embeddings`) or a hosted sentence-transformers endpoint;
 the `Embedder` ABC here keeps the boundary clean.
 """
 

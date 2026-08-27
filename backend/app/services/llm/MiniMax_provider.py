@@ -1,17 +1,18 @@
-"""MiniMax(智谱 GLM)LLM provider.
+"""MiniMax(MiniMax)LLM provider.
 
-MiniMax 提供 OpenAI 兼容的 Chat Completions 端点,本 provider 直接复用
-官方 `openai` SDK,只改 `base_url` + `api_key`,不加新依赖。
+MiniMax's chat completion endpoint is OpenAI-compatible, so this provider
+reuses the official `openai` SDK and only swaps `base_url` + `api_key`.
+No new dependency.
 
-可用模型(写入 Settings 后由运营配置覆盖):
-  * `glm-4.7`       — strong,深度研究 / 评分
-  * `glm-4-air`     — mid
-  * `glm-4-flash`   — cheap,筛选 / 摘要
-  * `embedding-2`    — 嵌入(独立端点;`embedding.py` 处理)
+Default model lineup (overridable via Settings):
+  * `MiniMax-M3`     — strong, deep research / scoring
+  * `MiniMax-M2`     — mid
+  * `MiniMax-M1`     — cheap, screening / summary
+  * `MiniMax-Embeddings` — embeddings (separate endpoint, handled in embedding.py)
 
-约束:必须返回 JSON 对象,否则算作 `ValidationError`。
-任何传输 / 鉴权 / 5xx 故障翻译为 `ExternalServiceError`,
-以便 screening / scoring 服务的重试逻辑保持统一。
+Contract: every response MUST be a JSON object (else `ValidationError`).
+Any transport / auth / 5xx failure is translated to `ExternalServiceError`
+so screening / scoring retry logic stays uniform across vendors.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ class MiniMaxLLMProvider(LLMProvider):
         *,
         api_key: str,
         default_model: str,
-        api_url: str = "https://api.MiniMax.cn/v1",
+        api_url: str = "https://api.MiniMax.io/v1",
         timeout: float = 30.0,
     ) -> None:
         if not api_key:
@@ -45,7 +46,7 @@ class MiniMaxLLMProvider(LLMProvider):
         self.default_model = default_model
         self.api_url = api_url.rstrip("/")
         self.timeout = timeout
-        # Lazy import — openai SDK 很重,测试不需要它。
+        # Lazy import — openai SDK is heavy and not required for tests.
         import openai  # type: ignore[import-not-found]
 
         self._client = openai.AsyncOpenAI(

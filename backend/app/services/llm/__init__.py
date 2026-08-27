@@ -27,8 +27,8 @@ def build_llm_provider(settings, *, prefer: str | None = None):
          API key wins.
       3. Fall back to the mock.
 
-    Default provider is **MiniMax**(智谱 GLM 系列,OpenAI 兼容);
-    OpenAI / Anthropic / Gemini 保留为备选。
+    Default provider is **MiniMax**(MiniMax-M3 / M2 / M1,OpenAI-compatible endpoint);
+OpenAI / Anthropic / Gemini are kept as alternates.
     """
     if getattr(settings, "mock_external_services", False):
         return MockLLMProvider()

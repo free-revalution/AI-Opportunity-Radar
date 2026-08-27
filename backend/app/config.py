@@ -48,13 +48,15 @@ class Settings(BaseSettings):
     redis_result_backend: str = "redis://localhost:6379/1"
 
     # ---------- LLM ----------
-    # Primary provider is MiniMax(智谱 GLM 系列,OpenAI 兼容端点)。
-    # OpenAI / Anthropic / Gemini 保留为备选;运行时由 `build_llm_provider` 选择。
+    # Primary provider is MiniMax(MiniMax-M3 / M2 / M1),
+    # OpenAI-compatible chat endpoint at https://api.MiniMax.io/v1.
+    # OpenAI / Anthropic / Gemini are kept as fallbacks; the runtime picks
+    # one via `build_llm_provider`.
     MiniMax_api_key: str = ""
-    MiniMax_model_cheap: str = "glm-4-flash"
-    MiniMax_model_mid: str = "glm-4-air"
-    MiniMax_model_strong: str = "glm-4.7"
-    MiniMax_api_url: str = "https://api.MiniMax.cn/v1"
+    MiniMax_model_cheap: str = "MiniMax-M1"
+    MiniMax_model_mid: str = "MiniMax-M2"
+    MiniMax_model_strong: str = "MiniMax-M3"
+    MiniMax_api_url: str = "https://api.MiniMax.io/v1"
 
     openai_api_key: str = ""
     openai_model_cheap: str = "gpt-4o-mini"
@@ -72,7 +74,7 @@ class Settings(BaseSettings):
     gemini_model_strong: str = "gemini-1.5-pro"
 
     llm_default_provider: Literal["MiniMax", "openai", "anthropic", "gemini"] = "MiniMax"
-    llm_embedding_model: str = "embedding-2"
+    llm_embedding_model: str = "MiniMax-Embeddings"
 
     # ---------- Firecrawl ----------
     firecrawl_api_key: str = ""
