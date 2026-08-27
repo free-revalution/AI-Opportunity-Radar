@@ -4,8 +4,14 @@
   "nodes": [
     {
       "parameters": {
-        "rule": {
-          "cronExpression": "0 2 * * *"
+        "triggerTimes": {
+          "item": [
+            {
+              "mode": "cronExpression",
+              "expression": "0 2 * * *",
+              "timezone": "UTC"
+            }
+          ]
         }
       },
       "id": "cron-trigger",

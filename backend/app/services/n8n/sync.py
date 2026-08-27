@@ -46,6 +46,25 @@ class N8nWorkflowSummary:
     raw: dict[str, Any] = field(default_factory=dict)
 
 
+# Fields that n8n's POST / PUT /api/v1/workflows treat as read-only.
+# Source: https://docs.n8n.io/api/v1/workflows — these are owned by n8n
+# (e.g. set by the runner, the scheduler, or the user via the UI toggle)
+# and must NOT appear in the request body. Activation goes through the
+# dedicated POST /api/v1/workflows/{id}/activate endpoint.
+_READONLY_TOP_LEVEL_FIELDS = frozenset({"active", "createdAt", "updatedAt"})
+
+
+def _strip_readonly(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of *payload* without read-only top-level fields.
+
+    n8n's v1 API returns 400 `request/body/active is read-only` if the
+    create/update body contains fields it manages internally. We strip
+    them here so callers can keep their hand-written workflow JSONs in
+    the n8n-export format (which always includes `"active": true`).
+    """
+    return {k: v for k, v in payload.items() if k not in _READONLY_TOP_LEVEL_FIELDS}
+
+
 class N8nClient:
     """Minimal n8n REST client.
 
@@ -188,6 +207,8 @@ def sync_workflows_dir(
     Behaviour:
     * For each file, look up the workflow by name on the remote instance.
     * If absent → create. If present → update in place.
+    * Read-only fields (e.g. `active`) are stripped before the create/update
+      call — n8n's API rejects them with 400 `is read-only`.
     * If `activate=True`, call `/activate` after a successful create/update.
     * Exceptions are caught and reported via `N8nWorkflowSummary.action='failed'`.
     """
@@ -214,22 +235,21 @@ def sync_workflows_dir(
                 continue
 
             name = str(payload["name"])
+            body = _strip_readonly(payload)
             try:
                 if name in existing and existing[name].get("id"):
                     remote_id = str(existing[name]["id"])
-                    updated = client.update_workflow(remote_id, payload)
+                    client.update_workflow(remote_id, body)
                     action = "updated"
                 else:
-                    created = client.create_workflow(payload)
+                    created = client.create_workflow(body)
                     remote_id = str(
                         created.get("id")
                         or (created.get("data") or {}).get("id")
                         or ""
                     )
                     action = "created"
-                    if activate:
-                        client.activate(remote_id)
-                if activate and action == "updated":
+                if activate and remote_id:
                     client.activate(remote_id)
                 summaries.append(
                     N8nWorkflowSummary(

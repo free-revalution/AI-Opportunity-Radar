@@ -80,6 +80,9 @@ services:
       - 9.9.9.9
     volumes:
       - ./backend:/app
+      # n8n/workflows/* needs to be visible to the backend too — the
+      # n8n_sync script reads them when pushing into the n8n container.
+      - ./n8n/workflows:/n8n/workflows:ro
     ports:
       - "8000:8000"
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
@@ -116,6 +119,9 @@ services:
       - 9.9.9.9
     volumes:
       - ./backend:/app
+      # n8n/workflows/* needs to be visible to the backend too — the
+      # n8n_sync script reads them when pushing into the n8n container.
+      - ./n8n/workflows:/n8n/workflows:ro
     command: ["python", "-m", "app.worker"]
     # No ports — worker is internal only.
 
@@ -159,9 +165,13 @@ services:
       DB_POSTGRESDB_DATABASE: n8n
       DB_POSTGRESDB_USER: radar
       DB_POSTGRESDB_PASSWORD: radar
+      # n8n basic auth — user MUST be email-format (n8n validates this).
+      # Skipping owner setup so basic auth is the only gate; no in-app
+      # email/password form to fill in.
       N8N_BASIC_AUTH_ACTIVE: "true"
-      N8N_BASIC_AUTH_USER: ${N8N_USER:-admin}
+      N8N_BASIC_AUTH_USER: ${N8N_USER:-admin@radar.local}
       N8N_BASIC_AUTH_PASSWORD: ${N8N_PASSWORD:-change-me}
+      N8N_SKIP_OWNER_SETUP: "true"
       WEBHOOK_URL: http://localhost:5678/
       GENERIC_TIMEZONE: UTC
       # Variables consumed by the workflow JSON in /n8n/workflows/*.json.
