@@ -11,6 +11,12 @@ Public surface:
     MockFeishuProvider     offline test fixture (records every send)
     format_daily_digest    Opportunity rows → interactive card payload
     FeishuBot              orchestrator: pull opps → format → send
+
+Phase 12G additions:
+    authorize / role_required_for / user_facing_deny_message
+        — RBAC enforcement for /admin commands.
+    tool_allowed_for_llm / tool_is_admin_only
+        — LLM tool allowlist (per docs §39).
 """
 
 from app.services.feishu.base import (
@@ -24,8 +30,21 @@ from app.services.feishu.bot import FeishuBot, FeishuDigestSummary
 from app.services.feishu.client import HttpxFeishuProvider
 from app.services.feishu.formatter import format_daily_digest
 from app.services.feishu.mock_client import MockFeishuProvider
+from app.services.feishu.rbac import (
+    AuthVerdict,
+    CommandRole,
+    USER_TOOL_ALLOWLIST,
+    authorize,
+    is_activation_command,
+    role_required_for,
+    tool_allowed_for_llm,
+    tool_is_admin_only,
+    user_facing_deny_message,
+)
 
 __all__ = [
+    "AuthVerdict",
+    "CommandRole",
     "FeishuBot",
     "FeishuCard",
     "FeishuDigestSummary",
@@ -33,7 +52,14 @@ __all__ = [
     "FeishuSendResult",
     "HttpxFeishuProvider",
     "MockFeishuProvider",
+    "USER_TOOL_ALLOWLIST",
+    "authorize",
     "build_feishu_provider",
     "format_daily_digest",
+    "is_activation_command",
+    "role_required_for",
     "sign_feishu_payload",
+    "tool_allowed_for_llm",
+    "tool_is_admin_only",
+    "user_facing_deny_message",
 ]

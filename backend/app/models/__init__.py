@@ -53,6 +53,13 @@ class User(Base):
 # ---------------------------------------------------------------------------
 # sources
 # ---------------------------------------------------------------------------
+# Per docs/下一阶段开发技术方案.md §22, ``Source`` carries compliance
+# metadata (compliance_level, terms/robots URLs, commercial_use_status,
+# access_method, rate_limit, last_compliance_check, retention_policy,
+# source_block_reason) so the Compliance Engine can gate every Signal
+# ingestion by source posture. New sources default to compliance_level
+# "E" (block) with "unknown" commercial-use until a human reviews them
+# — this is the safe default documented in ``evaluate_source_policy``.
 class Source(Base):
     __tablename__ = "sources"
 
@@ -67,6 +74,27 @@ class Source(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+    # ---- V2 compliance posture (Phase 12D) -------------------------------
+    compliance_level: Mapped[str] = mapped_column(
+        String(1), default="E", nullable=False, index=True
+    )
+    terms_url: Mapped[Optional[str]] = mapped_column(String(512))
+    robots_url: Mapped[Optional[str]] = mapped_column(String(512))
+    commercial_use_status: Mapped[str] = mapped_column(
+        String(32), default="unknown", nullable=False
+    )
+    access_method: Mapped[str] = mapped_column(
+        String(32), default="unknown", nullable=False
+    )
+    rate_limit: Mapped[Optional[int]] = mapped_column(Integer)
+    last_compliance_check: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
+    retention_policy: Mapped[str] = mapped_column(
+        String(64), default="session", nullable=False
+    )
+    source_block_reason: Mapped[Optional[str]] = mapped_column(String(64))
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +127,23 @@ class RawItem(Base):
 # ---------------------------------------------------------------------------
 # signals
 # ---------------------------------------------------------------------------
+# Per docs/下一阶段开发技术方案.md §6 / §7, Signal carries an enriched set
+# of fields beyond the original velocity/engagement/relevance trio:
+#
+#   - title / summary: human-readable headline + 2-3 sentence synopsis.
+#   - source_count:   number of independent sources backing this Signal.
+#   - sub-scores:     Freshness, Velocity, Evidence, Novelty, Commercial,
+#                     Actionability, Scarcity (all 0..100).
+#   - signal_score:   weighted aggregate (0..100), bands at 50/70/85.
+#   - lifecycle:      status state machine
+#                     (DISCOVERED → VALIDATING → VERIFIED → ANALYZING →
+#                      PUBLISHED → EXPIRED; or REJECTED).
+#   - compliance:     risk_score + compliance_status + reason.
+#   - retention:      retention_until for data-lifecycle control.
+#
+# All V2 fields are additive — old Opportunity pipeline keeps running
+# while the new Signal surface comes online. See migration
+# ``5d3b1f7a8c2e_v2_0_signal_v2_fields.py``.
 class Signal(Base):
     __tablename__ = "signals"
 
@@ -115,6 +160,47 @@ class Signal(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+    # ---- V2 metadata -----------------------------------------------------
+    title: Mapped[Optional[str]] = mapped_column(String(512))
+    summary: Mapped[Optional[str]] = mapped_column(Text)
+    source_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+
+    # ---- V2 sub-scores (0..100) -----------------------------------------
+    freshness_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    evidence_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    novelty_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    commercial_value_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    actionability_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    scarcity_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    confidence_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+
+    # ---- V2 aggregate (Signal Score 0..100) -----------------------------
+    signal_score: Mapped[float] = mapped_column(
+        Float, default=0.0, nullable=False, index=True
+    )
+
+    # ---- V2 lifecycle timestamps ----------------------------------------
+    detected_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    expiration_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    # ---- V2 status state machine ----------------------------------------
+    #   discovered → validating → verified → analyzing → published → expired
+    #                                                       (or rejected)
+    status: Mapped[str] = mapped_column(
+        String(32), default="discovered", nullable=False, index=True
+    )
+
+    # ---- V2 compliance posture ------------------------------------------
+    risk_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    compliance_status: Mapped[str] = mapped_column(
+        String(32), default="pending", nullable=False
+    )
+    compliance_reason: Mapped[Optional[str]] = mapped_column(String(255))
+
+    # ---- V2 retention ---------------------------------------------------
+    retention_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +302,90 @@ class OpportunitySource(Base):
 
 
 # ---------------------------------------------------------------------------
+# signal_sources (Phase 12C v2.0 — multi-source verification)
+# ---------------------------------------------------------------------------
+class SignalSource(Base):
+    """Many-to-many between Signals and RawItems.
+
+    Per docs/下一阶段开发技术方案.md §9-10, a Signal can be backed by
+    multiple independent RawItems — this table is the formal record of
+    which sources contributed. ``relevance`` is a per-source confidence
+    (0..1) and ``evidence_type`` carries a free-form tag (e.g. "news",
+    "discussion", "release-notes") that downstream agents can use.
+    """
+
+    __tablename__ = "signal_sources"
+    __table_args__ = (
+        UniqueConstraint("signal_id", "raw_item_id", name="uq_signal_raw"),
+    )
+
+    signal_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("signals.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    raw_item_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("raw_items.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    relevance: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    evidence_type: Mapped[Optional[str]] = mapped_column(String(32))
+    added_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+# ---------------------------------------------------------------------------
+# content_opportunities (Phase 12C v2.0 — vertical interpretation)
+# ---------------------------------------------------------------------------
+class ContentOpportunity(Base):
+    """Vertical interpretation of a Signal — what it means for a creator.
+
+    Per docs/下一阶段开发技术方案.md §11, this table separates "what
+    changed in the world" (Signal) from "what a creator can do about it"
+    (ContentOpportunity). One Signal can produce many ContentOpportunities
+    — one per platform / audience / niche combo.
+
+    Status state machine: draft → approved → published → archived.
+    """
+
+    __tablename__ = "content_opportunities"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    signal_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("signals.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    platform: Mapped[str] = mapped_column(
+        String(32), default="general", nullable=False
+    )
+    audience: Mapped[Optional[str]] = mapped_column(String(255))
+    niche: Mapped[Optional[str]] = mapped_column(String(128))
+    tone: Mapped[Optional[str]] = mapped_column(String(64))
+    content_angle: Mapped[Optional[str]] = mapped_column(Text)
+    hook: Mapped[Optional[str]] = mapped_column(Text)
+    title_candidates: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
+    material_ideas: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
+    script_outline: Mapped[Optional[str]] = mapped_column(Text)
+    recommended_length: Mapped[Optional[int]] = mapped_column(Integer)
+    cta: Mapped[Optional[str]] = mapped_column(Text)
+    risk_warning: Mapped[Optional[str]] = mapped_column(Text)
+    content_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), default="draft", nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+# ---------------------------------------------------------------------------
 # research_jobs
 # ---------------------------------------------------------------------------
 class ResearchJob(Base):
@@ -273,6 +443,112 @@ class Notification(Base):
     error: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+# ---------------------------------------------------------------------------
+# subscriptions (Phase 12E v2.0 — subscription tiers)
+# ---------------------------------------------------------------------------
+class Subscription(Base):
+    """Subscription record for a user OR a Feishu-bound open id.
+
+    Per docs/下一阶段开发技术方案.md §44 / §47:
+      plans:  free | basic | pro | creator
+      status: active | expired | suspended | cancelled
+
+    One row per active subscription — multiple rows per user_id are
+    allowed (history). The `source_channel` records where the
+    subscription came from (xianyu / wechat / direct / feishu).
+    """
+
+    __tablename__ = "subscriptions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    feishu_open_id: Mapped[Optional[str]] = mapped_column(String(128), index=True)
+    plan: Mapped[str] = mapped_column(String(32), default="free", nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), default="active", nullable=False, index=True
+    )
+    starts_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+    source_channel: Mapped[Optional[str]] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+# ---------------------------------------------------------------------------
+# activation_codes (Phase 12E v2.0 — Xianyu-style invite codes)
+# ---------------------------------------------------------------------------
+class ActivationCode(Base):
+    """One-time activation code issued when a customer buys via Xianyu.
+
+    Per docs §52:
+      - SHA-256(code + server_pepper) stored as code_hash.
+      - Status: unused | active | expired | revoked.
+      - bound_feishu_open_id: the Feishu user this code was bound to.
+
+    Codes are written as a hash only — the plaintext is shown to the
+    customer once on issue and never persisted server-side.
+    """
+
+    __tablename__ = "activation_codes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    plan: Mapped[str] = mapped_column(String(32), default="basic", nullable=False)
+    order_id: Mapped[Optional[int]] = mapped_column(Integer, index=True)
+    status: Mapped[str] = mapped_column(
+        String(32), default="unused", nullable=False, index=True
+    )
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    bound_feishu_open_id: Mapped[Optional[str]] = mapped_column(String(128))
+    bound_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+# ---------------------------------------------------------------------------
+# audit_logs (Phase 12E v2.0 — compliance audit trail)
+# ---------------------------------------------------------------------------
+class AuditLog(Base):
+    """Append-only audit trail for publish / research / compliance actions.
+
+    Per docs §65-66:
+      actor_type: admin | system | user | bot
+      action:     publish | reject | research | refresh | score | activate
+      result:     success | failure | blocked | partial
+      metadata_json: free-form per-action context (kept small — a few KB).
+
+    Always INSERT, never UPDATE — every action is a new row so the trail
+    is tamper-evident via ``created_at`` ordering.
+    """
+
+    __tablename__ = "audit_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    actor_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    actor_id: Mapped[Optional[str]] = mapped_column(String(128))
+    action: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    resource_type: Mapped[Optional[str]] = mapped_column(String(64))
+    resource_id: Mapped[Optional[str]] = mapped_column(String(128))
+    result: Mapped[str] = mapped_column(
+        String(32), default="success", nullable=False
+    )
+    metadata_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+        index=True,
     )
 
 
@@ -361,16 +637,21 @@ class Order(Base):
 
 
 __all__ = [
+    "ActivationCode",
+    "AuditLog",
     "Base",
-    "User",
-    "Source",
-    "RawItem",
-    "Signal",
+    "ContentOpportunity",
+    "Notification",
     "Opportunity",
     "OpportunitySource",
+    "Order",
+    "RawItem",
     "ResearchJob",
     "ResearchReport",
-    "Notification",
+    "Signal",
+    "SignalSource",
+    "Source",
+    "Subscription",
     "SystemJob",
-    "Order",
+    "User",
 ]
