@@ -75,7 +75,8 @@ class FeishuEvent:
     chat_id: str
     chat_type: str  # "group" | "p2p"
     message_type: str  # "text" | "post" | …
-    text: str  # extracted from message.content
+    text: str  # cleaned text (mentions stripped)
+    raw_text: str = ""  # original text including @-mentions
 
     @property
     def is_command(self) -> bool:
@@ -195,6 +196,14 @@ def parse_event(body: dict[str, Any]) -> FeishuEvent | dict[str, Any] | None:
     if not isinstance(content, dict):
         content = {}
 
+    raw_text = str(content.get("text") or "")
+    # — strip bot mentions added by Feishu (e.g. "@_user_1", "@bot").
+    # Without this, downstream is_command / parse_command see
+    # "@_user_1 /help" instead of "/help" and the command gets
+    # classified as 'unknown'. See parse_command() for the
+    # multi-word display-name logic.
+    cleaned_text = _strip_mentions(raw_text).strip()
+
     return FeishuEvent(
         event_type=event_type,
         tenant_key=header.get("tenant_key") or "",
@@ -202,8 +211,31 @@ def parse_event(body: dict[str, Any]) -> FeishuEvent | dict[str, Any] | None:
         chat_id=message_obj.get("chat_id") or "",
         chat_type=message_obj.get("chat_type") or "",
         message_type=message_obj.get("message_type") or "text",
-        text=str(content.get("text") or "").strip(),
+        text=cleaned_text,
+        raw_text=raw_text,
     )
+
+
+def _strip_mentions(text: str) -> str:
+    """Strip leading bot-mention tokens from user text.
+
+    Feishu prefixes @-mentioned group messages with one of:
+      * `@_user_1` (placeholder form)
+      * `@bot_name` (single-word username)
+      * `@Display Name With Spaces` (multi-word display name)
+
+    The boundary between mention and command isn't known up front, so
+    we keep dropping leading whitespace-separated tokens until either
+    (a) the head token starts with `/` (a command), or (b) the text
+    is empty.
+    """
+    text = text.strip()
+    while text:
+        head, _, rest = text.partition(" ")
+        if head.startswith("/"):
+            break
+        text = rest.strip()
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -243,9 +275,13 @@ _COMMAND_ALK: dict[str, str] = {
 
 
 def parse_command(text: str) -> BotCommand:
-    """Extract a `BotCommand` from raw user text. Falls back to
-    `BotCommand(kind="unknown")` when the text isn't a recognised
-    command.
+    """Extract a `BotCommand` from already-cleaned user text. Falls back to
+    `BotCommand(kind="unknown")` when the text isn't a recognised command.
+
+    `text` should be the **mention-stripped** form produced by
+    `parse_event` — by the time we get here, leading `@_user_1` /
+    `@bot` / `@Display Name` tokens have been removed. See
+    `_strip_mentions` for the multi-word display-name handling.
     """
     text = text.strip()
     if not text.startswith("/"):
@@ -301,11 +337,27 @@ class FeishuCommandRouter:
             or _env_webhook_secret()
             or ""
         )
+        # — When the Feishu inbound handler is invoked, we receive the
+        # event over the public ngrok tunnel and need to call back into
+        # our own backend to execute the command. `localhost:8000` would
+        # hit ngrok's listener (the public endpoint that just routed
+        # the request in), not this FastAPI process — so default to the
+        # docker service name `backend:8000` for the in-container
+        # loopback. Operators can override via `FEISHU_INTERNAL_API_URL`
+        # or by passing `base_url=...` explicitly.
         self.base_url = (
             base_url
-            or self.settings.app_base_url
+            or self.settings.feishu_internal_api_url
             or self.DEFAULT_BASE_URL
         ).rstrip("/")
+        # — Base URL for *user-visible* links — users click these in
+        # the Feishu reply, so it must point at a publicly reachable
+        # host (frontend or the ngrok tunnel), not at the docker
+        # internal DNS name we use for backend self-callbacks.
+        self.public_base_url = (
+            (self.settings.app_base_url or "").rstrip("/")
+            or self.base_url
+        )
         # — owned by caller; if None, create a one-shot per call.
         self._http = http_client
 
@@ -394,7 +446,7 @@ class FeishuCommandRouter:
         for idx, opp in enumerate(items[:10], start=1):
             score = float(opp.get("total_score") or 0)
             title = opp.get("title") or "(无标题)"
-            url = f"{self.base_url}/opportunities/{opp.get('id')}"
+            url = f"{self.public_base_url}/opportunities/{opp.get('id')}"
             lines.append(f"{idx}. **{title}** — ⭐ {int(round(score))}")
             lines.append(f"   [查看详情]({url})")
         return CommandReply(
@@ -412,7 +464,7 @@ class FeishuCommandRouter:
         for idx, opp in enumerate(items[:10], start=1):
             score = float(opp.get("total_score") or 0)
             title = opp.get("title") or "(无标题)"
-            url = f"{self.base_url}/opportunities/{opp.get('id')}"
+            url = f"{self.public_base_url}/opportunities/{opp.get('id')}"
             lines.append(f"{idx}. {title} — ⭐ {int(round(score))}")
             lines.append(f"   [查看详情]({url})")
         return CommandReply(text="\n".join(lines))
@@ -431,7 +483,7 @@ class FeishuCommandRouter:
                 text=f"❌ 研究任务创建失败:{result.get('_text') or result}",
             )
         job_id = result.get("job_id")
-        url = f"{self.base_url}/on-demand"
+        url = f"{self.public_base_url}/on-demand"
         return CommandReply(
             text=(
                 f"✅ 已生成研究任务 #{job_id} · 主题:`{topic}`\n"

@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     app_debug: bool = True
     app_base_url: str = "http://localhost:3000"
     app_api_base_url: str = "http://localhost:8000"
+    # — URL the *backend* uses to call itself when handling Feishu
+    # command callbacks. Must point at the docker service name so the
+    # loopback request doesn't accidentally hit the ngrok tunnel
+    # (where `localhost` would be the ngrok agent's listener, not
+    # this FastAPI process).
+    feishu_internal_api_url: str = "http://backend:8000"
     app_secret_key: str = "change-me-in-production"
     app_log_level: str = "INFO"
 

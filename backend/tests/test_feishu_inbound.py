@@ -178,6 +178,58 @@ def test_parse_event_command_args_after_token():
     assert parsed.command_args == "AI 法律合同"
 
 
+def test_parse_event_strips_mention_prefix_and_recognises_command():
+    """Regression test: Feishu prefixes @-mentioned group messages with
+    `@_user_1`. parse_event must strip that prefix so downstream
+    `is_command` returns True and `parse_command` routes correctly.
+
+    Without this fix, group messages were logged as
+    `feishu_event_non_command` and silently ignored.
+    """
+    body = {
+        "header": {"event_type": "im.message.receive_v1"},
+        "event": {
+            "sender": {"sender_id": {"open_id": "ou_user"}},
+            "message": {
+                "chat_id": "oc_chat",
+                "chat_type": "group",
+                "message_type": "text",
+                "content": json.dumps({"text": "@_user_1 /daily"}),
+            },
+        },
+    }
+    parsed = parse_event(body)
+    assert isinstance(parsed, FeishuEvent)
+    assert parsed.is_command is True
+    assert parsed.text == "/daily"
+    assert parsed.raw_text == "@_user_1 /daily"
+    assert parsed.command == "/daily"
+    assert parsed.command_args == ""
+
+
+def test_parse_event_strips_multi_word_display_name_mention():
+    """@Display Name With Spaces + command should also resolve."""
+    body = {
+        "header": {"event_type": "im.message.receive_v1"},
+        "event": {
+            "sender": {"sender_id": {"open_id": "ou_user"}},
+            "message": {
+                "chat_id": "oc_chat",
+                "chat_type": "group",
+                "message_type": "text",
+                "content": json.dumps(
+                    {"text": "@AI Opportunity Radar /research AI 法律合同"}
+                ),
+            },
+        },
+    }
+    parsed = parse_event(body)
+    assert isinstance(parsed, FeishuEvent)
+    assert parsed.is_command is True
+    assert parsed.command == "/research"
+    assert parsed.command_args == "AI 法律合同"
+
+
 # ---------------------------------------------------------------------------
 # parse_command
 # ---------------------------------------------------------------------------
@@ -206,6 +258,23 @@ def test_parse_command_unknown_kind():
 
 def test_parse_command_non_command_text():
     assert parse_command("hello world").kind == "unknown"
+
+
+def test_parse_command_assumes_already_cleaned_text():
+    """parse_command now operates on mention-stripped text — mention
+    stripping moved to parse_event / _strip_mentions in the
+    parse_command refactor. When a raw mention-prefixed text reaches
+    parse_command (e.g. unit-test direct invocation), it is
+    classified as 'unknown' — that's by design; the production
+    path always strips first.
+
+    See `test_parse_event_strips_mention_prefix_and_recognises_command`
+    for the end-to-end regression test.
+    """
+    # — Direct invocation without prior stripping → unknown.
+    assert parse_command("@_user_1 /help").kind == "unknown"
+    # — But the cleaned form is what parse_command expects:
+    assert parse_command("/help").kind == "help"
 
 
 # ---------------------------------------------------------------------------
