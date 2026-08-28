@@ -539,6 +539,39 @@ def test_feishu_endpoint_routes_today_command(feishu_client):
     assert "elements" in sent[0]["content"]
 
 
+def test_feishu_endpoint_send_message_survives_router_aclose(feishu_client):
+    """Regression: Phase 7 added Drive/Bitable sibling clients that
+    share the endpoint's `FeishuAppClient._http`. The `aclose()` must
+    happen AFTER `send_message()`, not in a `finally` that fires
+    before the reply is delivered — otherwise the chat reply silently
+    fails with `Cannot send a request, as the client has been closed`.
+
+    Triggered by the bug found while testing `/report` / `/table`
+    end-to-end: the router's Drive/Bitable siblings hit `app_client._http`
+    during `route()`, then the old `finally: aclose()` ran before the
+    explicit `send_message`, closing the client mid-request.
+    """
+    response = feishu_client.post(
+        "/api/feishu/event",
+        json={
+            "header": {"event_type": "im.message.receive_v1"},
+            "event": {
+                "sender": {"sender_id": {"open_id": "ou_user"}},
+                "message": {
+                    "chat_id": "oc_chat",
+                    "chat_type": "group",
+                    "message_type": "text",
+                    "content": json.dumps({"text": "/today"}),
+                },
+            },
+        },
+    )
+    # — Must be 200, not 500. The bug surfaced as `Internal Server Error`.
+    assert response.status_code == 200
+    sent = feishu_client._sent_app_messages  # type: ignore[attr-defined]
+    assert len(sent) == 1, "send_message should have run after route()"
+
+
 def test_feishu_endpoint_acks_non_command_text(feishu_client):
     response = feishu_client.post(
         "/api/feishu/event",

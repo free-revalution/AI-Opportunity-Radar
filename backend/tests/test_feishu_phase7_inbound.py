@@ -229,6 +229,35 @@ async def test_router_report_handles_pending_job():
     assert drive.calls == []
 
 
+async def test_router_report_surfaces_historical_pending_job():
+    """Regression for production bug: a Phase 5 on-demand job with
+    `status=pending` AND `started_at=null` is almost certainly a
+    *historical* row from before the on-demand pipeline migrated to
+    synchronous mode (the worker was removed but old rows remained).
+    The user should be told to re-run via `/research` rather than
+    wait indefinitely."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "job_id": 1,
+                "opportunity_title": "历史遗留任务",
+                "status": "pending",
+                "started_at": None,
+                "report": None,
+            },
+            request=request,
+        )
+
+    drive = _StubDrive()
+    router = _make_router(handler, drive=drive)
+    reply = await router.route(BotCommand(kind="report", args="1"))
+    # — Tells the user it's a stale historical row + how to fix it.
+    assert "历史遗留" in reply.text or "Phase 5" in reply.text
+    assert "/research" in reply.text
+    assert drive.calls == []
+
+
 async def test_router_report_translates_drive_failure_to_chat():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=_completed_report_payload(5), request=request)

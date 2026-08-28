@@ -357,7 +357,22 @@ class FeishuBitableClient(_TokenMixin):
             return existing
 
         # — Auto-create.
-        body = {"name": f"AI 机会雷达 - {self._table_name}", "folder_token": ""}
+        # — NOTE: Feishu's Bitable App Create response nests the
+        # created app under `data.app` (not `data.app_token` directly):
+        #   {
+        #     "code": 0,
+        #     "data": {
+        #       "app": {
+        #         "app_token": "bascn...",
+        #         "name": "...",
+        #         "folder_token": "...",
+        #         "url": "..."
+        #       }
+        #     }
+        #   }
+        # Older docs / pre-v1 schemas returned `data.app_token` directly,
+        # so we fall back to that path for forward compatibility.
+        body = {"name": f"AI 机会雷达 - {self._table_name}"}
         response = await self._request(
             method="POST", path="/bitable/v1/apps", json_body=body
         )
@@ -366,9 +381,19 @@ class FeishuBitableClient(_TokenMixin):
                 f"bitable/v1/apps create rejected: code={response.get('code')} "
                 f"msg={response.get('msg')}"
             )
-        app_token = ((response.get("data") or {}).get("app_token") or "").strip()
+        data = response.get("data") or {}
+        app_token = (
+            ((data.get("app") or {}).get("app_token") or "").strip()
+            or ((data.get("app_token") or "").strip())  # legacy
+        )
         if not app_token:
-            raise FeishuContentError("bitable/v1/apps create returned no app_token")
+            # — Surface the raw body so operators can see what Feishu
+            # actually returned (helps diagnose permission / folder
+            # issues quickly).
+            raise FeishuContentError(
+                f"bitable/v1/apps create returned no app_token "
+                f"(data keys: {list(data.keys())})"
+            )
 
         self._cached_app_token = app_token
         # — Write back to settings so subsequent calls in the same

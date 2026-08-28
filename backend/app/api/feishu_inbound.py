@@ -215,9 +215,8 @@ async def handle_feishu_event(request: Request) -> dict[str, Any]:
         )
         # — Still ack so Feishu doesn't retry the same message; the
         # operator sees the failure in logs + Prometheus metrics.
-        return {"code": 0, "msg": "ok"}
-    finally:
         await app_client.aclose()
+        return {"code": 0, "msg": "ok"}
 
     logger.info(
         "feishu_command_routed",
@@ -245,6 +244,15 @@ async def handle_feishu_event(request: Request) -> dict[str, Any]:
             chat_id=event.chat_id,
             error=str(exc),
         )
+    finally:
+        # — Close the shared httpx client AFTER the send_message
+        # attempt (success or failure). Doing this in the previous
+        # `finally` block caused Phase 7 reply sends to fail with
+        # `Cannot send a request, as the client has been closed`
+        # because the router's Drive/Bitable siblings already use
+        # the same httpx client during `route()` and the client
+        # was being torn down before the explicit send_message here.
+        await app_client.aclose()
 
     return {"code": 0, "msg": "ok"}
 

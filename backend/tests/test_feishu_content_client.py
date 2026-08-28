@@ -215,7 +215,13 @@ def test_drive_create_docx_base64_encodes_markdown_content() -> None:
 @pytest.mark.asyncio
 async def test_bitable_ensure_app_creates_when_empty_then_caches() -> None:
     """Empty token → POST /bitable/v1/apps once → cached in settings.
-    Second call doesn't POST again."""
+    Second call doesn't POST again.
+
+    Regression: Feishu v1 response nests the app under `data.app`:
+        {"code": 0, "data": {"app": {"app_token": "..."}}}
+    (not `data.app_token` directly). Earlier code read the wrong path
+    and raised `returned no app_token` even on a 200 success.
+    """
 
     s = _settings_with_app()
     post_count = 0
@@ -227,7 +233,11 @@ async def test_bitable_ensure_app_creates_when_empty_then_caches() -> None:
             if request.method == "POST" and request.url.path.endswith("/bitable/v1/apps"):
                 nonlocal post_count
                 post_count += 1
-                return httpx.Response(200, json=_ok(data={"app_token": "BITAPP"}), request=request)
+                return httpx.Response(
+                    200,
+                    json=_ok(data={"app": {"app_token": "BITAPP", "name": "X"}}),
+                    request=request,
+                )
             return httpx.Response(404, json=_ok(999), request=request)
 
     app_client = FeishuAppClient(settings=s, http_client=httpx.AsyncClient(transport=_Transport()))
@@ -239,6 +249,57 @@ async def test_bitable_ensure_app_creates_when_empty_then_caches() -> None:
         assert post_count == 1
         # — The auto-created token was persisted back to settings.
         assert s.feishu_bitable_app_token == "BITAPP"
+    finally:
+        await app_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_bitable_ensure_app_accepts_legacy_data_app_token_shape() -> None:
+    """Some docs / older schemas return `data.app_token` directly. The
+    client falls back to that path so we don't break callers."""
+    s = _settings_with_app()
+
+    class _Transport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if "/auth/v3/tenant_access_token" in request.url.path:
+                return httpx.Response(200, json=_ok(tenant_access_token="tok"), request=request)
+            return httpx.Response(
+                200,
+                json=_ok(data={"app_token": "LEGACYAPP"}),
+                request=request,
+            )
+
+    app_client = FeishuAppClient(settings=s, http_client=httpx.AsyncClient(transport=_Transport()))
+    bitable = FeishuBitableClient(app_client=app_client, settings=s)
+    try:
+        token = await bitable.ensure_app()
+        assert token == "LEGACYAPP"
+    finally:
+        await app_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_bitable_ensure_app_surfaces_raw_data_keys_when_token_missing() -> None:
+    """When Feishu returns success but no `app_token` anywhere, the
+    error message lists the actual `data` keys so operators can spot
+    a schema drift quickly."""
+    s = _settings_with_app()
+
+    class _Transport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if "/auth/v3/tenant_access_token" in request.url.path:
+                return httpx.Response(200, json=_ok(tenant_access_token="tok"), request=request)
+            return httpx.Response(
+                200,
+                json=_ok(data={"unexpected_key": "x"}),
+                request=request,
+            )
+
+    app_client = FeishuAppClient(settings=s, http_client=httpx.AsyncClient(transport=_Transport()))
+    bitable = FeishuBitableClient(app_client=app_client, settings=s)
+    try:
+        with pytest.raises(FeishuContentError, match="data keys"):
+            await bitable.ensure_app()
     finally:
         await app_client.aclose()
 

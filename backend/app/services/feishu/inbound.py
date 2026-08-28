@@ -656,8 +656,24 @@ class FeishuCommandRouter:
                 text=f"❌ 任务 #{job_id} 状态异常:HTTP {status_code}。"
             )
         if detail.get("status") != "completed":
+            current_status = detail.get("status") or "unknown"
+            # — Heuristic: a Phase 5 on-demand job that has `started_at`
+            # null AND status=pending is almost certainly a *historical*
+            # job from before the on-demand pipeline was migrated to
+            # synchronous mode (i.e. the worker was removed but old rows
+            # remained). Surface a clearer message so the user knows
+            # they should re-run via `/research` instead of waiting.
+            if current_status == "pending" and not detail.get("started_at"):
+                return CommandReply(
+                    text=(
+                        f"⚠️ 任务 #{job_id} 是 Phase 5 历史遗留的 pending job "
+                        "(`started_at` 为空,worker 已下线,不会再启动)。\n"
+                        f"请用 `/research <新主题>` 重新生成一份研究报告,"
+                        f"Phase 7 会立刻同步推送。"
+                    ),
+                )
             return CommandReply(
-                text=f"⏳ 任务 #{job_id} 当前状态 `{detail.get('status')}`,尚未完成。"
+                text=f"⏳ 任务 #{job_id} 当前状态 `{current_status}`,尚未完成。"
             )
         report_payload = detail.get("report") or {}
         if not report_payload:
