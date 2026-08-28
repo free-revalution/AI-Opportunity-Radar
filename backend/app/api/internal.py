@@ -405,28 +405,56 @@ def _build_notification_service(
     Phase 6 product decision; Telegram remains the configured fallback
     via `NOTIFICATION_FALLBACK_CHANNELS`).
 
-    The mock provider is injected by default under
-    `MOCK_EXTERNAL_SERVICES=true` so tests + local dev work offline.
+    Provider selection rules (in order):
+
+      1. Real provider when the matching channel has credentials configured
+         (`feishu_webhook_url` for Feishu; `telegram_bot_token` for
+         Telegram). Local dev with real Webhook URLs will hit the real
+         API.
+      2. Mock provider when `mock_external_services=true` AND no real
+         credentials are present. This is the "fully offline" path used
+         by tests and offline exploration.
     """
     settings = get_settings()
-    if getattr(settings, "mock_external_services", False):
-        # — Build a channel-specific mock adapter. Tests for Feishu
-        # inject the Feishu mock; tests for Telegram inject the Telegram
-        # mock. We pick based on the requested channel.
-        if (channel or "").lower() == "feishu":
+    requested = (channel or "").lower()
+
+    if requested == "feishu":
+        if settings.feishu_webhook_url:
+            # — Real Feishu: build via factory with explicit channel.
+            from app.services.bots import build_bot_provider
+
+            provider = build_bot_provider(settings, channel="feishu")
+        elif getattr(settings, "mock_external_services", False):
             from app.services.bots.feishu_adapter import FeishuBotAdapter
             from app.services.feishu.mock_client import MockFeishuProvider
 
             provider = FeishuBotAdapter(MockFeishuProvider())
         else:
+            # — No URL + no mock mode: fall back to mock so the call
+            # doesn't crash; record a config warning in the response.
+            from app.services.bots.feishu_adapter import FeishuBotAdapter
+            from app.services.feishu.mock_client import MockFeishuProvider
+
+            provider = FeishuBotAdapter(MockFeishuProvider())
+    else:
+        if settings.telegram_bot_token:
+            from app.services.bots import build_bot_provider
+
+            provider = build_bot_provider(settings, channel="telegram")
+        elif getattr(settings, "mock_external_services", False):
             from app.services.bots.telegram_adapter import TelegramBotAdapter
             from app.services.notification.mock_telegram import MockTelegramProvider
 
             provider = TelegramBotAdapter(MockTelegramProvider())
-        return NotificationService(
-            session, settings=settings, provider=provider, channel=channel
-        )
-    return NotificationService(session, settings=settings, channel=channel)
+        else:
+            from app.services.bots.telegram_adapter import TelegramBotAdapter
+            from app.services.notification.mock_telegram import MockTelegramProvider
+
+            provider = TelegramBotAdapter(MockTelegramProvider())
+
+    return NotificationService(
+        session, settings=settings, provider=provider, channel=channel
+    )
 
 
 @router.post(

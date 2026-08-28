@@ -95,14 +95,26 @@ def test_sign_feishu_payload_rejects_empty_secret() -> None:
 
 
 def test_sign_feishu_payload_matches_documented_algorithm() -> None:
-    """Reproduce Feishu's reference example verbatim."""
+    """Reproduce Feishu's reference example verbatim.
+
+    Feishu official spec (verified against
+    https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot):
+        string_to_sign = f"{timestamp}\\n{secret}"
+        sign = base64(hmac.new(string_to_sign.encode(), b"",
+                              hashlib.sha256).digest())
+
+    The HMAC `key` is `string_to_sign` itself; the `message` is the
+    empty byte string. Older internal docs at our company described the
+    opposite ordering (key=secret, msg=string_to_sign) — that was
+    wrong, fixed in Phase 6 bugfix.
+    """
     secret = "secret_key_for_test"
     ts = 1700000000
 
-    # Reference computation: base64(HMAC-SHA256(key=secret, msg="ts\nsecret"))
+    # Reference computation per the live Feishu docs:
     string_to_sign = f"{ts}\n{secret}".encode("utf-8")
     expected = base64.b64encode(
-        hmac.new(secret.encode("utf-8"), string_to_sign, hashlib.sha256).digest()
+        hmac.new(string_to_sign, b"", hashlib.sha256).digest()
     ).decode("utf-8")
 
     out = sign_feishu_payload(secret=secret, timestamp=ts)
@@ -289,12 +301,13 @@ async def test_httpx_provider_attaches_signature_when_secret_set() -> None:
     sent_payload = json.loads(captured[0].content.decode("utf-8"))
     assert "timestamp" in sent_payload
     assert "sign" in sent_payload
-    # Verify the signature against the documented algorithm.
+    # Verify the signature against the live Feishu algorithm
+    # (key = string_to_sign, message = empty bytes).
     ts = sent_payload["timestamp"]
     expected = base64.b64encode(
         hmac.new(
-            b"robot_secret",
             f"{ts}\nrobot_secret".encode("utf-8"),
+            b"",
             hashlib.sha256,
         ).digest()
     ).decode("utf-8")
@@ -363,7 +376,12 @@ def test_factory_returns_mock_when_no_url_configured() -> None:
     assert isinstance(provider, MockFeishuProvider)
 
 
-def test_factory_returns_mock_when_mock_flag_set() -> None:
+def test_factory_returns_httpx_when_url_configured_even_under_mock_flag() -> None:
+    """Phase 6 product decision: a configured `feishu_webhook_url` is
+    an explicit opt-in to live delivery — `MOCK_EXTERNAL_SERVICES=true`
+    no longer wins over a real URL. Operators who want fully-offline
+    behaviour can omit the URL (default) or pass `prefer="mock"`.
+    """
     settings = SimpleNamespace(
         mock_external_services=True,
         feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/abc",
@@ -371,6 +389,18 @@ def test_factory_returns_mock_when_mock_flag_set() -> None:
         feishu_timeout=15.0,
     )
     provider = build_feishu_provider(settings)
+    assert isinstance(provider, HttpxFeishuProvider)
+
+
+def test_factory_returns_mock_when_prefer_mock_with_url() -> None:
+    """`prefer="mock"` still wins — tests opt-out explicitly."""
+    settings = SimpleNamespace(
+        mock_external_services=True,
+        feishu_webhook_url="https://open.feishu.cn/open-apis/bot/v2/hook/abc",
+        feishu_webhook_secret="",
+        feishu_timeout=15.0,
+    )
+    provider = build_feishu_provider(settings, prefer="mock")
     assert isinstance(provider, MockFeishuProvider)
 
 

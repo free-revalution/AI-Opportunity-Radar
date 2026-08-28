@@ -108,14 +108,20 @@ def sign_feishu_payload(
 
     Per Feishu docs:
         string_to_sign = f"{timestamp}\\n{secret}"
-        sign = base64(hmac.new(secret.encode(), string_to_sign.encode(),
+        sign = base64(hmac.new(string_to_sign.encode(), b"",
                               hashlib.sha256).digest())
+
+    The HMAC `key` is the `string_to_sign` itself; the `message` is the
+    empty byte string `b""`. (Older internal docs at our company
+    described the opposite ordering, but the live Feishu API uses the
+    spec above — verified against the 2024-08 official open-platform
+    custom-robot docs.)
     """
     if not secret:
         raise ValueError("sign_feishu_payload requires a non-empty secret")
     ts = int(time.time()) if timestamp is None else int(timestamp)
     string_to_sign = f"{ts}\n{secret}".encode("utf-8")
-    digest = hmac.new(secret.encode("utf-8"), string_to_sign, hashlib.sha256).digest()
+    digest = hmac.new(string_to_sign, b"", hashlib.sha256).digest()
     return {"timestamp": str(ts), "sign": base64.b64encode(digest).decode("utf-8")}
 
 
@@ -125,16 +131,18 @@ def sign_feishu_payload(
 def build_feishu_provider(settings, *, prefer: Optional[str] = None):
     """Return the configured provider, falling back to the mock.
 
-    Selection rules:
-      * `MOCK_EXTERNAL_SERVICES=true`   → mock
-      * `prefer="mock"`                 → mock
-      * no `feishu_webhook_url` set     → mock
+    Selection rules (priority order — first match wins):
+      * `prefer="mock"`                 → mock (tests + opt-out)
+      * no `feishu_webhook_url` set     → mock (offline by default)
       * otherwise                       → httpx provider
-    """
-    if getattr(settings, "mock_external_services", False):
-        from app.services.feishu.mock_client import MockFeishuProvider
 
-        return MockFeishuProvider()
+    Note: `MOCK_EXTERNAL_SERVICES=true` no longer unconditionally wins.
+    If a real `feishu_webhook_url` is configured we send to the real
+    Feishu API even in "mock mode" — Phase 6 product decision: a
+    configured webhook URL is an explicit opt-in to live delivery.
+    Local users who want offline-only behaviour can either omit the
+    URL (default) or pass `prefer="mock"`.
+    """
     if (prefer or "").lower() == "mock":
         from app.services.feishu.mock_client import MockFeishuProvider
 

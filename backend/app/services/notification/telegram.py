@@ -66,24 +66,21 @@ class TelegramProvider(ABC):
 def build_telegram_provider(settings, *, prefer: Optional[str] = None):
     """Return the configured provider, falling back to the mock.
 
-    Selection rules:
-      * `MOCK_EXTERNAL_SERVICES=true`            → mock
+    Selection rules (priority order — first match wins):
       * `prefer="mock"`                          → mock
       * no `telegram_bot_token` configured       → mock
       * otherwise                                → httpx provider
-    """
-    if getattr(settings, "mock_external_services", False):
-        from app.services.notification.mock_telegram import MockTelegramProvider
 
-        return MockTelegramProvider()
+    Note: `MOCK_EXTERNAL_SERVICES=true` no longer unconditionally wins.
+    Same logic as `build_feishu_provider` — a configured bot token is
+    an explicit opt-in to live delivery even under "mock mode".
+    """
     if (prefer or "").lower() == "mock":
         from app.services.notification.mock_telegram import MockTelegramProvider
-
         return MockTelegramProvider()
     token = getattr(settings, "telegram_bot_token", "") or ""
     if not token:
         from app.services.notification.mock_telegram import MockTelegramProvider
-
         return MockTelegramProvider()
 
     from app.services.notification.httpx_telegram import HttpxTelegramProvider

@@ -131,7 +131,15 @@ class Settings(BaseSettings):
     # Telegram becomes the fallback channel.
     notification_default_channel: Literal["telegram", "feishu"] = "feishu"
     # Ordered list of fallback channels tried when the primary send fails.
-    notification_fallback_channels: list[str] = Field(default_factory=lambda: ["telegram"])
+    # `NoDecode` keeps the env var as a raw CSV string until our
+    # `_split_csv` validator runs — matches the treatment of
+    # `cors_allow_origins` + `enabled_sources`. Without this annotation
+    # pydantic-settings tries to JSON-decode the value first and fails
+    # on the plain `"telegram"` value when the docker image is built
+    # with a slightly different pydantic-settings version.
+    notification_fallback_channels: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["telegram"]
+    )
 
     # ---------- n8n ----------
     n8n_base_url: str = "http://localhost:5678"
@@ -162,7 +170,12 @@ class Settings(BaseSettings):
     backup_output_dir: str = "./backups"
 
     # ---------- Validators ----------
-    @field_validator("cors_allow_origins", "enabled_sources", mode="before")
+    @field_validator(
+        "cors_allow_origins",
+        "enabled_sources",
+        "notification_fallback_channels",
+        mode="before",
+    )
     @classmethod
     def _split_csv(cls, v: object) -> object:
         if isinstance(v, str):
