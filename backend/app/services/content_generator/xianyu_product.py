@@ -9,12 +9,22 @@ spreadsheet — never trust the model to invent field names.
 Pricing policy: keep suggestions inside ¥39-¥99 for the digital-
 product line ("100 个海外 AI 创业机会"). Higher prices belong to
 定制报告, which is sold off-platform.
+
+Phase 9 — DRY cleanup:
+  * `metadata_from_opportunity` collapsed into the base
+    `base_metadata` + a tiny channel-specific add-on.
+  * `user_prompt` field walk picks up the tighter context-list
+    pattern via the `opportunity_context_fields` class attribute
+    (JSON-shape wants fewer fields — we only feed the LLM the bits
+    that map to listing JSON keys).
+  * Schema validation moved to a `validate_required_fields` helper
+    so it can be reused by future JSON generators (Phase 11's
+    Xiaohongshu Publisher payload, etc.).
 """
 
 from __future__ import annotations
 
-import json
-from typing import Any
+from typing import Any, Iterable
 
 from app.services.content_generator.base import (
     ContentGenerator,
@@ -22,9 +32,6 @@ from app.services.content_generator.base import (
     register,
 )
 from app.services.llm.provider import LLMProvider
-from app.utils import get_logger
-
-logger = get_logger(__name__)
 
 
 _XIANYU_SCHEMA: dict[str, Any] = {
@@ -70,12 +77,51 @@ _XIANYU_SCHEMA: dict[str, Any] = {
     ],
 }
 
+# Top-level keys the operator pastes into a fixed spreadsheet.
+# Promoted to a class attribute so `validate_required_fields` can
+# re-run the check elsewhere if we ever wrap the listing in an
+# envelope (e.g. for the bundle export format).
+REQUIRED_FIELDS: tuple[str, ...] = (
+    "title",
+    "description",
+    "selling_points",
+    "price",
+)
+
+
+def validate_required_fields(
+    payload: dict[str, Any], required: Iterable[str], *, generator_name: str
+) -> None:
+    """Defensive schema check for JSON-shape generators.
+
+    The LLM spec enforces the schema, but providers occasionally
+    drop a field on token truncation. We re-check here so the
+    operator never sees half-rendered listings.
+    """
+    missing = [k for k in required if k not in payload]
+    if missing:
+        raise ValueError(
+            f"{generator_name} generator: model output missing {missing!r}"
+        )
+
 
 class XianyuProductGenerator(ContentGenerator):
     name = "xianyu_product"
     channel = "xianyu"
     format = "json"
     description = "闲鱼商品 listing — JSON,人工复制发布"
+    # JSON-shape — tighter context list. We only need the fields
+    # that map to listing JSON keys (title / summary / target /
+    # market / business model / score).
+    opportunity_context_fields = (
+        "title",
+        "summary",
+        "target_customer",
+        "market_size",
+        "monetization_model",
+        "total_score",
+    )
+    research_report_fields = ("executive_summary",)
 
     async def generate(
         self,
@@ -89,12 +135,7 @@ class XianyuProductGenerator(ContentGenerator):
             user=self.user_prompt(opportunity=opportunity, report=report),
             response_schema=self.response_schema(),
         )
-        # Defensive: ensure required fields are present.
-        for field in ("title", "description", "selling_points", "price"):
-            if field not in payload:
-                raise ValueError(
-                    f"xianyu generator: model output missing {field!r}"
-                )
+        validate_required_fields(payload, REQUIRED_FIELDS, generator_name=self.name)
         return GeneratedContent(
             opportunity_id=int(opportunity.id),
             generator=self.name,
@@ -102,7 +143,8 @@ class XianyuProductGenerator(ContentGenerator):
             title=str(payload["title"]),
             format=self.format,
             content=payload,
-            metadata={
+            metadata=self.metadata_from_opportunity(opportunity)
+            | {
                 "price_cny": int(payload.get("price", 49) or 49),
                 "delivery_method": payload.get("delivery_method"),
                 "category": payload.get("category"),
@@ -128,30 +170,11 @@ class XianyuProductGenerator(ContentGenerator):
             "卖点 3-5 条,每条 20 字以内,具体、有数字、避免'颠覆'类空话。"
         )
 
-    def user_prompt(self, *, opportunity: Any, report: Any | None) -> str:
-        parts: list[str] = [f"机会:{opportunity.title}"]
-        if getattr(opportunity, "summary", None):
-            parts.append(f"摘要:{opportunity.summary}")
-        if getattr(opportunity, "target_customer", None):
-            parts.append(f"目标客户:{opportunity.target_customer}")
-        if getattr(opportunity, "market_size", None):
-            parts.append(f"市场规模:{opportunity.market_size}")
-        if getattr(opportunity, "monetization_model", None):
-            parts.append(f"商业模式:{opportunity.monetization_model}")
-        if getattr(opportunity, "total_score", None):
-            parts.append(f"评分:{opportunity.total_score}/100")
-        if report is not None and getattr(report, "executive_summary", None):
-            parts.append(f"\n深度研究:{report.executive_summary}")
-        return "\n".join(parts)
-
     def response_schema(self) -> dict[str, Any]:
         return _XIANYU_SCHEMA
-
-    def metadata_from_opportunity(self, opportunity: Any) -> dict[str, Any]:
-        return {"score": float(getattr(opportunity, "total_score", 0.0) or 0.0)}
 
 
 register(XianyuProductGenerator())
 
 
-__all__ = ["XianyuProductGenerator", "_XIANYU_SCHEMA"]
+__all__ = ["XianyuProductGenerator", "_XIANYU_SCHEMA", "REQUIRED_FIELDS"]

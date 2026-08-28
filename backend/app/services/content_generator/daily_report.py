@@ -3,13 +3,21 @@
 The output is the canonical "AI 机会雷达日报". It feeds:
 
   * the **Feishu daily bot** (Phase 2 — full Feishu card)
-  * the **公众号 long article** (re-skinned in wechat_article.py)
   * the **dashboard Content Center** preview pane
+
+Note: Phase 8 (v2.0) split the 公众号 long-form into a separate
+`wechat_article.py` generator — different 字数 / 视角 / 结构 /
+CTA. Sharing only the field list.
 
 The structure follows the doc spec (机会名称 / 来源 / 用户痛点 /
 市场分析 / 商业机会 / 推荐行动) and is enforced via a Markdown
 template rather than free-form prose — that way downstream
 distributors can re-parse sections reliably.
+
+Phase 9 — DRY cleanup: `_extract_text` / `_extract_title` /
+`user_prompt` field walk moved to `base.py` (see module-level
+helpers there). This subclass keeps the human-readable ## sections
+layout because the Feishu card parser keys off the heading text.
 """
 
 from __future__ import annotations
@@ -19,12 +27,11 @@ from typing import Any
 from app.services.content_generator.base import (
     ContentGenerator,
     GeneratedContent,
+    base_metadata,
+    extract_text_from_llm,
     register,
 )
 from app.services.llm.provider import LLMProvider
-from app.utils import get_logger
-
-logger = get_logger(__name__)
 
 
 class DailyReportGenerator(ContentGenerator):
@@ -42,17 +49,17 @@ class DailyReportGenerator(ContentGenerator):
         report: Any | None,
         llm: LLMProvider,
     ) -> GeneratedContent:
-        user_prompt = self.user_prompt(opportunity=opportunity, report=report)
         # No JSON schema — Markdown; we enforce structure via the
         # system prompt + a closing template the model is told to fill.
         raw = await llm.complete_json(
             system=self.system_prompt(),
-            user=user_prompt,
+            user=self.user_prompt(opportunity=opportunity, report=report),
             response_schema=None,
         )
-        # Some providers return {"text": "..."} when no schema is given.
-        body = self._extract_text(raw)
+        body = extract_text_from_llm(raw)
         title = opportunity.title or "未命名机会"
+        meta = base_metadata(opportunity)
+        meta["mvp_days"] = int(getattr(opportunity, "mvp_days", 0) or 0)
         return GeneratedContent(
             opportunity_id=int(opportunity.id),
             generator=self.name,
@@ -60,12 +67,7 @@ class DailyReportGenerator(ContentGenerator):
             title=f"今日AI商业机会: {title}",
             format=self.format,
             content=body,
-            metadata={
-                "score": float(getattr(opportunity, "total_score", 0.0) or 0.0),
-                "category": getattr(opportunity, "category", None),
-                "market": getattr(opportunity, "market", None),
-                "mvp_days": int(getattr(opportunity, "mvp_days", 0) or 0),
-            },
+            metadata=meta,
         )
 
     # ----- prompts ---------------------------------------------------
@@ -89,6 +91,9 @@ class DailyReportGenerator(ContentGenerator):
         )
 
     def user_prompt(self, *, opportunity: Any, report: Any | None) -> str:
+        # daily_report overrides the default bullet-list user_prompt
+        # because Feishu card rendering and the operator audit
+        # glance prefer the "## 简短摘要" style sections.
         parts: list[str] = []
         parts.append(f"# 机会标题:{opportunity.title}")
         if getattr(opportunity, "summary", None):
@@ -112,40 +117,12 @@ class DailyReportGenerator(ContentGenerator):
 
         if report is not None:
             parts.append("\n## 深度研究输出")
-            for k in (
-                "executive_summary",
-                "market_analysis",
-                "competition_analysis",
-                "china_analysis",
-                "monetization_analysis",
-                "mvp_analysis",
-                "risk_analysis",
-                "recommendation",
-                "confidence",
-            ):
+            for k in self.research_report_fields:
                 v = getattr(report, k, None)
                 if v:
                     parts.append(f"\n### {k}\n{v}")
 
         return "\n".join(parts).strip()
-
-    # ----- helpers ---------------------------------------------------
-    @staticmethod
-    def _extract_text(raw: dict[str, Any]) -> str:
-        """Provider-agnostic: pull the markdown out of whatever the LLM
-        returned. Some providers wrap in `{"text": ...}`, some return
-        the dict that *is* the markdown string, some nest under
-        `content`. We accept all three."""
-        if not isinstance(raw, dict):
-            return str(raw)
-        for key in ("text", "markdown", "content", "body"):
-            v = raw.get(key)
-            if isinstance(v, str) and v.strip():
-                return v
-        # Last resort — dump the whole dict as a JSON fenced block.
-        import json
-
-        return "```json\n" + json.dumps(raw, ensure_ascii=False, indent=2) + "\n```"
 
 
 # Self-register on import.

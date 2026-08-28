@@ -130,6 +130,8 @@ export interface ContentPiece {
   metadata: Record<string, unknown>;
   generator: string;
   format: string; // markdown | json | ...
+  /** Phase 10 — top-level quality score (when persisted by /quality). */
+  quality_score?: ContentQualityScore | null;
   created_at: string | null;
 }
 
@@ -147,6 +149,9 @@ export interface ContentCenterOpportunity {
   difficulty: string | null;
   monetization_model: string | null;
   china_gap: string | null;
+  // Phase 8 — per-channel ✓/○ publish tracking. Keys: feishu / xianyu /
+  // xiaohongshu / wechat_article. Value is an ISO-8601 timestamp.
+  channel_published?: Record<string, string>;
 }
 
 export interface ContentCenterItem {
@@ -157,6 +162,208 @@ export interface ContentCenterItem {
 export interface ContentCenterResponse {
   generated_at: string;
   items: ContentCenterItem[];
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8 — regenerate, export, per-channel mark_published
+// ---------------------------------------------------------------------------
+export type ExportFormat = "csv" | "json" | "bundle";
+
+export interface ContentRegenerateRequest {
+  generators?: string[];
+  delete_previous?: boolean;
+}
+
+export interface ContentRegenerateResponse {
+  opportunity_id: number;
+  regenerated_count: number;
+  generators: string[];
+  items: Array<{
+    generator: string;
+    channel: string;
+    title: string;
+    char_count: number | null;
+  }>;
+}
+
+export interface ContentExportRequest {
+  opportunity_ids?: number[];
+  limit?: number;
+  only_qualified?: boolean;
+  channels?: string[];
+  format: ExportFormat;
+}
+
+export interface ContentExportCsvResponse {
+  // CSV response — content body is the raw CSV text. We expose `body`
+  // as a string (not parsed JSON).
+  body: string;
+  filename: string;
+}
+
+export interface ContentExportJsonResponse {
+  exported_at: string;
+  items: Array<{
+    opportunity_id: number;
+    opportunity_title: string;
+    content: Record<string, ContentPiece>;
+  }>;
+}
+
+export interface ContentExportBundleResponse {
+  exported_at: string;
+  files: Array<{
+    filename: string;
+    content_type: string;
+    content: string;
+  }>;
+}
+
+export interface ContentMarkChannelPublishedRequest {
+  channel: string;
+  commercial_status?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 9 — content editing + version history
+// ---------------------------------------------------------------------------
+export interface ContentEditRequest {
+  /** New body — at least one of body / title / metadata must be set. */
+  body?: string;
+  /** New title. */
+  title?: string;
+  /** Merged into source metadata (source keys are preserved). */
+  metadata?: Record<string, unknown>;
+  /** Operator note for the audit trail. */
+  edit_note?: string;
+}
+
+export interface ContentEditResponse {
+  notification_id: number;
+  channel: string;
+  title: string;
+  body: string;
+  metadata: Record<string, unknown>;
+  edited_from_notification_id: number;
+  created_at: string | null;
+}
+
+export interface ContentVersionItem {
+  notification_id: number;
+  channel: string;
+  title: string;
+  /** First 80 chars of body — for sidebar preview without full load. */
+  preview: string;
+  char_count: number;
+  metadata: Record<string, unknown>;
+  /** Set on rows created via POST /content/{id}/edit. */
+  edited_from_notification_id?: number | null;
+  edit_note?: string | null;
+  created_at: string | null;
+}
+
+export interface ContentVersionsResponse {
+  opportunity_id: number;
+  channel: string | null;
+  total: number;
+  items: ContentVersionItem[];
+}
+
+// ---------------------------------------------------------------------------
+// Phase 10 — LLM-as-judge quality scoring
+// ---------------------------------------------------------------------------
+export interface ContentQualityScore {
+  hook_strength: number;
+  cta_naturalness: number;
+  data_accuracy: number;
+  char_count_compliance: number;
+  platform_style_match: number;
+  total: number;
+  rationale: string;
+  below_threshold: boolean;
+  threshold_used: number;
+  dimension_floor_used: number;
+}
+
+export interface ContentQualityRequest {
+  /** Override `DEFAULT_THRESHOLD` for this one call. */
+  threshold?: number;
+  /** When true, persist the score on the notification payload. */
+  persist?: boolean;
+}
+
+export interface ContentQualityResponse {
+  notification_id: number;
+  channel: string;
+  title: string;
+  score: ContentQualityScore;
+}
+
+export interface ContentAutoImproveRequest {
+  threshold?: number;
+  max_attempts?: number;
+  delete_previous?: boolean;
+}
+
+export interface ContentAutoImproveResponse {
+  notification_id: number;
+  channel: string;
+  score: ContentQualityScore;
+  below_threshold: boolean;
+  attempts_used: number;
+  max_attempts: number;
+  threshold: number;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 11 — one-click publish
+// ---------------------------------------------------------------------------
+export interface PublishResult {
+  notification_id: number;
+  channel: string;
+  publisher: string;
+  success: boolean;
+  skipped: boolean;
+  external_id: string | null;
+  external_url: string | null;
+  error: string | null;
+  marked_published: boolean;
+}
+
+export interface PublishChannelInfo {
+  channel: string;
+  publisher: string;
+  configured: boolean;
+}
+
+export interface PublishChannelsResponse {
+  channels: string[];
+  configured: PublishChannelInfo[];
+  unconfigured: PublishChannelInfo[];
+}
+
+export interface BatchPublishRequest {
+  notification_ids: number[];
+  mark_published?: boolean;
+}
+
+export interface BatchPublishResponse {
+  requested: number;
+  results: Array<{
+    publisher: string;
+    channel: string;
+    success: boolean;
+    skipped: boolean;
+    external_id: string | null;
+    external_url: string | null;
+    error: string | null;
+  }>;
+  marked_published_count: number;
+}
+
+export interface PublishRequest {
+  channel?: string;
+  mark_published?: boolean;
 }
 
 // ---------------------------------------------------------------------------

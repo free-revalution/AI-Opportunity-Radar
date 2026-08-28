@@ -72,7 +72,15 @@ export const apiBaseUrl = API_BASE_URL;
 // ---------------------------------------------------------------------------
 // Content Center (Phase 3 v2.0)
 // ---------------------------------------------------------------------------
-import type { ContentCenterResponse } from "@/types";
+import type {
+  ContentCenterResponse,
+  ContentExportBundleResponse,
+  ContentExportJsonResponse,
+  ContentExportRequest,
+  ContentMarkChannelPublishedRequest,
+  ContentRegenerateRequest,
+  ContentRegenerateResponse,
+} from "@/types";
 
 /** Header value for internal API auth. Browser-side we read it from
  * `NEXT_PUBLIC_RADAR_WEBHOOK_SECRET` (falling back to the literal the
@@ -110,11 +118,13 @@ async function jsonFetchWithSecret<T>(
 export async function fetchContentCenter(
   only_qualified: boolean = true,
   limit: number = 20,
+  channel?: string,
 ): Promise<ContentCenterResponse> {
   const params = new URLSearchParams({
     only_qualified: String(only_qualified),
     limit: String(limit),
   });
+  if (channel) params.set("channel", channel);
   return jsonFetchWithSecret<ContentCenterResponse>(
     `/api/internal/content/by_opportunity?${params.toString()}`,
   );
@@ -124,6 +134,8 @@ export interface MarkContentResult {
   opportunity_id: number;
   content_status: string;
   commercial_status: string;
+  // Phase 8 — full per-channel publish map returned by /mark_published.
+  channel_published?: Record<string, string>;
 }
 
 export async function markContentPublished(
@@ -142,6 +154,21 @@ export async function markContentPublished(
   );
 }
 
+/** Phase 8 — stamp just ONE channel (no legacy "mark all" fallback). */
+export async function markChannelPublished(
+  opportunityId: number,
+  channel: string,
+): Promise<MarkContentResult> {
+  return jsonFetchWithSecret<MarkContentResult>(
+    `/api/internal/content/${opportunityId}/mark_published`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ channel }),
+    },
+  );
+}
+
 export async function markContentSold(
   opportunityId: number,
   order?: OrderCreatePayload,
@@ -154,6 +181,81 @@ export async function markContentSold(
       body: JSON.stringify(order ? { order } : {}),
     },
   );
+}
+
+/** Phase 8 — regenerate content for a single opportunity. */
+export async function regenerateContent(
+  opportunityId: number,
+  body: ContentRegenerateRequest = {},
+): Promise<ContentRegenerateResponse> {
+  return jsonFetchWithSecret<ContentRegenerateResponse>(
+    `/api/internal/content/regenerate/${opportunityId}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+/** Phase 8 — bulk export. Returns the parsed JSON / bundle envelope;
+ * for CSV returns the raw text + filename so the caller can stream it
+ * straight into a Blob for browser download. */
+export async function exportContent(
+  body: ContentExportRequest,
+): Promise<
+  | { format: "csv"; body: string; filename: string }
+  | { format: "json"; data: ContentExportJsonResponse; filename: string }
+  | { format: "bundle"; data: ContentExportBundleResponse; filename: string }
+> {
+  if (body.format === "csv") {
+    // CSV response is text/csv — bypass jsonFetchWithSecret and stream bytes.
+    const url = `${API_BASE_URL}/api/internal/content/export`;
+    const headers: Record<string, string> = { Accept: "text/csv" };
+    if (WEBHOOK_SECRET) headers["X-Radar-Webhook"] = WEBHOOK_SECRET;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      cache: "no-store",
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`API ${res.status} ${res.statusText}: ${text || url}`);
+    }
+    const cd = res.headers.get("content-disposition") ?? "";
+    const m = /filename="?([^";]+)"?/.exec(cd);
+    return {
+      format: "csv",
+      body: await res.text(),
+      filename: m?.[1] ?? "content_export.csv",
+    };
+  }
+  if (body.format === "json") {
+    const data = await jsonFetchWithSecret<ContentExportJsonResponse>(
+      "/api/internal/content/export",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    );
+    return { format: "json", data, filename: "content_export.json" };
+  }
+  // bundle
+  const data = await jsonFetchWithSecret<ContentExportBundleResponse>(
+    "/api/internal/content/export",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  return {
+    format: "bundle",
+    data,
+    filename: "content_export_bundle.json",
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -287,5 +389,156 @@ export async function fetchOnDemandDetail(
 ): Promise<OnDemandDetailResponse> {
   return jsonFetchWithSecret<OnDemandDetailResponse>(
     `/api/internal/research/on_demand/${jobId}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 9 — content editing + version history
+// ---------------------------------------------------------------------------
+import type {
+  ContentEditRequest,
+  ContentEditResponse,
+  ContentVersionsResponse,
+} from "@/types";
+
+/**
+ * Phase 9 — create a new version by editing an existing notification.
+ *
+ * Backend: `POST /api/internal/content/{notification_id}/edit`
+ *
+ * Behaviour:
+ *   - At least one of `body` / `title` / `metadata` must be supplied
+ *     (otherwise 422 from the server).
+ *   - Returns a NEW Notification row; the original is left intact.
+ *     The new row's `payload` carries `edited_from_notification_id` and
+ *     `edit_note` so the audit trail is queryable.
+ */
+export async function editContent(
+  notificationId: number,
+  body: ContentEditRequest,
+): Promise<ContentEditResponse> {
+  return jsonFetchWithSecret<ContentEditResponse>(
+    `/api/internal/content/${notificationId}/edit`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+/**
+ * Phase 9 — list all versions of generated content for one opportunity,
+ * DESC by `created_at` (newest first). Pass `channel` to scope to a single
+ * channel (matches the keys used by Content Center: feishu / xianyu /
+ * xiaohongshu / wechat_article).
+ */
+export async function fetchContentVersions(
+  opportunityId: number,
+  channel?: string,
+  limit: number = 50,
+): Promise<ContentVersionsResponse> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (channel) params.set("channel", channel);
+  return jsonFetchWithSecret<ContentVersionsResponse>(
+    `/api/internal/content/${opportunityId}/versions?${params.toString()}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 10 — LLM-as-judge quality scoring
+// ---------------------------------------------------------------------------
+import type {
+  ContentAutoImproveRequest,
+  ContentAutoImproveResponse,
+  ContentQualityRequest,
+  ContentQualityResponse,
+} from "@/types";
+
+/**
+ * Phase 10 — score one generated piece. Returns 5 sub-scores + weighted
+ * total + a one-line rationale. Use `persist: true` to write the score
+ * into the notification payload so the next Content Center load shows
+ * the badge without re-running the scorer.
+ */
+export async function fetchContentQuality(
+  notificationId: number,
+  body: ContentQualityRequest = {},
+): Promise<ContentQualityResponse> {
+  return jsonFetchWithSecret<ContentQualityResponse>(
+    `/api/internal/content/${notificationId}/quality`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+/**
+ * Phase 10 — score + auto-regenerate. Returns the final score envelope
+ * plus how many LLM attempts were used and the resulting
+ * notification_id (which may be the source if the first attempt already
+ * passed).
+ */
+export async function autoImproveContent(
+  notificationId: number,
+  body: ContentAutoImproveRequest = {},
+): Promise<ContentAutoImproveResponse> {
+  return jsonFetchWithSecret<ContentAutoImproveResponse>(
+    `/api/internal/content/${notificationId}/auto_improve`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 11 — one-click publish
+// ---------------------------------------------------------------------------
+import type {
+  BatchPublishRequest,
+  BatchPublishResponse,
+  PublishChannelsResponse,
+  PublishRequest,
+  PublishResult,
+} from "@/types";
+
+/** Phase 11 — list which channels have a publisher registered and
+ * whether each publisher is configured with credentials. */
+export async function fetchPublishChannels(): Promise<PublishChannelsResponse> {
+  return jsonFetchWithSecret<PublishChannelsResponse>(
+    "/api/internal/publish/channels",
+  );
+}
+
+/** Phase 11 — publish a single notification to its target platform. */
+export async function publishNotification(
+  notificationId: number,
+  body: PublishRequest = {},
+): Promise<PublishResult> {
+  return jsonFetchWithSecret<PublishResult>(
+    `/api/internal/content/${notificationId}/publish`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+/** Phase 11 — publish a batch of notifications in one call. */
+export async function batchPublishNotifications(
+  body: BatchPublishRequest,
+): Promise<BatchPublishResponse> {
+  return jsonFetchWithSecret<BatchPublishResponse>(
+    "/api/internal/content/batch_publish",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
   );
 }

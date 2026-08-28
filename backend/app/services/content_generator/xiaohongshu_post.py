@@ -14,6 +14,11 @@ We render 引流 as a fixed placeholder `{{CTA_URL}}` so the
 distribution layer can substitute the per-channel landing page
 (Xianyu listing, 知识星球 invite, etc.) without re-running the
 generator.
+
+Phase 9 — DRY cleanup: `_extract_text` / `_extract_title` /
+`append_block_if_missing` come from `base.py`. Channel-specific
+logic that's still local: `_suggest_hashtags` (heuristic tag set
+that depends on `opportunity.category`).
 """
 
 from __future__ import annotations
@@ -23,6 +28,9 @@ from typing import Any
 from app.services.content_generator.base import (
     ContentGenerator,
     GeneratedContent,
+    append_block_if_missing,
+    extract_text_from_llm,
+    extract_title_from_body,
     register,
 )
 from app.services.llm.provider import LLMProvider
@@ -33,6 +41,18 @@ class XiaohongshuPostGenerator(ContentGenerator):
     channel = "xiaohongshu"
     format = "markdown"
     description = "小红书图文笔记 — Markdown 短文,emoji + 话题标签"
+    # 小红书 — tighter context list (no research_report_fields); the
+    # 300-600 字 budget doesn't leave room for 8 sections of report.
+    opportunity_context_fields = (
+        "title",
+        "summary",
+        "target_user",
+        "market_size",
+        "mvp_days",
+        "china_gap",
+        "total_score",
+    )
+    research_report_fields = ("executive_summary",)
 
     async def generate(
         self,
@@ -46,15 +66,18 @@ class XiaohongshuPostGenerator(ContentGenerator):
             user=self.user_prompt(opportunity=opportunity, report=report),
             response_schema=None,
         )
-        body = self._extract_text(raw)
-        title = self._extract_title(body) or opportunity.title
+        body = extract_text_from_llm(raw)
+        # 30-char cap (no ellipsis) — 小红书 平台会自动截断更长的标题,
+        # 加省略号反而显得 prompty.
+        title, _ = extract_title_from_body(body, max_chars=30, ellipsis="")
+        if not title:
+            title = opportunity.title
         hashtags = self._suggest_hashtags(opportunity)
-        # CTA line is appended unconditionally — never trust the LLM
-        # to remember it. Operators can edit the markdown before
-        # pasting if they want a different call-to-action.
-        cta_line = f"👉 完整项目分析:{{{{CTA_URL}}}}"
-        if "{{CTA_URL}}" not in body:
-            body = body.rstrip() + "\n\n" + cta_line
+        # CTA line is appended unconditionally via the shared helper —
+        # never trust the LLM to remember it.
+        body = append_block_if_missing(
+            body, "{{CTA_URL}}", "👉 完整项目分析:{{CTA_URL}}"
+        )
         body_with_hashtags = body.rstrip() + "\n\n" + " ".join(hashtags)
         return GeneratedContent(
             opportunity_id=int(opportunity.id),
@@ -88,45 +111,7 @@ class XiaohongshuPostGenerator(ContentGenerator):
             "* 引流(用上面的 CTA 占位符,不要自己填 URL)\n"
         )
 
-    def user_prompt(self, *, opportunity: Any, report: Any | None) -> str:
-        parts: list[str] = [f"机会标题:{opportunity.title}"]
-        if getattr(opportunity, "summary", None):
-            parts.append(f"摘要:{opportunity.summary}")
-        if getattr(opportunity, "target_user", None):
-            parts.append(f"目标用户:{opportunity.target_user}")
-        if getattr(opportunity, "market_size", None):
-            parts.append(f"市场:{opportunity.market_size}")
-        if getattr(opportunity, "mvp_days", None):
-            parts.append(f"MVP 天数:{opportunity.mvp_days}")
-        if getattr(opportunity, "china_gap", None):
-            parts.append(f"中国空白:{opportunity.china_gap}")
-        if report is not None and getattr(report, "executive_summary", None):
-            parts.append(f"\n深度研究:{report.executive_summary}")
-        return "\n".join(parts)
-
     # ----- helpers ---------------------------------------------------
-    @staticmethod
-    def _extract_text(raw: Any) -> str:
-        if isinstance(raw, str):
-            return raw
-        if isinstance(raw, dict):
-            for key in ("text", "markdown", "content", "body"):
-                v = raw.get(key)
-                if isinstance(v, str) and v.strip():
-                    return v
-            import json
-
-            return "```json\n" + json.dumps(raw, ensure_ascii=False) + "\n```"
-        return str(raw)
-
-    @staticmethod
-    def _extract_title(body: str) -> str:
-        for line in body.splitlines():
-            line = line.strip().lstrip("#").strip()
-            if line:
-                return line[:30]
-        return ""
-
     @staticmethod
     def _suggest_hashtags(opportunity: Any) -> list[str]:
         # Heuristic tag set — never trust the model here. Operators can

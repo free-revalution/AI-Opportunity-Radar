@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 from decimal import Decimal
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi.responses import Response
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,7 +32,7 @@ from app.schemas.order import (
     OrderStatusUpdateRequest,
 )
 from app.services.clustering import ClusteringService
-from app.services.content_generator import ContentGeneratorService
+from app.services.content_generator import ContentGeneratorService, get_registry
 from app.services.ingestion import IngestionService
 from app.services.llm import build_llm_provider
 from app.services.notification import NotificationService
@@ -679,13 +681,46 @@ async def run_content_generation(
     llm = build_llm_provider(settings=get_settings())
     service = ContentGeneratorService(session=session, llm=llm)
 
+    # Phase 8 — wire the `generators` field through. Commented in the
+    # original Phase 3 schema but never actually read by the endpoint.
+    # Validate against the live registry so an upstream caller can't
+    # request a generator that doesn't exist (typo, removed channel).
+    generators = body.get("generators")
+    if generators is not None:
+        if not isinstance(generators, list) or not all(
+            isinstance(g, str) for g in generators
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="`generators` must be a list[str]",
+            )
+        allowed = set(get_registry().names())
+        unknown = [g for g in generators if g not in allowed]
+        if unknown:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "message": "unknown generator(s) requested",
+                    "unknown": unknown,
+                    "allowed": sorted(allowed),
+                },
+            )
+
     if body.get("opportunity_ids"):
-        result = await service.run_for_ids([int(x) for x in body["opportunity_ids"]])
+        result = await service.run_for_ids(
+            [int(x) for x in body["opportunity_ids"]],
+            generators=generators,
+        )
     else:
         result = await service.run_for_top_opportunities(
             limit=int(body.get("limit", 5)),
             only_qualified=bool(body.get("only_qualified", True)),
+            generators=generators,
         )
+    # Flush wrote Notification rows mid-run; commit so they survive the
+    # request-scoped session teardown (otherwise the implicit rollback at
+    # `async with sessionmaker()` close wipes them).
+    await session.commit()
     return result.as_dict()
 
 
@@ -764,28 +799,101 @@ async def send_feishu_digest(
 async def list_content_by_opportunity(
     only_qualified: bool = True,
     limit: int = 20,
+    channel: str | None = None,
     session: AsyncSession = Depends(get_session),
     _secret: None = Depends(_check_webhook_secret),
 ) -> dict[str, Any]:
-    """Phase 3 (v2.0) — Content Center backend.
+    """Phase 3 + Phase 8 (v2.0) — Content Center backend.
 
     Returns one row per opportunity (top `limit` by score), each with the
     most-recent generated content for every sales channel
     (feishu / xianyu / xiaohongshu / wechat_article). The frontend uses
     this to render the Content Center page.
+
+    Phase 8 — optional `channel` query param filters the response down
+    to a single sales channel (e.g. `?channel=wechat_article`). Frontend
+    uses this for the "只看公众号" tab so it doesn't have to ship the
+    full payload and slice client-side.
+    """
+    grouped, opportunities = await _fetch_grouped_content(
+        session=session,
+        only_qualified=only_qualified,
+        limit=limit,
+    )
+
+    items: list[dict[str, Any]] = []
+    for opp in opportunities:
+        opp_channels = grouped.get(opp.id, {})
+        if channel is not None:
+            opp_channels = (
+                {channel: opp_channels[channel]}
+                if channel in opp_channels
+                else {}
+            )
+        items.append(
+            {
+                "opportunity": {
+                    "id": opp.id,
+                    "title": opp.title,
+                    "slug": opp.slug,
+                    "summary": opp.summary,
+                    "total_score": float(opp.total_score or 0.0),
+                    "content_status": opp.content_status,
+                    "commercial_status": opp.commercial_status,
+                    "channel_published": dict(opp.channel_published or {}),
+                    "target_customer": opp.target_customer,
+                    "market_size": opp.market_size,
+                    "mvp_days": int(opp.mvp_days or 0),
+                    "difficulty": opp.difficulty,
+                    "monetization_model": opp.monetization_model,
+                    "china_gap": opp.china_gap,
+                },
+                "content": opp_channels,
+            }
+        )
+
+    return {"generated_at": _utc_now_iso(), "items": items}
+
+
+async def _fetch_grouped_content(
+    *,
+    session: AsyncSession,
+    only_qualified: bool,
+    limit: int,
+    opportunity_ids: list[int] | None = None,
+) -> tuple[dict[int, dict[str, dict[str, Any]]], list[Any]]:
+    """Shared helper for `/content/by_opportunity` and `/content/export`.
+
+    Returns a 2-tuple of (grouped, opportunities):
+      * `grouped[opp_id][channel] = payload_dict` — only the latest
+        notification per channel per opp
+      * `opportunities` — the Opportunity rows in score-DESC order
+        (matches `grouped`'s iteration order for the response builder)
+
+    If `opportunity_ids` is provided, `only_qualified` + `limit` are
+    ignored — the IDs are used verbatim.
     """
     from app.models import Notification, Opportunity
 
-    stmt = select(Opportunity).order_by(Opportunity.total_score.desc())
-    if only_qualified:
-        stmt = stmt.where(
-            Opportunity.commercial_status.in_(["qualified", "promising"])
-        )
-    stmt = stmt.limit(limit)
-    opportunities = list((await session.execute(stmt)).scalars().all())
+    if opportunity_ids:
+        # Caller-specified subset — bypass score filter and limit.
+        rows = (
+            await session.execute(
+                select(Opportunity).where(Opportunity.id.in_(opportunity_ids))
+            )
+        ).scalars().all()
+        opportunities = list(rows)
+    else:
+        stmt = select(Opportunity).order_by(Opportunity.total_score.desc())
+        if only_qualified:
+            stmt = stmt.where(
+                Opportunity.commercial_status.in_(["qualified", "promising"])
+            )
+        stmt = stmt.limit(limit)
+        opportunities = list((await session.execute(stmt)).scalars().all())
 
     if not opportunities:
-        return {"generated_at": _utc_now_iso(), "items": []}
+        return {}, []
 
     opp_ids = [o.id for o in opportunities]
     notif_stmt = (
@@ -809,41 +917,24 @@ async def list_content_by_opportunity(
             continue
         if n.channel in grouped[oid]:
             continue  # keep only the latest per channel
+        payload = n.payload or {}
+        # Phase 10 — top-level `quality_score` lives on the payload (set
+        # by POST /quality with persist=true). Surface it so the Content
+        # Center can render a badge without a second round-trip.
+        quality_score = payload.get("quality_score")
         grouped[oid][n.channel] = {
             "notification_id": n.id,
             "channel": n.channel,
-            "title": (n.payload or {}).get("title") or "",
-            "body": (n.payload or {}).get("body") or "",
-            "metadata": (n.payload or {}).get("metadata") or {},
-            "generator": (n.payload or {}).get("generator") or "",
-            "format": (n.payload or {}).get("format") or "",
+            "title": payload.get("title") or "",
+            "body": payload.get("body") or "",
+            "metadata": payload.get("metadata") or {},
+            "generator": payload.get("generator") or "",
+            "format": payload.get("format") or "",
+            "quality_score": quality_score,
             "created_at": n.created_at.isoformat() if n.created_at else None,
         }
 
-    items: list[dict[str, Any]] = []
-    for opp in opportunities:
-        items.append(
-            {
-                "opportunity": {
-                    "id": opp.id,
-                    "title": opp.title,
-                    "slug": opp.slug,
-                    "summary": opp.summary,
-                    "total_score": float(opp.total_score or 0.0),
-                    "content_status": opp.content_status,
-                    "commercial_status": opp.commercial_status,
-                    "target_customer": opp.target_customer,
-                    "market_size": opp.market_size,
-                    "mvp_days": int(opp.mvp_days or 0),
-                    "difficulty": opp.difficulty,
-                    "monetization_model": opp.monetization_model,
-                    "china_gap": opp.china_gap,
-                },
-                "content": grouped.get(opp.id, {}),
-            }
-        )
-
-    return {"generated_at": _utc_now_iso(), "items": items}
+    return grouped, opportunities
 
 
 @router.post(
@@ -856,12 +947,27 @@ async def mark_content_published(
     session: AsyncSession = Depends(get_session),
     _secret: None = Depends(_check_webhook_secret),
 ) -> dict[str, Any]:
-    """Phase 3 (v2.0) — flip an Opportunity's `content_status` to `published`.
+    """Phase 3 + Phase 8 (v2.0) — flip an Opportunity's `content_status`.
+
+    Phase 8 — per-channel publish tracking via the
+    `Opportunity.channel_published` JSON map:
+
+      * No `channel` in body → mark all four sales channels as
+        published (legacy Phase 3 behaviour; `content_status` flips to
+        `published` once).
+      * `channel: "wechat_article"` → stamp just that one channel in
+        `channel_published`. `content_status` flips to `published` if
+        any channel becomes marked; stays at its previous state if the
+        operator is un-marking (we don't support un-mark yet, but the
+        shape leaves room for it).
 
     Body (all optional):
-        { "commercial_status": "promising" }   # override the next stage
+        {
+          "channel": "wechat_article",                # Phase 8 — subset
+          "commercial_status": "promising"            # optional stage bump
+        }
 
-    Returns the new state.
+    Returns the new state including the full `channel_published` map.
     """
     from app.models import Opportunity
 
@@ -872,9 +978,32 @@ async def mark_content_published(
             detail=f"opportunity {opportunity_id} not found",
         )
 
-    opp.content_status = "published"
     body = body or {}
     next_stage = body.get("commercial_status")
+    # — Start from the persisted map (JSONB column → Python dict).
+    cp: dict[str, str] = dict(opp.channel_published or {})
+    now_iso = _utc_now_iso()
+    raw_channel = body.get("channel")
+    # Distinguish "not provided" (None → legacy mark-all) from
+    # "provided but empty/invalid" (→ 422). The legacy behaviour stays
+    # for backwards compatibility with Phase 3 callers.
+    if raw_channel is not None:
+        if not isinstance(raw_channel, str) or not raw_channel.strip():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="`channel` must be a non-empty string",
+            )
+        cp[raw_channel] = now_iso
+    else:
+        # Legacy "mark all published" path — stamp every known channel so
+        # the Content Center ✓ badges line up everywhere.
+        for ch in ("feishu", "xianyu", "xiaohongshu", "wechat_article"):
+            cp[ch] = now_iso
+
+    opp.channel_published = cp
+    if cp:
+        # High-water mark: any channel flipped → published.
+        opp.content_status = "published"
     if next_stage in {"promising", "qualified", "unqualified"}:
         opp.commercial_status = next_stage
     await session.commit()
@@ -883,6 +1012,7 @@ async def mark_content_published(
         "opportunity_id": opportunity_id,
         "content_status": opp.content_status,
         "commercial_status": opp.commercial_status,
+        "channel_published": dict(opp.channel_published or {}),
     }
 
 
@@ -978,6 +1108,934 @@ async def mark_content_sold(
     if created_order:
         response["order"] = created_order
     return response
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 (v2.0) — multi-channel content operations
+# ---------------------------------------------------------------------------
+@router.post(
+    "/content/regenerate/{opportunity_id}",
+    summary="Regenerate content for a single opportunity (Phase 8 v2.0)",
+)
+async def regenerate_opportunity_content(
+    opportunity_id: int,
+    body: dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 8 (v2.0) — single-opportunity regenerate.
+
+    Body (all optional):
+        {
+          "generators": ["wechat_article"],   # subset; default = all
+          "delete_previous": false            # if true, hard-delete prior
+                                             # Notifications on the same
+                                             # channels before re-running
+        }
+
+    Behaviour:
+      * `enrich=False` — the Opportunity is already enriched; no need to
+        burn tokens re-extracting the same six commercial fields.
+      * Default `delete_previous=False` → APPEND mode. New Notification
+        rows are created; old ones remain so the operator can roll back
+        via the audit trail.
+      * 404 if the opportunity doesn't exist.
+
+    Returns a per-generator summary.
+    """
+    from sqlalchemy import delete
+
+    from app.models import Notification, Opportunity, ResearchReport
+
+    body = body or {}
+    opp = await session.get(Opportunity, opportunity_id)
+    if opp is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"opportunity {opportunity_id} not found",
+        )
+
+    generators = body.get("generators")
+    if generators is not None:
+        if not isinstance(generators, list) or not all(
+            isinstance(g, str) for g in generators
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="`generators` must be a list[str]",
+            )
+        allowed = set(get_registry().names())
+        unknown = [g for g in generators if g not in allowed]
+        if unknown:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "message": "unknown generator(s) requested",
+                    "unknown": unknown,
+                    "allowed": sorted(allowed),
+                },
+            )
+
+    delete_previous = bool(body.get("delete_previous", False))
+    if delete_previous and generators:
+        # Only delete the channels that are about to be re-generated —
+        # preserve the operator's history on the others.
+        channels = {
+            get_registry().get(g).channel
+            for g in generators
+            if get_registry().get(g).channel
+        }
+        if channels:
+            stmt = delete(Notification).where(
+                Notification.channel.in_(channels),
+                Notification.payload["opportunity_id"].as_integer() == opportunity_id,
+            )
+            await session.execute(stmt)
+            await session.flush()
+
+    # Pull the latest research report for context.
+    report = (
+        await session.execute(
+            select(ResearchReport)
+            .where(ResearchReport.opportunity_id == opportunity_id)
+            .order_by(ResearchReport.created_at.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+
+    llm = build_llm_provider(settings=get_settings())
+    service = ContentGeneratorService(session=session, llm=llm)
+    produced = await service.run_for_opportunity(
+        opp, report=report, generators=generators, enrich=False
+    )
+    # Persist any new Notifications (flushed by the service) before the
+    # request-scoped session closes — see commit note on
+    # `run_content_generation`.
+    await session.commit()
+
+    return {
+        "opportunity_id": opportunity_id,
+        "regenerated_count": len(produced),
+        "generators": [p.generator for p in produced],
+        "items": [
+            {
+                "generator": p.generator,
+                "channel": p.channel,
+                "title": p.title,
+                "char_count": len(p.content) if isinstance(p.content, str) else None,
+            }
+            for p in produced
+        ],
+    }
+
+
+@router.post(
+    "/content/export",
+    summary="Bulk-export generated content as CSV / JSON / bundle (Phase 8 v2.0)",
+)
+async def export_content(
+    body: dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> Response:
+    """Phase 8 (v2.0) — batch export.
+
+    Body (all optional except `format`):
+        {
+          "opportunity_ids": [12, 34, 56],   # OR
+          "limit": 50, "only_qualified": true,
+          "channels": ["xianyu", "wechat_article"],  # subset; default = all
+          "format": "csv" | "json" | "bundle"        # REQUIRED
+        }
+
+    Returns:
+      * **csv** — `text/csv; charset=utf-8`. Header row:
+          opportunity_id, opportunity_title, channel, title, format,
+          body, metadata, generator, created_at. One row per
+          opportunity-channel.
+      * **json** — JSON envelope
+          `{exported_at, items: [{opportunity_id, content: {...}}]}`
+      * **bundle** — JSON envelope with file payloads so the frontend
+          can wrap them in a Blob and trigger a browser download:
+          `{exported_at, files: [{filename, content_type, content}]}`.
+          This is the most useful format for "copy-paste into the
+          公众号编辑器" workflow.
+    """
+    import csv as _csv
+    import io as _io
+    import json as _json
+
+    body = body or {}
+    fmt = (body.get("format") or "csv").lower()
+    if fmt not in {"csv", "json", "bundle"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"format must be csv|json|bundle, got {fmt!r}",
+        )
+
+    opp_ids_in = body.get("opportunity_ids")
+    limit = int(body.get("limit", 50))
+    only_qualified = bool(body.get("only_qualified", True))
+    channels = body.get("channels")
+
+    if opp_ids_in is not None and not (
+        isinstance(opp_ids_in, list) and all(isinstance(x, int) for x in opp_ids_in)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="`opportunity_ids` must be a list[int]",
+        )
+    if channels is not None and not (
+        isinstance(channels, list) and all(isinstance(x, str) for x in channels)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="`channels` must be a list[str]",
+        )
+
+    grouped, opportunities = await _fetch_grouped_content(
+        session=session,
+        only_qualified=only_qualified,
+        limit=limit,
+        opportunity_ids=opp_ids_in,
+    )
+
+    # Build {opp_id: {channel: payload}}, filtered by the requested channel subset.
+    filtered: dict[int, dict[str, dict[str, Any]]] = {}
+    opp_titles: dict[int, str] = {}
+    for opp in opportunities:
+        opp_titles[opp.id] = opp.title or f"opp-{opp.id}"
+        for ch, payload in grouped.get(opp.id, {}).items():
+            if channels is None or ch in channels:
+                filtered.setdefault(opp.id, {})[ch] = payload
+
+    if fmt == "csv":
+        buf = _io.StringIO()
+        writer = _csv.writer(buf, quoting=_csv.QUOTE_ALL)
+        writer.writerow(
+            [
+                "opportunity_id",
+                "opportunity_title",
+                "channel",
+                "title",
+                "format",
+                "body",
+                "metadata",
+                "generator",
+                "created_at",
+            ]
+        )
+        for oid, ch_dict in filtered.items():
+            for ch, payload in ch_dict.items():
+                body_str = (
+                    payload["body"]
+                    if isinstance(payload["body"], str)
+                    else _json.dumps(payload["body"], ensure_ascii=False)
+                )
+                meta_str = _json.dumps(
+                    payload.get("metadata") or {}, ensure_ascii=False
+                )
+                writer.writerow(
+                    [
+                        oid,
+                        opp_titles.get(oid, ""),
+                        ch,
+                        payload.get("title") or "",
+                        payload.get("format") or "",
+                        body_str,
+                        meta_str,
+                        payload.get("generator") or "",
+                        payload.get("created_at") or "",
+                    ]
+                )
+        return Response(
+            content=buf.getvalue(),
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="content_export.csv"'
+            },
+        )
+
+    if fmt == "json":
+        items = [
+            {"opportunity_id": oid, "opportunity_title": opp_titles.get(oid, ""), "content": ch_dict}
+            for oid, ch_dict in filtered.items()
+        ]
+        return Response(
+            content=_json.dumps(
+                {"exported_at": _utc_now_iso(), "items": items},
+                ensure_ascii=False,
+            ),
+            media_type="application/json; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="content_export.json"'
+            },
+        )
+
+    # bundle — one file per opportunity-channel.
+    files: list[dict[str, Any]] = []
+    for oid, ch_dict in filtered.items():
+        base_title = opp_titles.get(oid, f"opp-{oid}")
+        slug = _slugify(base_title) or f"opp-{oid}"
+        for ch, payload in ch_dict.items():
+            ext = "md" if payload.get("format") == "markdown" else "json"
+            content_type = (
+                "text/markdown; charset=utf-8"
+                if ext == "md"
+                else "application/json; charset=utf-8"
+            )
+            body_value = payload.get("body") or ""
+            if not isinstance(body_value, str):
+                body_value = _json.dumps(body_value, ensure_ascii=False)
+            files.append(
+                {
+                    "filename": f"{slug}-{ch}.{ext}",
+                    "content_type": content_type,
+                    "content": body_value,
+                }
+            )
+    return Response(
+        content=_json.dumps(
+            {"exported_at": _utc_now_iso(), "files": files},
+            ensure_ascii=False,
+        ),
+        media_type="application/json; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="content_export_bundle.json"'
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 9 — content editing + version history
+# ---------------------------------------------------------------------------
+@router.post(
+    "/content/{notification_id}/edit",
+    summary="Save operator-edited content as a new version (Phase 9 v2.0)",
+)
+async def edit_notification_content(
+    notification_id: int,
+    body: dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 9 (v2.0) — operator-edited content becomes a new version.
+
+    Body (one of `body` / `title` / `metadata` may be supplied; at
+    least one must be present, otherwise it's a no-op):
+        {
+          "title": "...",       # optional — defaults to source title
+          "body": "...",        # optional — defaults to source body
+          "metadata": { ... },  # optional — merged with source metadata
+          "edit_note": "..."    # optional — operator note for the audit trail
+        }
+
+    Behaviour:
+      * Loads the source notification row.
+      * Creates a NEW notification row on the same channel with the
+        edited body / title / metadata. The original row stays
+        untouched — full audit trail.
+      * Records `edit_note` + the source `notification_id` in the
+        new row's payload so the version-history view can show
+        "edited from #42 at 2026-08-28 by operator".
+
+    Returns the new notification_id + the persisted payload.
+    """
+    from app.models import Notification
+
+    src = await session.get(Notification, notification_id)
+    if src is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"notification {notification_id} not found",
+        )
+
+    body = body or {}
+    new_body = body.get("body")
+    new_title = body.get("title")
+    new_metadata = body.get("metadata")
+    edit_note = body.get("edit_note")
+
+    if new_body is None and new_title is None and new_metadata is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="supply at least one of `body` / `title` / `metadata`",
+        )
+
+    src_payload = dict(src.payload or {})
+    persisted_body = (
+        new_body if new_body is not None else src_payload.get("body", "")
+    )
+    persisted_title = (
+        new_title if new_title is not None else src_payload.get("title", "")
+    )
+    persisted_metadata = dict(src_payload.get("metadata") or {})
+    if new_metadata:
+        persisted_metadata.update(new_metadata)
+    if edit_note:
+        persisted_metadata["edit_note"] = edit_note
+
+    new_payload = dict(src_payload)
+    new_payload.update(
+        {
+            "title": persisted_title,
+            "body": persisted_body,
+            "metadata": persisted_metadata,
+            # Audit trail fields — surfaced by /content/versions below.
+            "edited_from_notification_id": src.id,
+            "edit_note": edit_note,
+        }
+    )
+
+    new_notif = Notification(channel=src.channel, payload=new_payload)
+    session.add(new_notif)
+    await session.commit()
+    await session.refresh(new_notif)
+
+    return {
+        "notification_id": new_notif.id,
+        "channel": new_notif.channel,
+        "title": persisted_title,
+        "body": persisted_body,
+        "metadata": persisted_metadata,
+        "edited_from_notification_id": src.id,
+        "created_at": new_notif.created_at.isoformat() if new_notif.created_at else None,
+    }
+
+
+@router.get(
+    "/content/{opportunity_id}/versions",
+    summary="List all versions of generated content for one opp (Phase 9 v2.0)",
+)
+async def list_content_versions(
+    opportunity_id: int,
+    channel: str | None = None,
+    limit: int = 50,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 9 (v2.0) — full version history per (opp, channel).
+
+    Returns up to `limit` most-recent Notifications for the given
+    opportunity. Frontend renders a sidebar:
+      v3 (latest) · 2026-08-28 13:45 · operator-edit (from v2)
+      v2         · 2026-08-28 12:30 · wechat_article regenerate
+      v1         · 2026-08-28 11:00 · initial generation
+
+    Filters:
+      * `channel` (optional) — restrict to one channel
+      * `limit`   (optional, default 50) — most-recent N rows
+
+    Each entry includes a tiny preview (first 80 chars of body) so
+    the operator can pick the right version to restore without
+    loading each one in full.
+    """
+    from app.models import Notification, Opportunity
+
+    opp = await session.get(Opportunity, opportunity_id)
+    if opp is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"opportunity {opportunity_id} not found",
+        )
+
+    stmt = (
+        select(Notification)
+        .where(Notification.payload["opportunity_id"].as_integer() == opportunity_id)
+        .order_by(Notification.created_at.desc(), Notification.id.desc())
+        .limit(limit)
+    )
+    if channel is not None:
+        stmt = stmt.where(Notification.channel == channel)
+
+    rows = list((await session.execute(stmt)).scalars().all())
+
+    items: list[dict[str, Any]] = []
+    for n in rows:
+        payload = dict(n.payload or {})
+        body_str = payload.get("body") or ""
+        if not isinstance(body_str, str):
+            body_str = json.dumps(body_str, ensure_ascii=False)
+        meta = payload.get("metadata") or {}
+        items.append(
+            {
+                "notification_id": n.id,
+                "channel": n.channel,
+                "title": payload.get("title") or "",
+                "preview": body_str[:80],
+                "char_count": len(body_str),
+                "metadata": meta,
+                "edited_from_notification_id": payload.get(
+                    "edited_from_notification_id"
+                ),
+                "edit_note": payload.get("edit_note"),
+                "created_at": n.created_at.isoformat() if n.created_at else None,
+            }
+        )
+
+    return {
+        "opportunity_id": opportunity_id,
+        "channel": channel,
+        "total": len(items),
+        "items": items,
+    }
+
+
+@router.post(
+    "/content/{notification_id}/quality",
+    summary="LLM-as-judge quality score for one generated piece (Phase 10 v2.0)",
+)
+async def score_content_quality(
+    notification_id: int,
+    body: dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 10 (v2.0) — score a single piece of generated content.
+
+    Body (all optional):
+        {
+          "threshold": 6.0,        # override DEFAULT_THRESHOLD for this call
+          "persist":  true         # if true, store the score in the
+                                   #   notification's payload under
+                                   #   `quality_score` so the next
+                                   #   /by_opportunity fetch shows it
+                                   #   without a second LLM call
+        }
+
+    Returns the score envelope:
+        {
+          "notification_id": 42,
+          "channel": "wechat_article",
+          "title": "...",
+          "score": {
+            "hook_strength": 7.5,
+            "cta_naturalness": 8.0,
+            "data_accuracy": 5.0,
+            "char_count_compliance": 9.0,
+            "platform_style_match": 7.0,
+            "total": 7.05,
+            "rationale": "...",
+            "below_threshold": false,
+            "threshold_used": 6.0,
+            "dimension_floor_used": 4.0
+          }
+        }
+
+    The LLM call is short (max 400 tokens) and the result is NOT
+    cached on the server — every call costs one round trip. Use
+    `persist=true` to write the score into the row so subsequent
+    Content Center loads don't recompute it.
+    """
+    from app.services.content_scorer import ContentQualityScorer
+
+    body = body or {}
+    persist = bool(body.get("persist", False))
+    threshold_override = body.get("threshold")
+
+    from app.models import Notification
+
+    notif = await session.get(Notification, notification_id)
+    if notif is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"notification {notification_id} not found",
+        )
+
+    payload = dict(notif.payload or {})
+    payload["channel"] = notif.channel
+
+    scorer = ContentQualityScorer()
+    if threshold_override is not None:
+        try:
+            scorer.threshold = float(threshold_override)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"`threshold` must be a number, got {threshold_override!r}",
+            )
+
+    # We need an LLM provider here — build the same way the rest of the
+    # content endpoints do.
+    from app.services.llm import build_llm_provider
+
+    llm = build_llm_provider()
+
+    score = await scorer.score(notification_payload=payload, llm=llm)
+
+    if persist:
+        new_payload = dict(payload)
+        new_payload["quality_score"] = score.as_dict()
+        notif.payload = new_payload
+        await session.commit()
+
+    return {
+        "notification_id": notif.id,
+        "channel": notif.channel,
+        "title": payload.get("title") or "",
+        "score": score.as_dict(),
+    }
+
+
+@router.post(
+    "/content/{notification_id}/auto_improve",
+    summary="Score + auto-regenerate if below threshold (Phase 10 v2.0)",
+)
+async def auto_improve_content(
+    notification_id: int,
+    body: dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 10 (v2.0) — score → if below threshold, regenerate up to N
+    times until the score is acceptable (or attempts run out).
+
+    Body (all optional):
+        {
+          "threshold":      6.0,
+          "max_attempts":   2,   # total LLM attempts, including the first
+          "delete_previous": false
+        }
+
+    Behaviour:
+      * Loads the source notification, identifies which generator /
+        opportunity produced it.
+      * Scores it with the same `ContentQualityScorer` as /quality.
+      * If `score.below_threshold` and attempts < max_attempts, calls
+        the generator again to produce a new version (append mode by
+        default — historical rows preserved).
+      * Returns the final score + how many retries were used + the new
+        notification_id (if a retry happened).
+    """
+    from app.models import Notification, Opportunity
+    from app.services.content_generator import (
+        ContentGeneratorService,
+        get_registry,
+    )
+    from app.services.content_scorer import ContentQualityScorer
+    from app.services.llm import build_llm_provider
+
+    body = body or {}
+    try:
+        threshold = float(body.get("threshold", 6.0))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"`threshold` must be a number, got {body.get('threshold')!r}",
+        )
+    try:
+        max_attempts = max(1, min(int(body.get("max_attempts", 2)), 4))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"`max_attempts` must be int 1-4, got {body.get('max_attempts')!r}",
+        )
+    delete_previous = bool(body.get("delete_previous", False))
+
+    notif = await session.get(Notification, notification_id)
+    if notif is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"notification {notification_id} not found",
+        )
+    payload = dict(notif.payload or {})
+    payload["channel"] = notif.channel
+    opportunity_id = payload.get("opportunity_id")
+    generator_name = payload.get("generator")
+    if not opportunity_id or not generator_name:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="notification payload missing `opportunity_id` or `generator`",
+        )
+
+    opp = await session.get(Opportunity, opportunity_id)
+    if opp is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"opportunity {opportunity_id} not found",
+        )
+
+    registry = get_registry()
+    if generator_name not in registry.names():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"unknown generator {generator_name!r}",
+        )
+
+    llm = build_llm_provider()
+    scorer = ContentQualityScorer()
+    scorer.threshold = threshold
+
+    # Attempt 1 — score the source notification.
+    current_notif_id = notif.id
+    score = await scorer.score(notification_payload=payload, llm=llm)
+    attempts_used = 1
+
+    service = ContentGeneratorService(session=session, llm=llm, registry=registry)
+
+    while score.below_threshold and attempts_used < max_attempts:
+        # Re-run the generator for this opp — produces a new Notification.
+        produced = await service.run_for_opportunity(
+            opp,
+            generators=[generator_name],
+            enrich=False,  # already enriched — don't burn tokens re-doing it
+        )
+        if not produced:
+            break
+        attempts_used += 1
+        current_notif_id = produced[-1].notification_id
+        new_notif = await session.get(Notification, current_notif_id)
+        if new_notif is None:
+            break
+        new_payload = dict(new_notif.payload or {})
+        new_payload["channel"] = new_notif.channel
+        score = await scorer.score(notification_payload=new_payload, llm=llm)
+
+    # Optional cleanup — when the operator opts in, delete the previous
+    # low-scoring notifications for this (opp, generator) and keep
+    # only the best one. Default off — append-only is safer.
+    if delete_previous and attempts_used > 1:
+        from sqlalchemy import delete as sa_delete
+
+        await session.execute(
+            sa_delete(Notification).where(
+                Notification.payload["opportunity_id"].as_integer() == opportunity_id,
+                Notification.payload["generator"].as_string() == generator_name,
+                Notification.id != current_notif_id,
+                Notification.channel == notif.channel,
+            )
+        )
+
+    await session.commit()
+
+    return {
+        "notification_id": current_notif_id,
+        "channel": notif.channel,
+        "score": score.as_dict(),
+        "below_threshold": score.below_threshold,
+        "attempts_used": attempts_used,
+        "max_attempts": max_attempts,
+        "threshold": threshold,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 11 — Publisher infrastructure (one-click publish)
+# ---------------------------------------------------------------------------
+@router.get(
+    "/publish/channels",
+    summary="List channels with a registered publisher (Phase 11 v2.0)",
+)
+async def list_publish_channels(
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Return which channels can be published to right now and which
+    publishers are unconfigured (so the frontend can show a friendly
+    CTA)."""
+    from app.services.publisher import (
+        channels as _channels,
+        get_publisher,
+    )
+
+    configured: list[dict[str, Any]] = []
+    unconfigured: list[dict[str, Any]] = []
+    for ch in _channels():
+        publisher = get_publisher(ch)
+        entry = {
+            "channel": ch,
+            "publisher": publisher.name,
+            "configured": publisher.is_configured(),
+        }
+        if publisher.is_configured():
+            configured.append(entry)
+        else:
+            unconfigured.append(entry)
+    return {
+        "channels": list(_channels()),
+        "configured": configured,
+        "unconfigured": unconfigured,
+    }
+
+
+@router.post(
+    "/content/{notification_id}/publish",
+    summary="Publish a single notification to its target platform (Phase 11 v2.0)",
+)
+async def publish_notification(
+    notification_id: int,
+    body: dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 11 (v2.0) — fan out to the publisher for the notification's
+    channel. Body (all optional):
+
+        {
+          "channel": "...",    # override (rarely needed — defaults to notif.channel)
+          "mark_published": true  # if true, stamp channel_published[ch]
+                                 #   + flip content_status when the
+                                 #   result is `success=True`
+        }
+
+    The publisher may return `success=False, skipped=True` when the
+    platform credentials aren't configured — that's not a bug, it's
+    a hint to the operator. Real failures (`success=False, error=...`)
+    bubble up as a 502 so the operator knows to retry.
+    """
+    from app.models import Notification, Opportunity
+    from app.services.publisher import (
+        PublishResult,
+        get_publisher,
+    )
+
+    body = body or {}
+    mark_published = bool(body.get("mark_published", True))
+    channel_override = body.get("channel")
+
+    notif = await session.get(Notification, notification_id)
+    if notif is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"notification {notification_id} not found",
+        )
+
+    channel = channel_override or notif.channel
+    payload = dict(notif.payload or {})
+
+    try:
+        publisher = get_publisher(channel)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        )
+
+    result: PublishResult = await publisher.publish(payload)
+
+    if result.success and mark_published:
+        opportunity_id = payload.get("opportunity_id")
+        if opportunity_id:
+            opp = await session.get(Opportunity, opportunity_id)
+            if opp is not None:
+                cp = dict(opp.channel_published or {})
+                cp[channel] = _utc_now_iso()
+                opp.channel_published = cp
+                opp.content_status = "published"
+                await session.flush()
+        await session.commit()
+    elif mark_published:
+        await session.commit()
+
+    status_code = (
+        status.HTTP_200_OK
+        if result.success or result.skipped
+        else status.HTTP_502_BAD_GATEWAY
+    )
+    return {
+        "notification_id": notif.id,
+        "channel": channel,
+        "publisher": result.publisher,
+        "success": result.success,
+        "skipped": result.skipped,
+        "external_id": result.external_id,
+        "external_url": result.external_url,
+        "error": result.error,
+        "marked_published": result.success and mark_published,
+    }
+
+
+@router.post(
+    "/content/batch_publish",
+    summary="Publish a batch of notifications (Phase 11 v2.0)",
+)
+async def batch_publish_notifications(
+    body: dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    _secret: None = Depends(_check_webhook_secret),
+) -> dict[str, Any]:
+    """Phase 11 (v2.0) — publish up to N notifications in one call.
+
+    Body:
+        {
+          "notification_ids": [42, 43, 44],
+          "mark_published": true   # optional, default true
+        }
+
+    Returns one PublishResult per input, in the same order. Does NOT
+    abort on individual failures — the operator gets a full report.
+    """
+    from app.models import Notification, Opportunity
+    from app.services.publisher import (
+        batch_publish as _batch_publish,
+    )
+
+    body = body or {}
+    raw_ids = body.get("notification_ids") or []
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="`notification_ids` must be a non-empty list",
+        )
+    if not all(isinstance(x, int) for x in raw_ids):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="`notification_ids` must contain only integers",
+        )
+    mark_published = bool(body.get("mark_published", True))
+
+    rows: dict[int, Notification] = {}
+    for nid in raw_ids:
+        n = await session.get(Notification, nid)
+        if n is not None:
+            rows[nid] = n
+
+    ordered: list[tuple[str, dict[str, Any]]] = []
+    for nid in raw_ids:
+        n = rows.get(nid)
+        if n is None:
+            continue
+        p = dict(n.payload or {})
+        p["channel"] = n.channel
+        ordered.append((n.channel, p))
+
+    results = await _batch_publish(ordered)
+
+    if mark_published:
+        now_iso = _utc_now_iso()
+        for (channel, _payload), result in zip(ordered, results):
+            if not result.success:
+                continue
+            opportunity_id = _payload.get("opportunity_id")
+            if not opportunity_id:
+                continue
+            opp = await session.get(Opportunity, opportunity_id)
+            if opp is None:
+                continue
+            cp = dict(opp.channel_published or {})
+            cp[channel] = now_iso
+            opp.channel_published = cp
+            opp.content_status = "published"
+        await session.commit()
+
+    return {
+        "requested": len(raw_ids),
+        "results": [r.as_dict() for r in results],
+        "marked_published_count": sum(
+            1 for r in results if r.success
+        ),
+    }
+
+
+def _slugify(text: str) -> str:
+    """ASCII-ish slug for export filenames. Falls back to ``"opp"`` when
+    the input has no usable characters (e.g. all Chinese — we keep the
+    CJK characters as-is so the operator can still recognise them in
+    Finder)."""
+    import re as _re
+
+    cleaned = _re.sub(r"\s+", "-", text.strip())
+    cleaned = _re.sub(r"[^0-9A-Za-z一-鿿\-_]", "", cleaned)
+    return cleaned[:60].strip("-")
 
 
 def _utc_now_iso() -> str:

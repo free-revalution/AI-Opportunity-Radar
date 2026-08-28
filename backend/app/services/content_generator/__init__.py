@@ -52,17 +52,25 @@ from app.services.content_generator.base import (
     get_registry,
     register,
 )
+from app.services.content_generator.daily_report import DailyReportGenerator
 from app.services.content_generator.service import (
     ContentGeneratorService,
     GenerationResult,
 )
+from app.services.content_generator.wechat_article import WechatArticleGenerator
+from app.services.content_generator.xiaohongshu_post import XiaohongshuPostGenerator
+from app.services.content_generator.xianyu_product import XianyuProductGenerator
 
 __all__ = [
     "ContentGenerator",
     "ContentRegistry",
     "GeneratedContent",
     "ContentGeneratorService",
+    "DailyReportGenerator",
     "GenerationResult",
+    "WechatArticleGenerator",
+    "XiaohongshuPostGenerator",
+    "XianyuProductGenerator",
     "get_registry",
     "register",
 ]

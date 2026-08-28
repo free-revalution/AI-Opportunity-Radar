@@ -169,6 +169,16 @@ class Opportunity(Base):
         String(32), default="unqualified", nullable=False, index=True
     )
 
+    # Phase 8 (v2.0) — per-channel publish tracking. JSON map:
+    #   {"wechat_article": "2026-08-28T12:34:56+00:00",
+    #    "xianyu":         "2026-08-28T12:35:01+00:00"}
+    # Drives the Content Center's per-channel ✓ / ○ badges so the
+    # operator can see "wechat 已发, xianyu 还没发" without losing the
+    # `content_status` high-water mark (which flips to `published` the
+    # moment ANY channel is marked). Missing keys = not yet published
+    # on that channel.
+    channel_published: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
     status: Mapped[str] = mapped_column(String(32), default="detected", nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

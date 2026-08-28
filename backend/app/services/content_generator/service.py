@@ -224,8 +224,13 @@ class ContentGeneratorService:
         *,
         limit: int = 5,
         only_qualified: bool = True,
+        generators: Iterable[str] | None = None,
     ) -> GenerationResult:
-        """Pick the top `limit` opportunities and run every generator."""
+        """Pick the top `limit` opportunities and run every generator.
+
+        `generators` lets the caller restrict which named generators
+        run (e.g. only `wechat_article`). None = every registered one.
+        """
         from app.models import Opportunity, ResearchReport  # local import
 
         stmt = select(Opportunity).order_by(Opportunity.total_score.desc())
@@ -250,7 +255,9 @@ class ContentGeneratorService:
             ).scalars().first()
 
             try:
-                produced = await self.run_for_opportunity(opp, report=report)
+                produced = await self.run_for_opportunity(
+                    opp, report=report, generators=generators
+                )
             except ExternalServiceError as exc:
                 result.errors.append(
                     {
@@ -263,8 +270,19 @@ class ContentGeneratorService:
             result.enriched_opportunity_ids.append(opp.id)
         return result
 
-    async def run_for_ids(self, opportunity_ids: list[int]) -> GenerationResult:
-        """Run all generators on a specific set of opportunity IDs."""
+    async def run_for_ids(
+        self,
+        opportunity_ids: list[int],
+        *,
+        generators: Iterable[str] | None = None,
+    ) -> GenerationResult:
+        """Run all (or a subset of) generators on a specific set of
+        opportunity IDs.
+
+        `generators` mirrors `run_for_top_opportunities` — same None =
+        all behaviour. The two methods now share the same surface so
+        callers (n8n cron, /content/regenerate, /content/generate) don't
+        have to remember which one supports subset filtering."""
         from app.models import Opportunity, ResearchReport  # local import
 
         result = GenerationResult()
@@ -284,7 +302,9 @@ class ContentGeneratorService:
                 )
             ).scalars().first()
             try:
-                produced = await self.run_for_opportunity(opp, report=report)
+                produced = await self.run_for_opportunity(
+                    opp, report=report, generators=generators
+                )
             except ExternalServiceError as exc:
                 result.errors.append(
                     {"opportunity_id": opp_id, "error": str(exc)}
