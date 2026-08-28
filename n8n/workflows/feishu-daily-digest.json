@@ -46,7 +46,7 @@
     "Cron (daily 02:30 UTC, after discovery)": {
       "main": [
         [
-          { "node": "Send Feishu digest", "type": "main", "index": 0 }
+          { "node": "Send Feishu digest (Phase 6 unified endpoint)", "type": "main", "index": 0 }
         ]
       ]
     }

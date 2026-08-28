@@ -73,12 +73,21 @@ def test_workflow_cron_triggers_have_a_cron_expression(path: Path) -> None:
             continue
         params = node.get("parameters", {})
         # n8n 0.x used `rule.cronExpression`; n8n 1.x uses
-        # `triggerTimes.item[].expression` with `mode: cronExpression`.
-        # We accept both shapes — the new one is what we shipped.
+        # `triggerTimes.item[].expression` with `mode: cronExpression`;
+        # n8n 1.2+ also supports `rule.interval[].expression`. We accept
+        # all three — whichever n8n shipped.
         cron: str | None = None
         rule = params.get("rule", {})
         if isinstance(rule, dict):
             cron = rule.get("cronExpression")
+            if not cron:
+                # rule.interval[].{field, expression} (n8n 1.2+)
+                for item in rule.get("interval") or []:
+                    if isinstance(item, dict) and isinstance(
+                        item.get("expression"), str
+                    ):
+                        cron = item["expression"]
+                        break
         if not cron:
             for item in params.get("triggerTimes", {}).get("item", []):
                 if (

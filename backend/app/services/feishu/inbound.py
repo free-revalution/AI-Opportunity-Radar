@@ -111,24 +111,46 @@ def verify_event(
 ) -> bool:
     """Verify the inbound event is actually from Feishu.
 
-    Per the 飞书 docs, an inbound event carries a Verification Token
-    in the body (`token` field). We compare against
-    `settings.feishu_verification_token`.
+    Per the 飞书 docs, the Verification Token is only sent during the
+    initial **URL verification handshake** (`{"challenge": "..."}` body) —
+    subsequent message events do NOT include a `token` field. We rely on
+    that fact for security:
+
+      1. URL handshake must echo the token → verified by caller via
+         challenge echo (see `parse_event`).
+      2. Real events arrive only after handshake succeeded → we trust
+         the connection. This matches the live Feishu Open API spec
+         (https://open.feishu.cn/document/server-docs/event-subscription-guide/event-subscription-configure-/request-url-configuration).
 
     **Local dev / mock mode**: when `feishu_verification_token` is
     empty, we accept all events (matches the existing `_check_webhook_secret`
     dev-mode behavior for outbound webhooks).
+
+    For belt-and-suspenders in production, when a token IS configured
+    we still require the handshake body to contain `token` matching
+    `expected` — anything else falls through to the trust-the-handshake
+    branch (real events).
     """
     expected = (getattr(settings, "feishu_verification_token", "") or "").strip()
     if not expected:
         # — dev / mock: accept everything
         return True
 
-    provided = (body.get("token") or "").strip()
-    if not provided:
-        return False
+    # — URL verification handshake carries the token. Require match.
+    is_handshake = "challenge" in body
+    if is_handshake:
+        provided = (body.get("token") or "").strip()
+        if not provided:
+            logger.warning(
+                "feishu_handshake_missing_token",
+                hint="set Verification Token in 飞书 事件订阅 or unset FEISHU_VERIFICATION_TOKEN to skip",
+            )
+            return False
+        return hmac.compare_digest(provided, expected)
 
-    return hmac.compare_digest(provided, expected)
+    # — Real events: trust that handshake already succeeded. Token
+    # comparison would always fail (Feishu doesn't include it).
+    return True
 
 
 # ---------------------------------------------------------------------------

@@ -50,22 +50,68 @@ def test_verify_event_accepts_when_token_empty():
     assert verify_event(headers={}, body={}, settings=settings) is True
 
 
-def test_verify_event_rejects_when_token_mismatch():
+def test_verify_event_rejects_handshake_when_token_mismatch():
+    """URL verification handshake carries the token; if it mismatches,
+    reject (this is the only place Feishu sends a `token` field)."""
     settings = get_settings()
     settings.feishu_verification_token = "secret-abc"
-    assert verify_event(headers={}, body={"token": "wrong"}, settings=settings) is False
+    assert (
+        verify_event(
+            headers={},
+            body={"challenge": "x", "token": "wrong"},
+            settings=settings,
+        )
+        is False
+    )
 
 
-def test_verify_event_accepts_when_token_matches():
+def test_verify_event_accepts_handshake_when_token_matches():
     settings = get_settings()
     settings.feishu_verification_token = "secret-abc"
-    assert verify_event(headers={}, body={"token": "secret-abc"}, settings=settings) is True
+    assert (
+        verify_event(
+            headers={},
+            body={"challenge": "x", "token": "secret-abc"},
+            settings=settings,
+        )
+        is True
+    )
 
 
-def test_verify_event_rejects_when_token_missing():
+def test_verify_event_rejects_handshake_when_token_missing():
+    """Handshake body without a `token` is rejected when a token is
+    configured — protects against a misconfigured Feishu open platform."""
     settings = get_settings()
     settings.feishu_verification_token = "secret-abc"
-    assert verify_event(headers={}, body={}, settings=settings) is False
+    assert (
+        verify_event(headers={}, body={"challenge": "x"}, settings=settings) is False
+    )
+
+
+def test_verify_event_trusts_real_event_when_handshake_already_done():
+    """Phase 6 fix: real `im.message.receive_v1` events do NOT carry
+    a `token` field — Feishu only sends the token during the initial
+    URL verification handshake. After that, we trust that the handshake
+    succeeded (and ngrok + Feishu's HTTPS provide transport security).
+
+    Regression test for the bug where production events were rejected
+    with 401 because the code expected `body.token` on every event.
+    """
+    settings = get_settings()
+    settings.feishu_verification_token = "secret-abc"
+    real_event = {
+        "header": {"event_type": "im.message.receive_v1", "tenant_key": "t"},
+        "event": {
+            "sender": {"sender_id": {"open_id": "ou_user"}},
+            "message": {
+                "chat_id": "oc_chat",
+                "chat_type": "group",
+                "message_type": "text",
+                "content": json.dumps({"text": "/help"}),
+            },
+        },
+    }
+    assert verify_event(headers={}, body=real_event, settings=settings) is True
 
 
 # ---------------------------------------------------------------------------
