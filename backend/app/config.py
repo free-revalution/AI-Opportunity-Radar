@@ -192,11 +192,23 @@ class Settings(BaseSettings):
     backup_container_name: str = "radar-postgres"
     backup_output_dir: str = "./backups"
 
+    # ---------- Admin API (Phase 13B) ----------
+    # Feishu open_ids that may call admin endpoints via `X-Feishu-Open-Id`.
+    # Comma-separated env var. Empty list = no Feishu admins allowed.
+    admin_open_ids: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # Shared secret for `X-Radar-Admin-Secret` header. Empty = disabled
+    # (admin endpoints reject all callers in that case, regardless of the
+    # Feishu list). Generated default keeps tests / dev workable.
+    admin_api_secret: str = ""
+    # Max rows any admin list endpoint returns per request. Default 200.
+    admin_max_list_limit: int = 200
+
     # ---------- Validators ----------
     @field_validator(
         "cors_allow_origins",
         "enabled_sources",
         "notification_fallback_channels",
+        "admin_open_ids",
         mode="before",
     )
     @classmethod

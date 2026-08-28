@@ -1,23 +1,27 @@
-"""Vertical Agent registry — Phase 12F.
+"""Vertical Agent registry — Phase 12F + Phase 13A.
 
 Per docs/下一阶段开发技术方案.md §15:
 
 > agents/
 >   base.py        — VerticalAgent protocol
->   content.py     — ContentRadarAgent (first vertical)
->   registry.py    — name → VerticalAgent
+>   content.py     — HeuristicContentRadarAgent (baseline, no LLM)
+>   llm_content.py — LLMContentRadarAgent (Phase 13A, LLM-backed)
+>   registry.py    — name → VerticalAgent + build_llm_content_agent factory
 
 The registry is intentionally tiny — process-local, no DB, no async
-quirks. Phase 13 will add the LLM-backed ContentRadarAgent on top of
-the same registry.
+quirks. ``build_llm_content_agent()`` is the public factory for
+constructing an LLM-backed agent with explicit dependencies; the
+returned instance is **not** registered globally (callers can swap the
+default via ``reset()`` then ``register(...)`` in tests).
 """
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Any, Iterable, Optional
 
 from .base import VerticalAgent
 from .content import HeuristicContentRadarAgent
+from .llm_content import LLMContentRadarAgent
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +57,7 @@ _registry = _Registry()
 
 # Default registrations — import-time so callers can `get()` immediately.
 _registry.register(HeuristicContentRadarAgent())
+_registry.register(LLMContentRadarAgent())  # provider=None → always falls back
 
 
 def register(agent: VerticalAgent) -> None:
@@ -84,10 +89,47 @@ def reset() -> None:
     """Used by tests — clears all registrations, then re-installs defaults."""
     _registry.reset()
     _registry.register(HeuristicContentRadarAgent())
+    _registry.register(LLMContentRadarAgent())
+
+
+def build_llm_content_agent(
+    *,
+    provider: Optional[Any] = None,
+    compliance_service: Optional[Any] = None,
+    model: Optional[str] = None,
+    max_tokens: int = 1024,
+    temperature: float = 0.2,
+) -> LLMContentRadarAgent:
+    """Construct an LLM-backed Content Radar with explicit dependencies.
+
+    Parameters
+    ----------
+    provider:
+        An ``LLMProvider`` instance. When ``None``, ``analyze()`` falls
+        back to the heuristic agent.
+    compliance_service:
+        Optional ``ComplianceService`` instance — when provided the LLM
+        output is gated; if BLOCKED, the agent falls back.
+    model, max_tokens, temperature:
+        Forwarded to ``provider.complete_json()``.
+
+    Returns a fresh ``LLMContentRadarAgent`` instance — does **not**
+    register it in the global registry. Callers that want to swap the
+    default ``"llm_content"`` registration can do so via
+    ``reset()`` then ``register(...)`` in tests.
+    """
+    return LLMContentRadarAgent(
+        provider=provider,
+        compliance_service=compliance_service,
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
 
 
 __all__ = [
     "agents",
+    "build_llm_content_agent",
     "get_agent",
     "names",
     "register",

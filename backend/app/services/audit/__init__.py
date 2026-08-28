@@ -205,6 +205,56 @@ class AuditService:
     def clear(self) -> None:
         self._buffer.clear()
 
+    # ----- DB persistence --------------------------------------------------
+    async def record_db(
+        self,
+        session: Any,
+        actor_type: str,
+        action: str,
+        *,
+        actor_id: Optional[str] = None,
+        resource_type: Optional[str] = None,
+        resource_id: Optional[str] = None,
+        result: str = AuditResult.SUCCESS.value,
+        metadata: Optional[dict[str, Any]] = None,
+        commit: bool = True,
+    ) -> "AuditEntry":
+        """Persist one row + append to the in-memory buffer.
+
+        Returns the entry that was written. ``commit=False`` lets the
+        caller fold the audit row into a larger transaction (e.g.
+        revoking an activation code and writing the audit row together).
+        """
+        from app.models import AuditLog  # local import to avoid cycle
+
+        row = AuditLog(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            result=result,
+            metadata_json=metadata or {},
+        )
+        session.add(row)
+        if commit:
+            await session.commit()
+            await session.refresh(row)
+        entry = AuditEntry(
+            actor_type=actor_type,
+            action=action,
+            actor_id=actor_id,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            result=result,
+            metadata=metadata,
+            created_at=getattr(row, "created_at", None) or datetime.now(tz=timezone.utc),
+        )
+        self._buffer.append(entry)
+        if len(self._buffer) > self.max_buffer:
+            self._buffer.popleft()
+        return entry
+
 
 # ---------------------------------------------------------------------------
 # Module-level singleton — mirrors the ComplianceService pattern.
@@ -220,9 +270,36 @@ def default_service() -> AuditService:
 
 
 def reset_default_service() -> AuditService:
+    """Reset the singleton (used by tests that need a fresh buffer)."""
     global _default_service
     _default_service = AuditService()
     return _default_service
+
+
+# ---------------------------------------------------------------------------
+# Convenience — module-level helper used by API layers.
+# ---------------------------------------------------------------------------
+def record_audit(
+    actor_type: str,
+    action: str,
+    *,
+    actor_id: Optional[str] = None,
+    resource_type: Optional[str] = None,
+    resource_id: Optional[str] = None,
+    result: str = AuditResult.SUCCESS.value,
+    metadata_json: Optional[dict[str, Any]] = None,
+) -> AuditEntry:
+    """Synchronous in-memory record. For DB persistence use
+    ``AuditService.record_db(session, ...)`` from inside an endpoint."""
+    return default_service().record(
+        actor_type=actor_type,
+        action=action,
+        actor_id=actor_id,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        result=result,
+        metadata=metadata_json,
+    )
 
 
 __all__ = [
@@ -232,5 +309,6 @@ __all__ = [
     "AuditResult",
     "AuditService",
     "default_service",
+    "record_audit",
     "reset_default_service",
 ]
