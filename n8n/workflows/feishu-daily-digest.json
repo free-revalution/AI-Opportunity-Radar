@@ -4,13 +4,9 @@
   "nodes": [
     {
       "parameters": {
-        "triggerTimes": {
-          "item": [
-            {
-              "mode": "cronExpression",
-              "expression": "30 2 * * *",
-              "timezone": "UTC"
-            }
+        "rule": {
+          "interval": [
+            { "field": "cronExpression", "expression": "30 2 * * *" }
           ]
         }
       },
@@ -23,7 +19,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "={{$env.API_BASE_URL_INTERNAL}}/api/internal/feishu/digest/send",
+        "url": "={{$env.API_BASE_URL_INTERNAL}}/api/internal/notifications/digest/send",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -33,14 +29,14 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={\"limit\": 5, \"only_qualified\": true, \"window_hours\": 24, \"auto_generate_content\": false, \"title_prefix\": \"AI 机会雷达日报\"}",
+        "jsonBody": "={\"channel\": \"feishu\", \"max_entries\": 5, \"min_score\": 0}",
         "options": {
           "timeout": 300000,
           "retry": { "maxTries": 2, "waitBetweenTries": 5000 }
         }
       },
       "id": "step-feishu-send",
-      "name": "Send Feishu digest",
+      "name": "Send Feishu digest (Phase 6 unified endpoint)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [520, 300]
