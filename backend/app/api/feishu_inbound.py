@@ -205,6 +205,10 @@ async def handle_feishu_event(request: Request) -> dict[str, Any]:
             bitable_digest_client=bitable_digest_client,
             bitable_ops_client=bitable_ops_client,
         )
+        # Phase 14A — commands like `/activate` need the sender's Open
+        # ID. The router accepts it via a transient attribute so the
+        # command AST itself stays pure-data.
+        router_instance._sender_open_id = event.sender_open_id
         reply = await router_instance.route(command)
     except Exception as exc:  # noqa: BLE001 — log + ack so Feishu doesn't retry.
         logger.error(

@@ -258,6 +258,9 @@ def can_transition(current: str, target: str) -> bool:
 
 
 __all__ = [
+    "ConsolidationResult",
+    "DEFAULT_TITLE_JACCARD_THRESHOLD",
+    "DEFAULT_TITLE_LOOKBACK_DAYS",
     "SignalBand",
     "SignalScoreInputs",
     "SignalScoreResult",
@@ -266,6 +269,26 @@ __all__ = [
     "band_for_score",
     "can_transition",
     "compute_signal_score",
+    "consolidate_raw_item",
     "evidence_from_source_count",
     "freshness_from_age",
+    "jaccard",
+    "normalize_title",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Phase 14B — signal consolidation (multi-source attach).
+# Eager-imported: the consolidator pulls SQLAlchemy + ORM models, but those
+# are already loaded by the time any caller imports this module.
+# ---------------------------------------------------------------------------
+from app.services.signals import consolidator as _consolidator  # noqa: E402
+
+# Re-bind the public names so `from app.services.signals import X` works
+# without callers having to know about the submodule.
+ConsolidationResult = _consolidator.ConsolidationResult
+DEFAULT_TITLE_JACCARD_THRESHOLD = _consolidator.DEFAULT_TITLE_JACCARD_THRESHOLD
+DEFAULT_TITLE_LOOKBACK_DAYS = _consolidator.DEFAULT_TITLE_LOOKBACK_DAYS
+consolidate_raw_item = _consolidator.consolidate_raw_item
+jaccard = _consolidator.jaccard
+normalize_title = _consolidator.normalize_title

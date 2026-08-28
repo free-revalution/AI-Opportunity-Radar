@@ -218,3 +218,21 @@ __all__ = [
     "redeem_code",
     "validate_format",
 ]
+
+
+# Re-export the Phase 14A flow surface so callers can `from app.services.activation import redeem_for_user`.
+from app.services.activation.flow import (  # noqa: E402
+    RedemptionResult,
+    RedemptionStatus,
+    plan_display_zh,
+    redeem_for_user,
+    user_message,
+)
+
+__all__ += [
+    "RedemptionResult",
+    "RedemptionStatus",
+    "plan_display_zh",
+    "redeem_for_user",
+    "user_message",
+]

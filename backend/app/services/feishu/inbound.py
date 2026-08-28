@@ -255,6 +255,7 @@ class BotCommand:
         "daily",
         "report",
         "table",
+        "activate",
         "unknown",
     ]
     args: str = ""
@@ -279,6 +280,9 @@ _COMMAND_ALK: dict[str, str] = {
     "/文档": "report",          # 中文 alias
     "/table": "table",
     "/表格": "table",
+    # — Phase 14A — activation code redemption
+    "/activate": "activate",
+    "/激活": "activate",
 }
 
 
@@ -450,6 +454,9 @@ class FeishuCommandRouter:
 
         if command.kind == "table":
             return await self._table(command.args)
+
+        if command.kind == "activate":
+            return await self._activate(command.args)
 
         return _unknown_reply(command.args)
 
@@ -746,6 +753,52 @@ class FeishuCommandRouter:
                 "command": "table",
                 "inserted": inserted,
                 "table_url": table_url,
+            },
+        )
+
+    async def _activate(self, args: str) -> CommandReply:
+        """`/activate <code>` — bind an Activation Code to this Feishu user.
+
+        Phase 14A — Xianyu-to-Feishu last-mile. Wraps
+        ``app.services.activation.redeem_for_user()`` so the bot never
+        needs to know about hash schemes, status flips, or Subscription
+        row creation. Always returns a Chinese reply — even on bad input
+        — so the user never sees a traceback.
+        """
+        from app.services.activation import redeem_for_user
+
+        # We need the sender's Feishu Open ID. The router doesn't carry it
+        # directly — callers must stash it on the router before invoking
+        # route(). Falls back to None which causes INVALID_FORMAT.
+        sender_open_id = getattr(self, "_sender_open_id", None)
+
+        code = (args or "").strip()
+        if not code:
+            return CommandReply(
+                text="用法:`/activate <激活码>`\n例如:`/activate ABCD-EFGH-JKLM`",
+                metadata={"command": "activate", "error": "missing_code"},
+            )
+
+        # Self-callback to /api/admin-style endpoint would be too heavy
+        # here — talk to the DB directly via the same engine the app uses.
+        from app.db import get_sessionmaker
+
+        sessionmaker = get_sessionmaker()
+        async with sessionmaker() as session:
+            result = await redeem_for_user(
+                session,
+                code=code,
+                feishu_open_id=sender_open_id or "",
+            )
+
+        return CommandReply(
+            text=result.user_message,
+            metadata={
+                "command": "activate",
+                "status": result.status.value,
+                "success": result.success,
+                "plan": result.plan,
+                "code_id": result.code_id,
             },
         )
 
