@@ -427,8 +427,24 @@ def _clear_settings_cache():
 
 @pytest.fixture
 def feishu_client(monkeypatch):
-    """A FastAPI TestClient with internal-api calls stubbed."""
+    """A FastAPI TestClient with internal-api + Feishu App API calls stubbed."""
     app = create_app()
+
+    sent_app_messages: list[dict[str, object]] = []
+
+    class _StubAppClient:
+        """Captures outbound Feishu App API calls without hitting the network."""
+
+        is_configured = True
+
+        async def send_message(self, *, chat_id, msg_type, content):
+            sent_app_messages.append(
+                {"chat_id": chat_id, "msg_type": msg_type, "content": content}
+            )
+            return {"code": 0, "msg": "ok", "data": {"message_id": "om_stub"}}
+
+        async def aclose(self):
+            return None
 
     def handler(request: httpx.Request) -> httpx.Response:
         if "/api/opportunities" in request.url.path:
@@ -452,7 +468,18 @@ def feishu_client(monkeypatch):
         "app.services.feishu.inbound.FeishuCommandRouter.__init__",
         patched_init,
     )
-    return TestClient(app)
+    # — Inject the stub FeishuAppClient so the endpoint actually sends.
+    monkeypatch.setattr(
+        "app.api.feishu_inbound.FeishuAppClient",
+        lambda **kwargs: _StubAppClient(),
+    )
+
+    test_client = TestClient(app)
+    # — Expose the capture list on the *module* (TestClient objects
+    # don't allow dynamic attributes) so individual tests can inspect
+    # what was sent via `request.node.module._sent_app_messages`.
+    test_client._sent_app_messages = sent_app_messages  # type: ignore[attr-defined]
+    return test_client
 
 
 def test_feishu_endpoint_handles_url_verification_challenge(feishu_client):
@@ -502,9 +529,14 @@ def test_feishu_endpoint_routes_today_command(feishu_client):
     )
     assert response.status_code == 200
     payload = response.json()
-    assert payload["code"] == 0
-    assert payload["data"]["command"] == "today"
-    assert "card" in payload["data"]["reply"]
+    assert payload == {"code": 0, "msg": "ok"}
+    # — Endpoint must have actively sent the reply via Feishu App API
+    # (not echoed in the response body — Feishu callbacks don't work that way).
+    sent = feishu_client._sent_app_messages  # type: ignore[attr-defined]
+    assert len(sent) == 1
+    assert sent[0]["chat_id"] == "oc_chat"
+    assert sent[0]["msg_type"] == "interactive"
+    assert "elements" in sent[0]["content"]
 
 
 def test_feishu_endpoint_acks_non_command_text(feishu_client):

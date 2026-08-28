@@ -15,6 +15,10 @@ Three Feishu variants we accept:
 Authentication uses the Verification Token in the body
 (`settings.feishu_verification_token`). When unset, the endpoint is
 open (matches the existing internal webhook dev-mode behavior).
+
+Replying to the user requires actively calling Feishu's App open API
+(`/im/v1/messages`) — the event callback's response body itself does
+not cause a message to be sent. See `FeishuAppClient`.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, status
 
 from app.config import get_settings
+from app.services.feishu.app_client import FeishuAppClient, FeishuAppError
 from app.services.feishu.inbound import (
     CommandReply,
     FeishuCommandRouter,
@@ -182,15 +187,27 @@ async def handle_feishu_event(request: Request) -> dict[str, Any]:
         metadata=reply.metadata,
     )
 
+    # — 4. Send the reply via Feishu's App API. The event callback
+    # response body does NOT itself cause a message to be sent —
+    # we have to call /im/v1/messages explicitly. Failures here
+    # are logged but we still return 200 so Feishu doesn't retry.
     card_payload = _feishu_card(reply)
-    return {
-        "code": 0,
-        "msg": "ok",
-        "data": {
-            "command": command.kind,
-            "reply": card_payload,
-        },
-    }
+    try:
+        app_client = FeishuAppClient(settings=settings)
+        await app_client.send_message(
+            chat_id=event.chat_id,
+            msg_type=card_payload["msg_type"],
+            content=card_payload["card"],
+        )
+    except FeishuAppError as exc:
+        logger.error(
+            "feishu_reply_send_failed",
+            command=command.kind,
+            chat_id=event.chat_id,
+            error=str(exc),
+        )
+
+    return {"code": 0, "msg": "ok"}
 
 
 __all__ = ["router"]
