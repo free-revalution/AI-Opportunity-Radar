@@ -394,23 +394,39 @@ async def cancel_research_job(
 
 
 # ---------------------------------------------------------------------------
-# Phase 8 — Telegram Notifications
+# Phase 8 / Phase 6 — Notifications (channel-agnostic)
 # ---------------------------------------------------------------------------
-def _build_notification_service(session: AsyncSession) -> NotificationService:
-    """Inject the mock provider by default — tests + local dev.
+def _build_notification_service(
+    session: AsyncSession, *, channel: str | None = None
+) -> NotificationService:
+    """Build a `NotificationService` for the requested channel.
 
-    Production callers should set `TELEGRAM_BOT_TOKEN` /
-    `TELEGRAM_CHAT_ID` and `MOCK_EXTERNAL_SERVICES=false` so the real
-    httpx provider is selected by the factory.
+    When `channel` is omitted, picks the settings default (Feishu per
+    Phase 6 product decision; Telegram remains the configured fallback
+    via `NOTIFICATION_FALLBACK_CHANNELS`).
+
+    The mock provider is injected by default under
+    `MOCK_EXTERNAL_SERVICES=true` so tests + local dev work offline.
     """
     settings = get_settings()
     if getattr(settings, "mock_external_services", False):
-        from app.services.notification.mock_telegram import MockTelegramProvider
+        # — Build a channel-specific mock adapter. Tests for Feishu
+        # inject the Feishu mock; tests for Telegram inject the Telegram
+        # mock. We pick based on the requested channel.
+        if (channel or "").lower() == "feishu":
+            from app.services.bots.feishu_adapter import FeishuBotAdapter
+            from app.services.feishu.mock_client import MockFeishuProvider
 
+            provider = FeishuBotAdapter(MockFeishuProvider())
+        else:
+            from app.services.bots.telegram_adapter import TelegramBotAdapter
+            from app.services.notification.mock_telegram import MockTelegramProvider
+
+            provider = TelegramBotAdapter(MockTelegramProvider())
         return NotificationService(
-            session, settings=settings, provider=MockTelegramProvider()
+            session, settings=settings, provider=provider, channel=channel
         )
-    return NotificationService(session, settings=settings)
+    return NotificationService(session, settings=settings, channel=channel)
 
 
 @router.post(
@@ -465,6 +481,8 @@ async def send_digest(
     Body (all optional):
         {
           "chat_id": "12345",
+          "channel": "feishu" | "telegram",  # Phase 6 — defaults to
+                                               # settings.notification_default_channel
           "dry_run": false,
           "max_entries": 5,
           "per_entry_summary_chars": 240,
@@ -473,6 +491,7 @@ async def send_digest(
     """
     body = body or {}
     chat_id = body.get("chat_id")
+    channel = body.get("channel")
     dry_run = bool(body.get("dry_run", False))
     max_entries = int(body.get("max_entries") or 5)
     per_entry_summary_chars = int(body.get("per_entry_summary_chars") or 240)
@@ -485,7 +504,7 @@ async def send_digest(
             detail=f"invalid min_score: {exc}",
         ) from exc
 
-    service = _build_notification_service(session)
+    service = _build_notification_service(session, channel=channel)
     summary = await record_pipeline_run(
         "notifications",
         lambda: service.send_digest(
@@ -496,7 +515,11 @@ async def send_digest(
             min_score=min_score_f,
         ),
     )
-    logger.info("notifications_digest_dispatched", **summary.as_dict())
+    logger.info(
+        "notifications_digest_dispatched",
+        requested_channel=service.channel,
+        **summary.as_dict(),
+    )
     return summary.as_dict()
 
 
@@ -648,6 +671,15 @@ async def send_feishu_digest(
     _secret: None = Depends(_check_webhook_secret),
 ) -> dict[str, Any]:
     """Phase 2 (v2.0) — push the top opportunities to a Feishu group.
+
+    **Phase 6 note**: this endpoint remains for the *auto content
+    generation* path (Phase 3 `content_generator` + Phase 2 Feishu
+    card formatter) that n8n cron triggers. For plain digest sends
+    without auto-generation, prefer
+    `POST /api/internal/notifications/digest/send` with
+    `{"channel": "feishu"}` — it shares the same `BotProvider`
+    abstraction as Telegram. The two will be consolidated when n8n
+    is migrated to call the unified endpoint.
 
     Body (all optional):
         {

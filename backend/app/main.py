@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app import __version__
 from app.api.health import router as health_router
+from app.api.feishu_inbound import router as feishu_inbound_router
 from app.api.internal import router as internal_router
 from app.api.metrics import router as metrics_router
 from app.api.notifications import router as notifications_router
@@ -89,6 +90,10 @@ def create_app() -> FastAPI:
     app.include_router(trends_router, prefix="/api", tags=["trends"])
     app.include_router(metrics_router, prefix="/api", tags=["metrics"])
     app.include_router(internal_router, prefix="/api/internal", tags=["internal"])
+    # Phase 6 v2.0: Feishu event-subscription callback (inbound bot commands).
+    # Mounted at `/api/feishu/event` — uses Feishu's own Verification Token,
+    # NOT the shared `X-Radar-Webhook` (that's for outbound internal calls).
+    app.include_router(feishu_inbound_router, prefix="/api/feishu", tags=["feishu"])
 
     return app
 

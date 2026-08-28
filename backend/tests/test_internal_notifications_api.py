@@ -278,3 +278,36 @@ async def test_history_with_no_rows_is_empty(client):
     body = response.json()
     assert body["count"] == 0
     assert body["items"] == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — channel param on /notifications/digest/send
+# ---------------------------------------------------------------------------
+async def test_digest_send_with_channel_feishu_uses_feishu_provider(client):
+    """`POST /api/internal/notifications/digest/send` with `channel="feishu"`
+    builds a Feishu mock + adapter under MOCK_EXTERNAL_SERVICES=true and
+    persists `Notification.channel == "feishu"`.
+    """
+    await _seed_opportunity(
+        client.sessionmaker,
+        title="AI Sales Coach",
+        slug="ai-sales-coach",
+        total_score=82.0,
+    )
+    response = client.post(
+        "/api/internal/notifications/digest/send",
+        json={"channel": "feishu", "chat_id": "feishu-target"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["notifications_delivered"] == 1
+    assert body["notifications_failed"] == 0
+
+    async with client.sessionmaker() as session:
+        rows = (
+            await session.execute(select(Notification))
+        ).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].channel == "feishu"
+    assert rows[0].delivered_at is not None
+    assert rows[0].payload.get("kind") == "digest"

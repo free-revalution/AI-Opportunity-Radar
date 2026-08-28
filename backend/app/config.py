@@ -116,6 +116,23 @@ class Settings(BaseSettings):
     feishu_webhook_secret: str = ""
     feishu_timeout: float = 15.0
 
+    # ---------- Feishu App (Phase 6 v2.0 — inbound event subscription) ----------
+    # These come from a 飞书开放平台 机器人 App — see 使用手册 §五之七.
+    # Without them, the inbound `/api/feishu/event` endpoint accepts
+    # events unverified (local dev only).
+    feishu_app_id: str = ""
+    feishu_app_secret: str = ""
+    feishu_verification_token: str = ""
+    feishu_encrypt_key: str = ""
+
+    # ---------- Bot channel selection (Phase 6 v2.0) ----------
+    # Primary channel used by `NotificationService` + n8n daily digests.
+    # Phase 6 product decision: Feishu first (国内可达 + 知识库 + 权限);
+    # Telegram becomes the fallback channel.
+    notification_default_channel: Literal["telegram", "feishu"] = "feishu"
+    # Ordered list of fallback channels tried when the primary send fails.
+    notification_fallback_channels: list[str] = Field(default_factory=lambda: ["telegram"])
+
     # ---------- n8n ----------
     n8n_base_url: str = "http://localhost:5678"
     n8n_api_key: str = ""

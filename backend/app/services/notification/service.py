@@ -1,8 +1,20 @@
-"""Notification service — Phase 8.
+"""Notification service — Phase 8 / Phase 6.
 
 Builds the daily digest + per-opportunity alerts from the database,
-hands the formatted MarkdownV2 text to the `TelegramProvider`, and
-records the outcome in the `notifications` table.
+hands the formatted MarkdownV2 text to a `BotProvider` (Phase 6
+abstraction over Telegram + Feishu), and records the outcome in the
+`notifications` table.
+
+Phase 6 changes:
+
+  * `provider` is now typed `BotProvider` (was `TelegramProvider`).
+  * `CHANNEL` is no longer hard-coded — it's read from
+    `provider.channel` so the same code path works for any platform.
+  * `_dispatch` calls `BotProvider.send(target, BotMessage(...))`
+    instead of `TelegramProvider.send_message(...)`.
+  * `send_via_fallback(...)` walks a list of channels, building each
+    on demand, so a Feishu-down scenario still reaches operators
+    via Telegram.
 
 Failure policy mirrors the rest of the codebase: a single failed send
 MUST NOT poison the batch. Each call persists its own `Notification`
@@ -25,16 +37,17 @@ from app.config import Settings, get_settings
 from app.metrics import record_notification
 from app.models import Notification, Opportunity, ResearchReport
 from app.repositories import OpportunityRepository
+from app.services.bots import (
+    BotMessage,
+    BotProvider,
+    BotSendResult,
+    build_bot_provider,
+)
 from app.services.notification.formatting import (
     DigestEntry,
     assert_markdown_v2_safe,
     format_digest,
     format_opportunity_alert,
-)
-from app.services.notification.telegram import (
-    TelegramProvider,
-    TelegramSendResult,
-    build_telegram_provider,
 )
 from app.utils import get_logger
 
@@ -56,6 +69,9 @@ class NotificationOutcome:
     provider: str
     error: str | None = None
     message_id: str | None = None
+    # When sent via `FallbackBotProvider`, the actual provider that
+    # delivered (may differ from the configured one). Empty otherwise.
+    delivered_by: str = ""
 
 
 @dataclass(slots=True)
@@ -67,6 +83,8 @@ class DigestSendSummary:
     notifications_failed: int = 0
     chat_id: str | None = None
     text_chars: int = 0
+    channel: str = ""  # — Phase 6: which channel was used
+    provider: str = ""  # — Phase 6: which provider actually shipped
     errors: list[str] = field(default_factory=list)
     preview: str | None = None
 
@@ -78,21 +96,36 @@ class DigestSendSummary:
 # Service
 # ---------------------------------------------------------------------------
 class NotificationService:
-    """Phase 8 orchestrator."""
+    """Phase 8 orchestrator (channel-agnostic since Phase 6)."""
 
-    CHANNEL = "telegram"
+    # — backwards-compat constant for callers that import it; mirrors
+    # `provider.channel` at construction time. Kept as a class-level
+    # default so legacy tests that don't inject a provider see "telegram".
+    DEFAULT_CHANNEL = "telegram"
 
     def __init__(
         self,
         session: AsyncSession,
         *,
         settings: Settings | None = None,
-        provider: TelegramProvider | None = None,
+        provider: BotProvider | None = None,
         base_url: str | None = None,
+        channel: str | None = None,
     ) -> None:
         self.session = session
         self.settings = settings or get_settings()
-        self.provider = provider or build_telegram_provider(self.settings)
+        # — Phase 6: factory picks the channel-specific BotProvider.
+        # When `channel` is supplied, that channel wins regardless of the
+        # settings default — used by `send_via_fallback` and by the
+        # `/api/internal/notifications/digest/send?channel=...` endpoint.
+        self.provider: BotProvider = provider or build_bot_provider(
+            self.settings, channel=channel
+        )
+        # — the active channel — taken from the provider unless explicitly
+        # overridden (rare; mostly for testing).
+        self.channel: str = (
+            channel or self.provider.channel or self.DEFAULT_CHANNEL
+        )
         # Default base URL — UI deep-links live here.
         self.base_url = (base_url or self.settings.app_base_url or "").rstrip("/")
 
@@ -214,7 +247,7 @@ class NotificationService:
             )
             return NotificationOutcome(
                 notification_id=None,
-                channel=self.CHANNEL,
+                channel=self.channel,
                 chat_id="",
                 delivered=False,
                 text_chars=0,
@@ -226,7 +259,7 @@ class NotificationService:
         if entry is None:
             return NotificationOutcome(
                 notification_id=None,
-                channel=self.CHANNEL,
+                channel=self.channel,
                 chat_id=target_chat,
                 delivered=False,
                 text_chars=0,
@@ -244,7 +277,7 @@ class NotificationService:
         if dry_run:
             return NotificationOutcome(
                 notification_id=None,
-                channel=self.CHANNEL,
+                channel=self.channel,
                 chat_id=target_chat,
                 delivered=False,
                 text_chars=len(text),
@@ -381,20 +414,20 @@ class NotificationService:
         text: str,
         payload: dict[str, Any],
     ) -> NotificationOutcome:
-        result: TelegramSendResult = await self.provider.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode="MarkdownV2",
+        result: BotSendResult = await self.provider.send(
+            target=chat_id,
+            message=BotMessage(text=text, parse_mode="MarkdownV2"),
         )
 
         notification = Notification(
-            channel=self.CHANNEL,
+            channel=self.channel,
             payload={
                 **payload,
                 "chat_id": chat_id,
                 "text_chars": len(text or ""),
                 "provider": result.provider,
                 "message_id": result.message_id,
+                "delivered_by": result.delivered_by or "",
             },
             delivered_at=datetime.now(UTC) if result.ok else None,
             error=None if result.ok else (result.error or "unknown error")[:2000],
@@ -408,6 +441,8 @@ class NotificationService:
             chat_id=chat_id,
             ok=result.ok,
             provider=result.provider,
+            delivered_by=result.delivered_by or "",
+            channel=self.channel,
             text_chars=len(text or ""),
             notification_id=notification.id,
             kind=payload.get("kind"),
@@ -420,14 +455,107 @@ class NotificationService:
 
         return NotificationOutcome(
             notification_id=notification.id,
-            channel=self.CHANNEL,
+            channel=self.channel,
             chat_id=chat_id,
             delivered=result.ok,
             text_chars=len(text or ""),
             provider=result.provider,
             message_id=result.message_id,
             error=result.error,
+            delivered_by=result.delivered_by or "",
         )
+
+    # ------------------------------------------------------------------
+    # public API — channel-aware send (Phase 6)
+    # ------------------------------------------------------------------
+    async def send_digest_to_channel(
+        self,
+        channel: str,
+        *,
+        chat_id: str | None = None,
+        max_entries: int = 5,
+        per_entry_summary_chars: int = 240,
+        min_score: float | None = None,
+    ) -> DigestSendSummary:
+        """Send the digest via a specific channel (telegram / feishu).
+
+        Builds a fresh `NotificationService` bound to that channel so the
+        `_dispatch` row records `channel=<channel>`. Returns the same
+        `DigestSendSummary` shape as `send_digest`.
+        """
+        target_service = NotificationService(
+            self.session,
+            settings=self.settings,
+            channel=channel,
+            base_url=self.base_url,
+        )
+        summary = await target_service.send_digest(
+            chat_id=chat_id,
+            max_entries=max_entries,
+            per_entry_summary_chars=per_entry_summary_chars,
+            min_score=min_score,
+        )
+        # — annotate the summary with the channel we used so the API can
+        # echo it back to the caller without inspecting Notification rows.
+        summary.channel = target_service.channel
+        if summary.errors and not summary.provider:
+            # — single-channel failure path: surface the provider name
+            # from the most recent error context if available
+            pass
+        return summary
+
+    async def send_via_fallback(
+        self,
+        channels: list[str],
+        *,
+        chat_id: str | None = None,
+        max_entries: int = 5,
+        per_entry_summary_chars: int = 240,
+        min_score: float | None = None,
+    ) -> DigestSendSummary:
+        """Try each channel in order; stop at the first successful send.
+
+        Each attempt persists its own `Notification` row (with the
+        attempted channel) so the audit trail shows the failure chain.
+        Returns a `DigestSendSummary` aggregating the outcomes.
+        """
+        all_errors: list[str] = []
+        for idx, channel in enumerate(channels):
+            target_service = NotificationService(
+                self.session,
+                settings=self.settings,
+                channel=channel,
+                base_url=self.base_url,
+            )
+            try:
+                summary = await target_service.send_digest(
+                    chat_id=chat_id,
+                    max_entries=max_entries,
+                    per_entry_summary_chars=per_entry_summary_chars,
+                    min_score=min_score,
+                )
+            except Exception as exc:  # noqa: BLE001 — translate to summary error
+                all_errors.append(f"{channel}: unexpected {type(exc).__name__}: {exc}")
+                continue
+            if summary.notifications_delivered > 0:
+                # — success: augment summary with the channel that worked
+                summary.channel = channel
+                summary.errors = all_errors + list(summary.errors)
+                return summary
+            # — this channel delivered zero notifications; try the next
+            all_errors.append(
+                f"{channel}: no deliveries"
+                + (f" ({'; '.join(summary.errors)})" if summary.errors else "")
+            )
+        # — all channels failed
+        summary = DigestSendSummary(
+            notifications_attempted=len(channels),
+            notifications_delivered=0,
+            notifications_failed=len(channels),
+            chat_id=chat_id,
+            errors=all_errors,
+        )
+        return summary
 
     # ------------------------------------------------------------------
     # internals — helpers

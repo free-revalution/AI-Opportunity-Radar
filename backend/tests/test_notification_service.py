@@ -1,8 +1,9 @@
 """End-to-end tests for the Phase 8 NotificationService.
 
-Uses MockTelegramProvider to verify the full pipeline:
+Uses MockTelegramProvider (wrapped in TelegramBotAdapter since Phase 6)
+to verify the full pipeline:
 
-  opportunities → digest text → Telegram send → Notification row
+  opportunities → digest text → BotProvider.send → Notification row
 
 Failure paths (no chat_id, missing opportunity, provider failure) are
 covered too — the service MUST persist the error, not raise.
@@ -14,6 +15,8 @@ import pytest
 from sqlalchemy import select
 
 from app.models import Notification, Opportunity, ResearchReport, Source
+from app.services.bots import FeishuBotAdapter, TelegramBotAdapter
+from app.services.feishu.mock_client import MockFeishuProvider
 from app.services.notification import (
     DigestEntry,
     MockTelegramProvider,
@@ -91,7 +94,7 @@ async def test_build_digest_preview_returns_text(sqlite_session, settings):
     )
     settings.app_base_url = "https://radar.example.com"
     service = NotificationService(
-        sqlite_session, settings=settings, provider=MockTelegramProvider()
+        sqlite_session, settings=settings, provider=TelegramBotAdapter(MockTelegramProvider())
     )
     preview = await service.build_digest_preview()
     assert preview["text_chars"] > 0
@@ -116,7 +119,7 @@ async def test_build_digest_preview_filters_by_min_score(sqlite_session, setting
     )
     settings.app_base_url = "https://radar.example.com"
     service = NotificationService(
-        sqlite_session, settings=settings, provider=MockTelegramProvider()
+        sqlite_session, settings=settings, provider=TelegramBotAdapter(MockTelegramProvider())
     )
     preview = await service.build_digest_preview(min_score=70.0)
     slugs = [e["slug"] for e in preview["entries"]]
@@ -135,7 +138,7 @@ async def test_build_digest_preview_caps_max_entries(sqlite_session, settings):
         )
     settings.app_base_url = "https://radar.example.com"
     service = NotificationService(
-        sqlite_session, settings=settings, provider=MockTelegramProvider()
+        sqlite_session, settings=settings, provider=TelegramBotAdapter(MockTelegramProvider())
     )
     preview = await service.build_digest_preview(max_entries=2)
     assert len(preview["entries"]) == 2
@@ -155,7 +158,7 @@ async def test_send_digest_dry_run_records_no_message(sqlite_session, settings):
     )
     settings.app_base_url = "https://radar.example.com"
     settings.telegram_chat_id = "123"
-    provider = MockTelegramProvider()
+    provider = TelegramBotAdapter(MockTelegramProvider())
     service = NotificationService(
         sqlite_session, settings=settings, provider=provider
     )
@@ -178,7 +181,7 @@ async def test_send_digest_dispatches_and_persists_notification(
     )
     settings.app_base_url = "https://radar.example.com"
     settings.telegram_chat_id = "chat-1"
-    provider = MockTelegramProvider()
+    provider = TelegramBotAdapter(MockTelegramProvider())
     service = NotificationService(
         sqlite_session, settings=settings, provider=provider
     )
@@ -210,7 +213,7 @@ async def test_send_digest_records_failure(sqlite_session, settings):
     )
     settings.app_base_url = "https://radar.example.com"
     settings.telegram_chat_id = "chat-1"
-    provider = MockTelegramProvider(should_fail=True)
+    provider = TelegramBotAdapter(MockTelegramProvider(should_fail=True))
     service = NotificationService(
         sqlite_session, settings=settings, provider=provider
     )
@@ -230,7 +233,7 @@ async def test_send_digest_records_failure(sqlite_session, settings):
 async def test_send_digest_without_chat_id_returns_noop(sqlite_session, settings):
     settings.telegram_chat_id = ""
     service = NotificationService(
-        sqlite_session, settings=settings, provider=MockTelegramProvider()
+        sqlite_session, settings=settings, provider=TelegramBotAdapter(MockTelegramProvider())
     )
     summary = await service.send_digest()
     assert summary.notifications_attempted == 0
@@ -250,7 +253,7 @@ async def test_opportunity_preview_returns_text(sqlite_session, settings):
     )
     settings.app_base_url = "https://radar.example.com"
     service = NotificationService(
-        sqlite_session, settings=settings, provider=MockTelegramProvider()
+        sqlite_session, settings=settings, provider=TelegramBotAdapter(MockTelegramProvider())
     )
     preview = await service.build_opportunity_preview(opp.id)
     assert preview["entry"]["slug"] == "ai-sales-coach"
@@ -261,7 +264,7 @@ async def test_opportunity_preview_unknown_returns_lookup_error(
     sqlite_session, settings
 ):
     service = NotificationService(
-        sqlite_session, settings=settings, provider=MockTelegramProvider()
+        sqlite_session, settings=settings, provider=TelegramBotAdapter(MockTelegramProvider())
     )
     with pytest.raises(LookupError):
         await service.build_opportunity_preview(424242)
@@ -277,7 +280,7 @@ async def test_send_opportunity_alert_dispatches(sqlite_session, settings):
     )
     settings.app_base_url = "https://radar.example.com"
     settings.telegram_chat_id = "chat-1"
-    provider = MockTelegramProvider()
+    provider = TelegramBotAdapter(MockTelegramProvider())
     service = NotificationService(
         sqlite_session, settings=settings, provider=provider
     )
@@ -296,7 +299,7 @@ async def test_send_opportunity_alert_dispatches(sqlite_session, settings):
 async def test_send_opportunity_alert_unknown_opportunity(sqlite_session, settings):
     settings.telegram_chat_id = "chat-1"
     service = NotificationService(
-        sqlite_session, settings=settings, provider=MockTelegramProvider()
+        sqlite_session, settings=settings, provider=TelegramBotAdapter(MockTelegramProvider())
     )
     outcome = await service.send_opportunity_alert(424242)
     assert outcome.delivered is False
@@ -315,7 +318,7 @@ async def test_send_opportunity_alert_without_chat_returns_noop(
     )
     settings.telegram_chat_id = ""
     service = NotificationService(
-        sqlite_session, settings=settings, provider=MockTelegramProvider()
+        sqlite_session, settings=settings, provider=TelegramBotAdapter(MockTelegramProvider())
     )
     outcome = await service.send_opportunity_alert(opp.id)
     assert outcome.delivered is False
@@ -335,7 +338,7 @@ async def test_list_history_returns_recent_rows(sqlite_session, settings):
     )
     settings.app_base_url = "https://radar.example.com"
     settings.telegram_chat_id = "chat-1"
-    provider = MockTelegramProvider()
+    provider = TelegramBotAdapter(MockTelegramProvider())
     service = NotificationService(
         sqlite_session, settings=settings, provider=provider
     )
@@ -360,7 +363,7 @@ async def test_service_preview_matches_formatter(sqlite_session, settings):
     )
     settings.app_base_url = "https://radar.example.com"
     service = NotificationService(
-        sqlite_session, settings=settings, provider=MockTelegramProvider()
+        sqlite_session, settings=settings, provider=TelegramBotAdapter(MockTelegramProvider())
     )
     preview = await service.build_digest_preview()
     entry = DigestEntry(
@@ -385,3 +388,80 @@ async def test_service_preview_matches_formatter(sqlite_session, settings):
         entries=[entry], base_url="https://radar.example.com"
     )
     assert manual == preview["text"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — Feishu channel + FallbackBotProvider coverage
+# ---------------------------------------------------------------------------
+async def test_send_digest_via_feishu_channel_persists_channel_feishu(
+    sqlite_session, settings
+):
+    """When the provider is a `FeishuBotAdapter`, the persisted
+    `Notification.channel` is `feishu` (Phase 6 channel-agnostic refactor).
+    """
+    await _seed_opportunity(
+        sqlite_session,
+        title="AI Sales Coach",
+        slug="ai-sales-coach",
+        total_score=82.0,
+        recommendation_target="recommend",
+    )
+    settings.app_base_url = "https://radar.example.com"
+    # — chat_id is read from settings.telegram_chat_id as a unified
+    # target id; for Feishu (single-webhook custom robot), `target` is
+    # ignored but the field must be non-empty to proceed past the
+    # no-chat-id guard.
+    settings.telegram_chat_id = "feishu-any-target"
+    provider = FeishuBotAdapter(MockFeishuProvider())
+    service = NotificationService(
+        sqlite_session, settings=settings, provider=provider, channel="feishu"
+    )
+    summary = await service.send_digest()
+    assert summary.notifications_delivered == 1
+    assert summary.notifications_failed == 0
+
+    rows = (
+        await sqlite_session.execute(select(Notification).order_by(Notification.id.desc()))
+    ).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].channel == "feishu"
+    assert rows[0].delivered_at is not None
+    assert rows[0].error is None
+    # — payload records the underlying provider's name.
+    assert rows[0].payload.get("provider") == "mock-feishu"
+
+
+async def test_send_digest_via_fallback_falls_over_to_telegram_when_feishu_fails(
+    sqlite_session, settings
+):
+    """Feishu fails → fallback Telegram delivers the digest."""
+    from app.services.bots import FallbackBotProvider
+
+    await _seed_opportunity(
+        sqlite_session,
+        title="AI Sales Coach",
+        slug="ai-sales-coach",
+        total_score=82.0,
+        recommendation_target="recommend",
+    )
+    settings.app_base_url = "https://radar.example.com"
+    settings.telegram_chat_id = "chat-1"
+    primary = FeishuBotAdapter(MockFeishuProvider(should_fail=True))
+    secondary = TelegramBotAdapter(MockTelegramProvider())
+    provider = FallbackBotProvider(primary=primary, secondary=secondary)
+    service = NotificationService(
+        sqlite_session, settings=settings, provider=provider, channel="feishu"
+    )
+    summary = await service.send_digest()
+    assert summary.notifications_delivered == 1
+    assert summary.notifications_failed == 0
+    # — Telegram mock recorded exactly one send.
+    assert len(secondary.telegram_provider.sent) == 1
+    # — Notification row attributes to the fallback channel (primary's
+    # channel), with delivered_by recording the actual provider.
+    rows = (
+        await sqlite_session.execute(select(Notification).order_by(Notification.id.desc()))
+    ).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].channel == "feishu"
+    assert rows[0].payload.get("delivered_by") == "telegram-adapter"
