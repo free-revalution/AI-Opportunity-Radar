@@ -253,6 +253,8 @@ class BotCommand:
         "refresh",
         "score",
         "daily",
+        "report",
+        "table",
         "unknown",
     ]
     args: str = ""
@@ -271,6 +273,12 @@ _COMMAND_ALK: dict[str, str] = {
     "/重评": "score",
     "/daily": "daily",
     "/日报": "daily",
+    # — Phase 7 v2.0 — content ecosystem
+    "/report": "report",
+    "/doc": "report",          # alias
+    "/文档": "report",          # 中文 alias
+    "/table": "table",
+    "/表格": "table",
 }
 
 
@@ -317,6 +325,9 @@ class FeishuCommandRouter:
       `/refresh`  → POST /api/internal/discovery/run
       `/score`    → POST /api/internal/scoring/run
       `/daily`    → POST /api/internal/notifications/digest/send
+      `/report`   → GET /api/internal/research/on_demand/{id}
+                    + Drive Docx import (Phase 7)
+      `/table`    → GET /api/opportunities + Bitable bulk insert (Phase 7)
 
     The webhook secret is read from `APP_SECRET_KEY` / `RADAR_WEBHOOK_SECRET`
     — the same one used by n8n cron workflows.
@@ -330,6 +341,9 @@ class FeishuCommandRouter:
         settings: Settings | None = None,
         http_client: Optional[httpx.AsyncClient] = None,
         base_url: Optional[str] = None,
+        drive_client: Optional[Any] = None,
+        bitable_digest_client: Optional[Any] = None,
+        bitable_ops_client: Optional[Any] = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.webhook_secret = (
@@ -360,6 +374,15 @@ class FeishuCommandRouter:
         )
         # — owned by caller; if None, create a one-shot per call.
         self._http = http_client
+
+        # — Phase 7 v2.0: Feishu Drive / Bitable clients. Used by
+        # `/report`, `/doc`, `/table`, and the auto-Docx-on-`/research`
+        # hook. Optional so existing call sites (and unit tests that
+        # don't exercise content paths) can keep instantiating the
+        # router without supplying them.
+        self._drive = drive_client
+        self._bitable_digest = bitable_digest_client
+        self._bitable_ops = bitable_ops_client
 
     def _headers(self) -> dict[str, str]:
         h = {"Content-Type": "application/json"}
@@ -421,6 +444,12 @@ class FeishuCommandRouter:
 
         if command.kind == "daily":
             return await self._daily()
+
+        if command.kind == "report":
+            return await self._report(command.args)
+
+        if command.kind == "table":
+            return await self._table(command.args)
 
         return _unknown_reply(command.args)
 
@@ -484,13 +513,61 @@ class FeishuCommandRouter:
             )
         job_id = result.get("job_id")
         url = f"{self.public_base_url}/on-demand"
+
+        # — Phase 7 v2.0: auto-create Docx once the report finishes.
+        # The /api/internal/research/on_demand endpoint is synchronous
+        # (returns after the report is rendered), so we can poll for
+        # completion inline. Failures here are logged but never
+        # supersede the Web link — the chat reply always has at least
+        # the URL fallback.
+        doc_line = ""
+        if job_id is not None and self._drive is not None and self._drive.is_configured:
+            doc_line = await self._maybe_create_docx_for_job(int(job_id), topic)
+
+        text = (
+            f"✅ 已生成研究任务 #{job_id} · 主题:`{topic}`\n"
+            f"[在 Web 上查看完整报告]({url})"
+        )
+        if doc_line:
+            text = f"{text}\n{doc_line}"
         return CommandReply(
-            text=(
-                f"✅ 已生成研究任务 #{job_id} · 主题:`{topic}`\n"
-                f"[在 Web 上查看完整报告]({url})"
-            ),
+            text=text,
             metadata={"command": "research", "job_id": job_id, "topic": topic},
         )
+
+    async def _maybe_create_docx_for_job(
+        self, job_id: int, topic: str
+    ) -> str:
+        """Best-effort: fetch a finished on-demand report and push to Drive.
+
+        Returns the markdown link line to append to the chat reply, or
+        `""` on any failure (we never let Docx issues break the main
+        reply).
+        """
+        from app.services.feishu.content_client import FeishuContentError
+
+        detail = await self._get(f"/api/internal/research/on_demand/{job_id}")
+        if detail.get("_status", 200) >= 400 or detail.get("status") != "completed":
+            return ""
+        report_payload = detail.get("report") or {}
+        if not report_payload:
+            return ""
+        markdown = _render_report_markdown(detail, report_payload)
+        try:
+            result = await self._drive.create_docx_from_markdown(  # type: ignore[union-attr]
+                title=f"研究报告 #{job_id} · {topic}",
+                markdown=markdown,
+            )
+            doc_url = result.get("url") or ""
+            if doc_url:
+                return f"📄 [飞书云文档已生成]({doc_url})"
+        except FeishuContentError as exc:
+            logger.warning(
+                "feishu_research_docx_failed",
+                job_id=job_id,
+                error=str(exc),
+            )
+        return ""
 
     async def _refresh(self) -> CommandReply:
         # — fires off discovery. Long-running; the endpoint just queues.
@@ -515,9 +592,145 @@ class FeishuCommandRouter:
             "/api/internal/notifications/digest/send",
             {},
         )
+        # — Phase 7 v2.0: also sync Top-10 to the daily-digest Bitable.
+        # Failure here is non-fatal — chat push is the primary channel.
+        table_line = ""
+        if (
+            self._bitable_digest is not None
+            and self._bitable_digest.is_configured is False  # may auto-create
+        ):
+            pass  # is_configured may be False initially but ensure_app handles it
+        if self._bitable_digest is not None:
+            try:
+                top10 = await self._get("/api/opportunities?limit=10")
+                items = top10.get("items") if isinstance(top10, dict) else None
+                if items:
+                    inserted = await self._bitable_digest.bulk_insert_opportunities(  # type: ignore[union-attr]
+                        items=items,
+                        base_url_for_links=self.public_base_url,
+                    )
+                    app_token, _ = await self._bitable_digest.ensure_table()  # type: ignore[union-attr]
+                    table_url = self._bitable_digest.public_url(app_token=app_token)
+                    if table_url:
+                        table_line = (
+                            f"📊 已同步今日 Top {inserted} 条至多维表格\n"
+                            f"[在 Bitable 中查看]({table_url})"
+                        )
+            except Exception as exc:  # noqa: BLE001 — non-fatal
+                logger.warning(
+                    "feishu_daily_bitable_sync_failed",
+                    error=str(exc),
+                )
+
+        text = "📬 已触发日报推送(主通道 → 降级通道)。"
+        if table_line:
+            text = f"{text}\n{table_line}"
         return CommandReply(
-            text="📬 已触发日报推送(主通道 → 降级通道)。",
+            text=text,
             metadata={"command": "daily", "result": str(result)[:500]},
+        )
+
+    async def _report(self, args: str) -> CommandReply:
+        """`/report <job_id>` — push a finished research report to Docx.
+
+        Distinct from the auto-Docx path in `_research`: this is the
+        explicit "retroactively push job #N" command, useful when the
+        user wants to share a report they generated earlier.
+        """
+        from app.services.feishu.content_client import FeishuContentError
+
+        job_id_str = args.strip()
+        if not job_id_str.isdigit():
+            return CommandReply(
+                text="用法:`/report <job_id>`\n例如:`/report 5`"
+            )
+        if self._drive is None or not self._drive.is_configured:
+            return CommandReply(
+                text="❌ 飞书云文档未配置(FEISHU_DRIVE_ROOT_FOLDER_TOKEN 为空)。"
+            )
+        job_id = int(job_id_str)
+        detail = await self._get(f"/api/internal/research/on_demand/{job_id}")
+        status_code = detail.get("_status", 200)
+        if status_code >= 400:
+            return CommandReply(
+                text=f"❌ 任务 #{job_id} 状态异常:HTTP {status_code}。"
+            )
+        if detail.get("status") != "completed":
+            return CommandReply(
+                text=f"⏳ 任务 #{job_id} 当前状态 `{detail.get('status')}`,尚未完成。"
+            )
+        report_payload = detail.get("report") or {}
+        if not report_payload:
+            return CommandReply(
+                text=f"❌ 任务 #{job_id} 没有可推送的报告内容。"
+            )
+        markdown = _render_report_markdown(detail, report_payload)
+        topic = detail.get("seed_topic") or detail.get("opportunity_title") or ""
+        try:
+            created = await self._drive.create_docx_from_markdown(  # type: ignore[union-attr]
+                title=f"研究报告 #{job_id} · {topic}" if topic else f"研究报告 #{job_id}",
+                markdown=markdown,
+            )
+        except FeishuContentError as exc:
+            return CommandReply(
+                text=f"❌ 文档创建失败:{exc}",
+                metadata={"command": "report", "job_id": job_id, "error": str(exc)},
+            )
+        return CommandReply(
+            text=(
+                f"📄 报告 #{job_id} 已推送至飞书云文档\n"
+                f"[打开]({created.get('url', '')})"
+            ),
+            metadata={
+                "command": "report",
+                "job_id": job_id,
+                "doc_id": created.get("doc_id"),
+                "doc_url": created.get("url"),
+            },
+        )
+
+    async def _table(self, args: str) -> CommandReply:
+        """`/table` — sync the full opportunity list to a Bitable app."""
+        from app.services.feishu.content_client import FeishuContentError
+
+        _ = args
+        if self._bitable_ops is None:
+            return CommandReply(
+                text="❌ Opportunities 多维表格客户端未初始化。"
+            )
+        if not self._bitable_ops.is_configured:
+            # is_configured only flips True once ensure_app writes the
+            # token back into settings. Try ensure_app once to surface
+            # a clean error message on auto-create failure.
+            pass
+        data = await self._get("/api/opportunities?limit=200")
+        items = data.get("items") if isinstance(data, dict) else None
+        if not items:
+            return CommandReply(
+                text="📭 数据库里没有可同步的机会。先跑 `/refresh` + `/score` 抓一些数据。"
+            )
+        try:
+            inserted = await self._bitable_ops.bulk_insert_opportunities(  # type: ignore[union-attr]
+                items=items,
+                base_url_for_links=self.public_base_url,
+            )
+            app_token, _ = await self._bitable_ops.ensure_table()  # type: ignore[union-attr]
+            table_url = self._bitable_ops.public_url(app_token=app_token)
+        except FeishuContentError as exc:
+            return CommandReply(
+                text=f"❌ 多维表格同步失败:{exc}",
+                metadata={"command": "table", "error": str(exc)},
+            )
+        text = f"📊 已同步 {inserted} 条机会到多维表格"
+        if table_url:
+            text = f"{text}\n[在 Bitable 中查看]({table_url})"
+        return CommandReply(
+            text=text,
+            metadata={
+                "command": "table",
+                "inserted": inserted,
+                "table_url": table_url,
+            },
         )
 
 
@@ -534,11 +747,81 @@ def _help_reply() -> CommandReply:
         "/research <主题> — 按需生成研究报告(¥299 场景)",
         "/refresh — 触发数据抓取",
         "/score — 触发重新评分",
-        "/daily — 触发日报推送",
+        "/daily — 触发日报推送(同时同步 Top 10 到多维表格)",
+        "/report <job_id> — 将已完成的研究报告推送至飞书云文档",
+        "/doc <job_id> — /report 的别名",
+        "/table — 手动同步机会表到多维表格",
         "",
         "更多能力见 Web 端 /dashboard",
     ]
     return CommandReply(text="\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Markdown rendering for /report + /research → Docx
+# ---------------------------------------------------------------------------
+_REPORT_SECTIONS: list[tuple[str, str]] = [
+    ("executive_summary", "执行摘要"),
+    ("market_analysis", "市场分析"),
+    ("competition_analysis", "竞争分析"),
+    ("china_analysis", "中国市场分析"),
+    ("monetization_analysis", "盈利模式"),
+    ("mvp_analysis", "MVP 分析"),
+    ("risk_analysis", "风险评估"),
+]
+
+
+def _render_report_markdown(
+    detail: dict[str, Any], report: dict[str, Any]
+) -> str:
+    """Render a finished on-demand research report as Markdown.
+
+    Feeds Feishu's `drive/v1/import_tasks` `file.content` (after
+    base64). Layout follows the 7-section schema from
+    `ResearchReport` (see `app/models.py`), plus a recommendation /
+    confidence headline and a sources section.
+    """
+    title = detail.get("opportunity_title") or detail.get("seed_topic") or "研究报告"
+    recommendation = (
+        report.get("recommendation")
+        or detail.get("recommendation")
+        or ""
+    ).strip() or "(无建议)"
+    try:
+        confidence_pct = f"{float(report.get('confidence') or detail.get('confidence') or 0):.0%}"
+    except (TypeError, ValueError):
+        confidence_pct = "n/a"
+    sources = report.get("sources") or []
+
+    lines: list[str] = [
+        f"# {title}",
+        "",
+        f"_推荐: **{recommendation}** · 置信度: {confidence_pct}_",
+        "",
+    ]
+    for key, label in _REPORT_SECTIONS:
+        body = (report.get(key) or "").strip()
+        if not body:
+            continue
+        lines.append(f"## {label}")
+        lines.append("")
+        lines.append(body)
+        lines.append("")
+
+    if sources:
+        lines.append("## 来源")
+        lines.append("")
+        for src in sources[:20]:
+            if isinstance(src, dict):
+                src_title = src.get("title") or src.get("url") or "(来源)"
+                src_url = src.get("url") or ""
+                if src_url:
+                    lines.append(f"- [{src_title}]({src_url})")
+                else:
+                    lines.append(f"- {src_title}")
+            else:
+                lines.append(f"- {src}")
+    return "\n".join(lines).strip() + "\n"
 
 
 def _unknown_reply(text: str) -> CommandReply:

@@ -128,6 +128,16 @@ class FeishuAppClient:
             return self._token
         return await self._fetch_token()
 
+    async def get_token(self) -> str:
+        """Public alias for `_get_token`.
+
+        Sibling clients (Drive/Bitable in `content_client.py`) call this
+        to share the same token cache instead of each maintaining their
+        own. Exposed publicly so router / helper layers don't reach into
+        a `_private` method.
+        """
+        return await self._get_token()
+
     # ------------------------------------------------------------------
     # Send message
     # ------------------------------------------------------------------

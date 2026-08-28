@@ -131,6 +131,23 @@ class Settings(BaseSettings):
     feishu_verification_token: str = ""
     feishu_encrypt_key: str = ""
 
+    # ---------- Feishu content ecosystem (Phase 7 v2.0 — Docx + Bitable) ----------
+    # Drive — target folder for `/research` and `/report` Docx creation.
+    # Find in Feishu drive:  open the folder, the URL ends with the token
+    #   https://<tenant>.feishu.cn/drive/folder/<token>
+    # Leave empty to silently skip Docx creation (commands still reply
+    # to the chat with their existing text content).
+    feishu_drive_root_folder_token: str = ""
+
+    # Bitable — daily-digest table for `/daily`. When empty, the first
+    # invocation auto-creates the app and logs the new `app_token` so
+    # operators can persist it back here for cross-restart reuse.
+    feishu_bitable_app_token: str = ""
+
+    # Bitable — opportunities table for `/table` (separate from digest).
+    # Same auto-create behaviour as the digest table.
+    feishu_bitable_opportunities_app_token: str = ""
+
     # ---------- Bot channel selection (Phase 6 v2.0) ----------
     # Primary channel used by `NotificationService` + n8n daily digests.
     # Phase 6 product decision: Feishu first (国内可达 + 知识库 + 权限);

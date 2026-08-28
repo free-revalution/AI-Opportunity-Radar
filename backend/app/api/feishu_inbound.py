@@ -29,6 +29,10 @@ from fastapi import APIRouter, HTTPException, Request, status
 
 from app.config import get_settings
 from app.services.feishu.app_client import FeishuAppClient, FeishuAppError
+from app.services.feishu.content_client import (
+    FeishuBitableClient,
+    FeishuDriveClient,
+)
 from app.services.feishu.inbound import (
     CommandReply,
     FeishuCommandRouter,
@@ -82,6 +86,29 @@ def _feishu_card(reply: CommandReply) -> dict[str, Any]:
             },
         },
     }
+
+
+def _build_content_clients(
+    settings: Any,
+    app_client: FeishuAppClient,
+) -> tuple[FeishuDriveClient, FeishuBitableClient, FeishuBitableClient]:
+    """Construct the three Phase 7 content clients sharing `app_client`'s
+    token cache.
+    """
+    drive = FeishuDriveClient(app_client=app_client, settings=settings)
+    bitable_digest = FeishuBitableClient(
+        app_client=app_client,
+        settings=settings,
+        token_setting="feishu_bitable_app_token",
+        table_name="Daily Digest",
+    )
+    bitable_ops = FeishuBitableClient(
+        app_client=app_client,
+        settings=settings,
+        token_setting="feishu_bitable_opportunities_app_token",
+        table_name="Opportunities",
+    )
+    return drive, bitable_digest, bitable_ops
 
 
 # ---------------------------------------------------------------------------
@@ -164,9 +191,20 @@ async def handle_feishu_event(request: Request) -> dict[str, Any]:
         # — Ack without a reply. Feishu will only retry on non-200.
         return {"code": 0, "msg": "ok"}
 
-    command = parse_command(event.text)
-    router_instance = FeishuCommandRouter(settings=settings)
+    # — Single `FeishuAppClient` instance per request so all Phase 7
+    # sibling clients (Drive + Bitable) share its token cache.
+    app_client = FeishuAppClient(settings=settings)
+    drive_client, bitable_digest_client, bitable_ops_client = _build_content_clients(
+        settings=settings, app_client=app_client
+    )
     try:
+        command = parse_command(event.text)
+        router_instance = FeishuCommandRouter(
+            settings=settings,
+            drive_client=drive_client,
+            bitable_digest_client=bitable_digest_client,
+            bitable_ops_client=bitable_ops_client,
+        )
         reply = await router_instance.route(command)
     except Exception as exc:  # noqa: BLE001 — log + ack so Feishu doesn't retry.
         logger.error(
@@ -178,6 +216,8 @@ async def handle_feishu_event(request: Request) -> dict[str, Any]:
         # — Still ack so Feishu doesn't retry the same message; the
         # operator sees the failure in logs + Prometheus metrics.
         return {"code": 0, "msg": "ok"}
+    finally:
+        await app_client.aclose()
 
     logger.info(
         "feishu_command_routed",
@@ -193,7 +233,6 @@ async def handle_feishu_event(request: Request) -> dict[str, Any]:
     # are logged but we still return 200 so Feishu doesn't retry.
     card_payload = _feishu_card(reply)
     try:
-        app_client = FeishuAppClient(settings=settings)
         await app_client.send_message(
             chat_id=event.chat_id,
             msg_type=card_payload["msg_type"],
