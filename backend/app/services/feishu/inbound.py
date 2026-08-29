@@ -256,6 +256,8 @@ class BotCommand:
         "report",
         "table",
         "activate",
+        "search",
+        "preferences",
         "unknown",
     ]
     args: str = ""
@@ -283,6 +285,11 @@ _COMMAND_ALK: dict[str, str] = {
     # — Phase 14A — activation code redemption
     "/activate": "activate",
     "/激活": "activate",
+    # — Phase 15C — search stub + user preferences
+    "/search": "search",
+    "/搜索": "search",
+    "/preferences": "preferences",
+    "/偏好": "preferences",
 }
 
 
@@ -304,6 +311,74 @@ def parse_command(text: str) -> BotCommand:
     if kind is None:
         return BotCommand(kind="unknown", args=text)
     return BotCommand(kind=kind, args=tail.strip())
+
+
+# ---------------------------------------------------------------------------
+# Paywall helpers (Phase 15C v2.0)
+# ---------------------------------------------------------------------------
+# Imported lazily inside the functions below to keep import-time graph
+# small — ``paywall`` pulls SQLAlchemy + models and we don't want the
+# router module to require all of that at import.
+def _command_quota_type(kind: str) -> Optional[str]:
+    """Return the quota feature for ``kind`` (or ``None`` to bypass)."""
+    from app.services.subscriptions.paywall import command_to_feature
+
+    return command_to_feature(kind)
+
+
+async def _paywall_check(*, command: "BotCommand", redis_client: Any, sender_open_id: Optional[str]) -> Any:
+    """Open a DB session, run ``check_access``, return the verdict.
+
+    Lazy-imports ``app.services.subscriptions.paywall`` and
+    ``app.db.get_sessionmaker`` so the router module stays import-clean
+    in tests that never call ``route()``.
+    """
+    from app.db import get_sessionmaker
+    from app.services.subscriptions.paywall import check_access
+
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        return await check_access(
+            session,
+            sender_open_id or "",
+            command.kind,
+            redis_client=redis_client,
+        )
+
+
+async def _paywall_record(
+    *,
+    redis_client: Any,
+    sender_open_id: Optional[str],
+    quota_type: str,
+) -> None:
+    """Increment the per-day counter after a successful handler run."""
+    from app.services.subscriptions.paywall import record_consumption
+
+    if not sender_open_id:
+        # Anonymous — nothing to attribute the counter to.
+        return
+    await record_consumption(
+        redis_client,
+        sender_open_id,
+        quota_type,
+    )
+
+
+def _paywall_deny_reply(verdict: Any) -> CommandReply:
+    """Build the ``CommandReply`` for a paywall denial."""
+    return CommandReply(
+        text=verdict.deny_message_zh,
+        metadata={
+            "command": verdict.quota_type,
+            "denied": True,
+            "plan": verdict.plan,
+            "quota_type": verdict.quota_type,
+            "quota_used": verdict.quota_used,
+            "quota_limit": verdict.quota_limit,
+            "reason": verdict.deny_reason,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +423,7 @@ class FeishuCommandRouter:
         drive_client: Optional[Any] = None,
         bitable_digest_client: Optional[Any] = None,
         bitable_ops_client: Optional[Any] = None,
+        redis_client: Optional[Any] = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.webhook_secret = (
@@ -388,6 +464,13 @@ class FeishuCommandRouter:
         self._bitable_digest = bitable_digest_client
         self._bitable_ops = bitable_ops_client
 
+        # — Phase 15C v2.0: Redis client used for paywall quota counters
+        # and activation rate-limit guards. ``None`` means Redis is
+        # unreachable → quota / rate-limit checks fall open (warn-logged).
+        # The caller (FeishuEventHandler) is responsible for passing the
+        # singleton from ``app.services.redis_client.get_redis()``.
+        self._redis = redis_client
+
     def _headers(self) -> dict[str, str]:
         h = {"Content-Type": "application/json"}
         if self.webhook_secret:
@@ -427,38 +510,68 @@ class FeishuCommandRouter:
             return {"_status": response.status_code, "_text": response.text}
 
     async def route(self, command: BotCommand) -> CommandReply:
-        """Dispatch a parsed command and return the reply."""
+        """Dispatch a parsed command and return the reply.
+
+        Phase 15C v2.0 — wraps every quota-gated command with a paywall
+        check (``app.services.subscriptions.paywall.check_access``) and
+        records consumption on success. Commands not in
+        ``COMMAND_TO_FEATURE`` (``help`` / ``activate`` / ``preferences``
+        / ``refresh`` / ``score``) bypass paywall — they're either free
+        metadata commands or admin-style operations.
+        """
+        # — Static / metadata commands bypass paywall entirely.
         if command.kind == "help":
             return _help_reply()
 
+        # — Phase 15C v2.0: paywall gate for quota-gated commands.
+        quota_type = _command_quota_type(command.kind)
+        if quota_type is not None:
+            verdict = await _paywall_check(
+                command=command,
+                redis_client=self._redis,
+                sender_open_id=getattr(self, "_sender_open_id", None),
+            )
+            if not verdict.allowed:
+                return _paywall_deny_reply(verdict)
+
+        # — Dispatch
         if command.kind == "today":
-            return await self._today(command.args)
+            reply = await self._today(command.args)
+        elif command.kind == "top":
+            reply = await self._top(command.args)
+        elif command.kind == "research":
+            reply = await self._research(command.args)
+        elif command.kind == "refresh":
+            reply = await self._refresh()
+        elif command.kind == "score":
+            reply = await self._score()
+        elif command.kind == "daily":
+            reply = await self._daily()
+        elif command.kind == "report":
+            reply = await self._report(command.args)
+        elif command.kind == "table":
+            reply = await self._table(command.args)
+        elif command.kind == "activate":
+            reply = await self._activate(command.args)
+        elif command.kind == "search":
+            reply = await self._search(command.args)
+        elif command.kind == "preferences":
+            reply = await self._preferences(command.args)
+        else:
+            reply = _unknown_reply(command.args)
 
-        if command.kind == "top":
-            return await self._top(command.args)
+        # — Phase 15C v2.0: record consumption on a successful
+        # paywall-gated dispatch. Errors / denials don't consume quota
+        # (handler set ``metadata["error"]`` or the deny branch already
+        # short-circuited above).
+        if quota_type is not None and not reply.metadata.get("error"):
+            await _paywall_record(
+                redis_client=self._redis,
+                sender_open_id=getattr(self, "_sender_open_id", None),
+                quota_type=quota_type,
+            )
 
-        if command.kind == "research":
-            return await self._research(command.args)
-
-        if command.kind == "refresh":
-            return await self._refresh()
-
-        if command.kind == "score":
-            return await self._score()
-
-        if command.kind == "daily":
-            return await self._daily()
-
-        if command.kind == "report":
-            return await self._report(command.args)
-
-        if command.kind == "table":
-            return await self._table(command.args)
-
-        if command.kind == "activate":
-            return await self._activate(command.args)
-
-        return _unknown_reply(command.args)
+        return reply
 
     # ------------------------------------------------------------------
     # Command handlers
@@ -764,6 +877,11 @@ class FeishuCommandRouter:
         needs to know about hash schemes, status flips, or Subscription
         row creation. Always returns a Chinese reply — even on bad input
         — so the user never sees a traceback.
+
+        Phase 15D — also passes ``redis_client=self._redis`` so the
+        activation flow's anti-brute-force guard (5 fails / 10 min) is
+        active. With ``redis_client=None`` the guard is bypassed — fine
+        for local dev, never in prod.
         """
         from app.services.activation import redeem_for_user
 
@@ -789,6 +907,7 @@ class FeishuCommandRouter:
                 session,
                 code=code,
                 feishu_open_id=sender_open_id or "",
+                redis_client=self._redis,
             )
 
         return CommandReply(
@@ -800,6 +919,150 @@ class FeishuCommandRouter:
                 "plan": result.plan,
                 "code_id": result.code_id,
             },
+        )
+
+    async def _search(self, args: str) -> CommandReply:
+        """`/search <query>` — Phase 15C v2.0 stub.
+
+        The real search interface (likely calling the LLM with a
+        constrained prompt + content_search index) lands in Phase 16.
+        Until then we tell the user what's coming and consume one
+        ``view_top_signals`` quota slot — same as ``/today`` because
+        that's roughly what we'll bill it as once live.
+        """
+        query = (args or "").strip()
+        if not query:
+            return CommandReply(
+                text="用法:`/search <关键词>`\n例如:`/search AI 法律合同审核`",
+                metadata={"command": "search", "error": "missing_query"},
+            )
+        return CommandReply(
+            text=(
+                "🔍 搜索功能开发中,Phase 16 上线。\n"
+                "当前可用:`/today` / `/top` / `/research` / `/report`。"
+            ),
+            metadata={"command": "search", "query": query, "stub": True},
+        )
+
+    async def _preferences(self, args: str) -> CommandReply:
+        """`/preferences [set k=v | reset]` — Phase 15C v2.0.
+
+        三个子模式:
+          * 无参         — 读当前偏好(自动 upsert User 行)
+          * ``set k=v``  — 设置单个偏好字段(白名单校验)
+          * ``reset``    — 清空 6 个偏好列
+
+        Phase 16 会把 User.preferences_* 注入 ContentRadarAgent prompt
+        context —— 这一步只做持久化。
+        """
+        from app.db import get_sessionmaker
+        from app.services.users import (
+            apply_preference,
+            get_or_create_user_by_feishu,
+            render_preferences_zh,
+            reset_preferences,
+        )
+
+        sender_open_id = getattr(self, "_sender_open_id", None)
+        if not sender_open_id:
+            return CommandReply(
+                text=(
+                    "请先 `/activate <激活码>` 绑定飞书账号后查看偏好。\n"
+                    "未绑定的用户无法保存偏好设置。"
+                ),
+                metadata={"command": "preferences", "error": "no_sender"},
+            )
+
+        sub = (args or "").strip()
+        sessionmaker = get_sessionmaker()
+
+        # — read mode ----------------------------------------------------
+        if not sub or sub == "show":
+            async with sessionmaker() as session:
+                user = await get_or_create_user_by_feishu(
+                    session, sender_open_id, commit=False
+                )
+                await session.commit()
+                text = render_preferences_zh(user)
+            return CommandReply(
+                text=text,
+                metadata={"command": "preferences", "mode": "read"},
+            )
+
+        # — reset --------------------------------------------------------
+        if sub == "reset":
+            async with sessionmaker() as session:
+                user = await get_or_create_user_by_feishu(
+                    session, sender_open_id, commit=False
+                )
+                reset_preferences(user)
+                await session.commit()
+                text = render_preferences_zh(user)
+            return CommandReply(
+                text="✅ 已清空偏好。\n\n" + text,
+                metadata={"command": "preferences", "mode": "reset"},
+            )
+
+        # — set k=v ------------------------------------------------------
+        if sub.startswith("set "):
+            kv = sub[4:].strip()
+            if "=" not in kv:
+                return CommandReply(
+                    text=(
+                        "用法:`/preferences set <key>=<value>`\n"
+                        "例如:`/preferences set platform=xiaohongshu`\n"
+                        "允许的字段:vertical / niche / platform / "
+                        "audience / tone / language"
+                    ),
+                    metadata={
+                        "command": "preferences",
+                        "mode": "set",
+                        "error": "missing_equals",
+                    },
+                )
+            key, _, value = kv.partition("=")
+            key = key.strip()
+            value = value.strip()
+            async with sessionmaker() as session:
+                user = await get_or_create_user_by_feishu(
+                    session, sender_open_id, commit=False
+                )
+                user, err = apply_preference(user, key, value)
+                if err is not None:
+                    return CommandReply(
+                        text=err,
+                        metadata={
+                            "command": "preferences",
+                            "mode": "set",
+                            "error": "invalid",
+                            "key": key,
+                        },
+                    )
+                await session.commit()
+                rendered = render_preferences_zh(user)
+            return CommandReply(
+                text=f"✅ 已设置 `{key}={value}`\n\n{rendered}",
+                metadata={
+                    "command": "preferences",
+                    "mode": "set",
+                    "key": key,
+                    "value": value,
+                },
+            )
+
+        # — anything else — usage hint ----------------------------------
+        return CommandReply(
+            text=(
+                "用法:\n"
+                "• `/preferences` — 查看当前偏好\n"
+                "• `/preferences set <key>=<value>` — 设置(例如 "
+                "`platform=xiaohongshu`)\n"
+                "• `/preferences reset` — 清空偏好\n"
+                "\n"
+                "允许的字段:vertical / niche / platform / audience / "
+                "tone / language"
+            ),
+            metadata={"command": "preferences", "error": "bad_subcommand"},
         )
 
 
@@ -820,7 +1083,11 @@ def _help_reply() -> CommandReply:
         "/report <job_id> — 将已完成的研究报告推送至飞书云文档",
         "/doc <job_id> — /report 的别名",
         "/table — 手动同步机会表到多维表格",
+        "/search <关键词> — 搜索(Phase 16 上线)",
+        "/preferences — 查看 / 设置偏好(vertical / niche / platform …)",
+        "/activate <激活码> — 绑定闲鱼购买的激活码",
         "",
+        "💎 套餐:免费 1 信号/天 · 基础 ¥29(5/天) · 专业 ¥59(20/天)",
         "更多能力见 Web 端 /dashboard",
     ]
     return CommandReply(text="\n".join(lines))

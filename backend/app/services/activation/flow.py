@@ -16,13 +16,24 @@ The flow:
   2. Validate format + status (unused/active/revoked/expired).
   3. Bind to ``feishu_open_id`` if not already bound.
   4. Create or update the user's ``Subscription`` row for the Code's plan.
-  5. Write an ``AuditLog`` row tagged ``activate`` (success or blocked).
-  6. Return a ``RedemptionResult`` carrying the user-facing Chinese reply.
+  5. Mirror the subscription state onto the User row (Phase 15D — lets
+     ``/preferences`` show the plan/expires without a join).
+  6. Write an ``AuditLog`` row tagged ``activate`` (success or blocked).
+  7. Return a ``RedemptionResult`` carrying the user-facing Chinese reply.
 
 The flow never raises on user input — bad codes, expired codes, and
 already-bound codes all return a structured ``RedemptionResult`` with
 ``success=False`` and a friendly Chinese message. The DB write path
 (subscription + audit) is only invoked on success.
+
+Phase 15D v2.0 — anti-brute-force guard:
+
+  When ``redis_client`` is supplied, repeated failures for the same
+  ``feishu_open_id`` are counted in Redis
+  (``radar:activate_fail:{open_id}``) and the 6th attempt within
+  10 minutes returns ``RedemptionStatus.RATE_LIMITED``. A successful
+  bind resets the counter. With ``redis_client=None`` the guard is
+  bypassed — fine for local dev, never in prod.
 """
 
 from __future__ import annotations
@@ -43,6 +54,9 @@ from app.services.activation import (
     validate_format,
 )
 from app.services.subscriptions import PLAN_CATALOGUE, get_plan_profile
+from app.utils import get_logger
+
+logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +76,80 @@ def plan_display_zh(plan: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Rate-limit constants (Phase 15D v2.0).
+# ---------------------------------------------------------------------------
+# Per docs/下一阶段开发技术方案.md §103:
+#   同一 Feishu ID:5 次失败 / 10 分钟 → 暂时封锁。
+_RATE_LIMIT_KEY_PREFIX = "radar:activate_fail"
+_RATE_LIMIT_THRESHOLD = 5
+_RATE_LIMIT_TTL_SECONDS = 600  # 10 minutes
+
+
+def _rate_limit_key(feishu_open_id: str) -> str:
+    return f"{_RATE_LIMIT_KEY_PREFIX}:{feishu_open_id}"
+
+
+async def _is_rate_limited(redis_client: Any, feishu_open_id: str) -> bool:
+    """True when the user has hit ``_RATE_LIMIT_THRESHOLD`` failures.
+
+    Never raises — Redis failures are logged and treated as not-limited
+    (fail-open).
+    """
+    if redis_client is None or not feishu_open_id:
+        return False
+    try:
+        raw = await redis_client.get(_rate_limit_key(feishu_open_id))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "activate_rate_limit_get_failed",
+            error=str(exc)[:200],
+        )
+        return False
+    if raw is None:
+        return False
+    try:
+        return int(raw) >= _RATE_LIMIT_THRESHOLD
+    except (TypeError, ValueError):
+        return False
+
+
+async def _record_failure(redis_client: Any, feishu_open_id: str) -> None:
+    """INCR + first-time EXPIRE; best-effort, never raises."""
+    if redis_client is None or not feishu_open_id:
+        return
+    key = _rate_limit_key(feishu_open_id)
+    try:
+        new_count = await redis_client.incr(key)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "activate_rate_limit_incr_failed",
+            error=str(exc)[:200],
+        )
+        return
+    if int(new_count) == 1:
+        try:
+            await redis_client.expire(key, _RATE_LIMIT_TTL_SECONDS)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "activate_rate_limit_expire_failed",
+                error=str(exc)[:200],
+            )
+
+
+async def _reset_failures(redis_client: Any, feishu_open_id: str) -> None:
+    """Best-effort DELETE on successful bind."""
+    if redis_client is None or not feishu_open_id:
+        return
+    try:
+        await redis_client.delete(_rate_limit_key(feishu_open_id))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "activate_rate_limit_delete_failed",
+            error=str(exc)[:200],
+        )
+
+
+# ---------------------------------------------------------------------------
 # Outcome
 # ---------------------------------------------------------------------------
 class RedemptionStatus(str, Enum):
@@ -74,6 +162,7 @@ class RedemptionStatus(str, Enum):
     REVOKED = "revoked"
     NOT_FOUND = "not_found"
     INVALID_FORMAT = "invalid_format"
+    RATE_LIMITED = "rate_limited"       # Phase 15D
 
 
 @dataclass(slots=True)
@@ -127,6 +216,12 @@ def user_message(result: RedemptionResult) -> str:
         return "❌ 激活码无效。请检查输入,或联系客服。"
     if result.status == RedemptionStatus.INVALID_FORMAT:
         return "❌ 激活码格式不正确。格式示例:`ABCD-EFGH-JKLM`"
+    if result.status == RedemptionStatus.RATE_LIMITED:
+        return (
+            "⏰ 尝试过于频繁,请稍后再试\n"
+            "(约 10 分钟后再来)。\n"
+            "如需立即协助请联系客服。"
+        )
     return "❌ 激活失败,请稍后重试或联系客服。"
 
 
@@ -155,6 +250,7 @@ async def redeem_for_user(
     pepper: str = DEFAULT_SERVER_PEPPER,
     now: Optional[datetime] = None,
     commit: bool = True,
+    redis_client: Any = None,
 ) -> RedemptionResult:
     """Bind ``code`` to ``feishu_open_id`` and create/update Subscription.
 
@@ -162,6 +258,9 @@ async def redeem_for_user(
     the Subscription + AuditLog rows. Set ``commit=False`` when the
     caller wants to fold this into a larger transaction (e.g. a test
     that seeds + redeems + checks in a single session).
+
+    ``redis_client`` (Phase 15D) enables the anti-brute-force guard.
+    Pass ``None`` to disable — fine for tests / local dev.
 
     The reducer ``redeem_code()`` is pure-data; we wrap it with the DB
     side-effects that turn a successful validation into a usable
@@ -196,6 +295,25 @@ async def redeem_for_user(
             ),
         )
 
+    # Phase 15D v2.0 — anti-brute-force guard. Runs BEFORE the hash +
+    # lookup so the DB doesn't bear the load of an attacker brute-forcing
+    # codes. Cheap formats / empty open_id were already rejected above.
+    if await _is_rate_limited(redis_client, feishu_open_id):
+        return RedemptionResult(
+            status=RedemptionStatus.RATE_LIMITED,
+            success=False,
+            error=ActivationError.RATE_LIMITED,
+            user_message=user_message(
+                RedemptionResult(
+                    status=RedemptionStatus.RATE_LIMITED,
+                    success=False,
+                    error=ActivationError.RATE_LIMITED,
+                )
+            ),
+            audit_action="activate",
+            audit_result="blocked",
+        )
+
     # Hash + lookup.
     code_hash = hash_code(code, pepper)
     row = await session.get(ActivationCode, code_hash) if hasattr(
@@ -225,6 +343,8 @@ async def redeem_for_user(
     )
 
     if not outcome.success:
+        # Phase 15D — bump the failure counter (best-effort).
+        await _record_failure(redis_client, feishu_open_id)
         status, err = _map_redeem_outcome(outcome.error)
         return _failed(
             status,
@@ -271,6 +391,18 @@ async def redeem_for_user(
         commit=False,
     )
 
+    # Phase 15D v2.0 — mirror subscription state to the User row so
+    # ``/preferences`` can read it without a join. Wrapped in try/except
+    # so a stale migration / unique-index collision never blocks the
+    # bind itself.
+    await _mirror_subscription_to_user(
+        session,
+        feishu_open_id=feishu_open_id,
+        status="active",
+        expires_at=sub.expires_at if sub else row.expires_at,
+        plan=plan,
+    )
+
     # AuditLog row.
     audit_status = "success" if is_first_bind else "success"  # both idempotent
     audit = AuditLog(
@@ -294,6 +426,10 @@ async def redeem_for_user(
         if sub is not None:
             await session.refresh(sub)
         await session.refresh(audit)
+
+    # Phase 15D — clear the failure counter on a successful bind so the
+    # user gets a clean slate for the next activation attempt.
+    await _reset_failures(redis_client, feishu_open_id)
 
     final_status = (
         RedemptionStatus.ALREADY_ACTIVE if already_active else RedemptionStatus.SUCCESS
@@ -408,6 +544,47 @@ async def _ensure_subscription(
     )
     session.add(sub)
     return sub
+
+
+async def _mirror_subscription_to_user(
+    session: AsyncSession,
+    *,
+    feishu_open_id: str,
+    status: str,
+    expires_at: Optional[datetime],
+    plan: Optional[str] = None,
+) -> None:
+    """Phase 15D — copy the subscription state onto the User row.
+
+    Best-effort: a unique-index race or migration-drift failure here
+    must NOT roll back the activation. The Subscription table is the
+    canonical source of truth — ``User`` rows are a denormalised cache
+    for ``/preferences`` speed.
+    """
+    try:
+        from app.services.users import (
+            get_or_create_user_by_feishu,
+            update_subscription_mirror,
+        )
+
+        # ``commit=False`` — the activation flow's outer transaction
+        # commits the whole batch (ActivationCode + Subscription +
+        # AuditLog + User mirror) atomically.
+        user = await get_or_create_user_by_feishu(
+            session, feishu_open_id, commit=False
+        )
+        update_subscription_mirror(
+            user,
+            status=status,
+            expires_at=expires_at,
+            plan=plan,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "activate_user_mirror_failed",
+            feishu_open_id=feishu_open_id,
+            error=str(exc)[:200],
+        )
 
 
 __all__ = [

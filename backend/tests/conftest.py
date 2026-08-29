@@ -95,3 +95,18 @@ async def client(sqlite_engine: AsyncEngine) -> AsyncIterator[TestClient]:
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
+
+
+@pytest.fixture
+def fake_redis() -> "_FakeRedisClient":
+    """Fresh in-memory Redis fake for one test.
+
+    Tests that exercise paywall / activation-rate-limit get this fixture
+    and inject it into either ``app.services.redis_client.get_redis()``
+    (via ``set_redis_for_tests``) or directly into the function-under-
+    test's ``redis_client`` parameter. Reset between tests by virtue of
+    pytest's per-function fixture scope.
+    """
+    from tests.test_redis_seam import _FakeRedisClient
+
+    return _FakeRedisClient()

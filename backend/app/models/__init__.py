@@ -49,6 +49,33 @@ class User(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
 
+    # ---- Phase 15A v2.0 — User preferences + Feishu binding -----------
+    # Per docs/下一阶段开发技术方案.md §31 / §86-87 / §130:
+    #   - `feishu_open_id` ties the legacy email/password User to the
+    #     Feishu identity used by the bot commands (Subscription has its
+    #     own `feishu_open_id` index — this is a denormalised shortcut
+    #     so the bot can look up preferences in one query).
+    #   - `vertical / niche / platform / audience / tone / language /
+    #     preferences_json` are the personalisation inputs for the
+    #     ContentRadarAgent prompt context (Phase 16 will wire them in).
+    #   - `subscription_status / subscription_expires_at` mirror the
+    #     canonical Subscription row so /preferences can show "you're on
+    #     pro until 2026-10-12" without joining two tables.
+    feishu_open_id: Mapped[Optional[str]] = mapped_column(
+        String(128), unique=True, nullable=True, index=True
+    )
+    vertical: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    niche: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    platform: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    audience: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    tone: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    language: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    preferences_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    subscription_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    subscription_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
 
 # ---------------------------------------------------------------------------
 # sources

@@ -280,6 +280,34 @@ def test_parse_command_assumes_already_cleaned_text():
 # ---------------------------------------------------------------------------
 # FeishuCommandRouter — mocked httpx transport
 # ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _stub_paywall(monkeypatch):
+    """Phase 15C — `route()` now opens a DB session for the paywall check.
+
+    These tests use httpx.MockTransport only (no real DB). Stub the
+    paywall check at the module boundary so it returns an "allowed"
+    verdict without touching the DB. Each test that *does* want to
+    exercise the paywall (e.g. test_paywall.py) wires its own
+    sessionmaker via the `client` fixture.
+    """
+    from app.services.feishu import inbound as inbound_module
+
+    async def _noop_paywall(**_kwargs):
+        from app.services.subscriptions.paywall import PaywallVerdict
+
+        return PaywallVerdict(
+            allowed=True,
+            plan="unknown",
+            quota_type="bypass",
+            quota_limit=0,
+            quota_used=0,
+        )
+
+    monkeypatch.setattr(
+        inbound_module, "_paywall_check", _noop_paywall
+    )
+
+
 def _make_router(handler: callable) -> FeishuCommandRouter:
     """Build a router whose `httpx.AsyncClient` uses an in-memory
     `MockTransport`. All `client.get/post` calls land in `handler`.

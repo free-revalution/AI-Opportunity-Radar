@@ -197,6 +197,12 @@ async def handle_feishu_event(request: Request) -> dict[str, Any]:
     drive_client, bitable_digest_client, bitable_ops_client = _build_content_clients(
         settings=settings, app_client=app_client
     )
+    # — Phase 15C v2.0: Redis client for paywall quota counters + the
+    # activation rate-limit guard. Resolved lazily — if Redis is down
+    # the singleton returns None and the router falls open.
+    from app.services.redis_client import get_redis
+
+    redis_client = await get_redis()
     try:
         command = parse_command(event.text)
         router_instance = FeishuCommandRouter(
@@ -204,6 +210,7 @@ async def handle_feishu_event(request: Request) -> dict[str, Any]:
             drive_client=drive_client,
             bitable_digest_client=bitable_digest_client,
             bitable_ops_client=bitable_ops_client,
+            redis_client=redis_client,
         )
         # Phase 14A — commands like `/activate` need the sender's Open
         # ID. The router accepts it via a transient attribute so the
