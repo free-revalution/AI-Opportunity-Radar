@@ -30,6 +30,7 @@ pytestmark = pytest.mark.asyncio
 # Test fixture app
 # ---------------------------------------------------------------------------
 WEBHOOK_SECRET = "test-webhook-secret-abc"
+APP_SECRET_KEY = "test-app-secret-xyz"
 ADMIN_SECRET = "test-admin-secret-42"
 ADMIN_OPEN_ID = "ou_admin_test_99"
 NOT_ADMIN_OPEN_ID = "ou_user_random"
@@ -204,3 +205,90 @@ class TestDevShortCircuit:
         )
         assert resp.status_code == 200
         assert resp.json()["actor"] == "secret"
+
+
+# ---------------------------------------------------------------------------
+# Two-source webhook — Phase 27 fix: RADAR_WEBHOOK_SECRET must work
+# alongside APP_SECRET_KEY (n8n injects the former via docker-compose).
+# ---------------------------------------------------------------------------
+class TestWebhookTwoSources:
+    async def test_app_secret_key_only(
+        self, restore_webhook_env
+    ) -> None:
+        """Only APP_SECRET_KEY configured — webhook header that matches
+        it must be accepted."""
+        os.environ.pop("RADAR_WEBHOOK_SECRET", None)
+        app = make_app(
+            admin_secret="", admin_open_ids=[], app_secret_key=APP_SECRET_KEY  # type: ignore[arg-type]
+        )
+        client = TestClient(app)
+        resp = client.get(
+            "/whoami", headers={"X-Radar-Webhook": APP_SECRET_KEY}
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"actor": "webhook"}
+
+    async def test_radar_webhook_secret_only(
+        self, restore_webhook_env
+    ) -> None:
+        """Only RADAR_WEBHOOK_SECRET configured — header that matches it
+        must be accepted (this is what n8n uses)."""
+        os.environ["RADAR_WEBHOOK_SECRET"] = APP_SECRET_KEY  # reuse the literal
+        app = make_app(
+            admin_secret="", admin_open_ids=[], app_secret_key=""
+        )
+        client = TestClient(app)
+        resp = client.get(
+            "/whoami", headers={"X-Radar-Webhook": APP_SECRET_KEY}
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"actor": "webhook"}
+
+    async def test_both_configured_either_works(
+        self, restore_webhook_env
+    ) -> None:
+        """Both APP_SECRET_KEY and RADAR_WEBHOOK_SECRET configured —
+        the client may send either value."""
+        os.environ["RADAR_WEBHOOK_SECRET"] = APP_SECRET_KEY
+        app = make_app(
+            admin_secret="", admin_open_ids=[],
+            app_secret_key=APP_SECRET_KEY,  # type: ignore[arg-type]
+        )
+        client = TestClient(app)
+
+        # Send the APP_SECRET_KEY value → accepted.
+        resp = client.get(
+            "/whoami", headers={"X-Radar-Webhook": APP_SECRET_KEY}
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"actor": "webhook"}
+
+    async def test_both_configured_different_values_both_work(
+        self, restore_webhook_env
+    ) -> None:
+        """Both configured with *different* values — each must match
+        its own source."""
+        os.environ["RADAR_WEBHOOK_SECRET"] = WEBHOOK_SECRET
+        app = make_app(
+            admin_secret="", admin_open_ids=[],
+            app_secret_key=APP_SECRET_KEY,  # type: ignore[arg-type]
+        )
+        client = TestClient(app)
+
+        # Send APP_SECRET_KEY value → accepted.
+        resp = client.get(
+            "/whoami", headers={"X-Radar-Webhook": APP_SECRET_KEY}
+        )
+        assert resp.status_code == 200
+
+        # Send RADAR_WEBHOOK_SECRET value → also accepted.
+        resp = client.get(
+            "/whoami", headers={"X-Radar-Webhook": WEBHOOK_SECRET}
+        )
+        assert resp.status_code == 200
+
+        # Send a totally wrong value → rejected.
+        resp = client.get(
+            "/whoami", headers={"X-Radar-Webhook": "neither-match"}
+        )
+        assert resp.status_code == 401

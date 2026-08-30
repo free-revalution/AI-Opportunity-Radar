@@ -14,9 +14,17 @@ precedence so audit rows carry the strongest actor label):
      matched open_id.
   2. ``X-Radar-Admin-Secret`` matches ``settings.admin_api_secret``
      (SHA-256 + constant-time compare) → returns ``"secret"``.
-  3. ``X-Radar-Webhook`` matches ``settings.app_secret_key`` /
-     ``os.environ['RADAR_WEBHOOK_SECRET']`` (same hash) → returns
+  3. ``X-Radar-Webhook`` matches **either** ``settings.app_secret_key``
+     **or** ``os.environ['RADAR_WEBHOOK_SECRET']`` (same hash) → returns
      ``"webhook"``.
+
+Two env vars are accepted for the webhook on purpose:
+
+- ``APP_SECRET_KEY`` — long-standing shared secret (read by Settings).
+- ``RADAR_WEBHOOK_SECRET`` — injected into the n8n container via
+  ``docker-compose.yml`` and referenced by workflow JSON as
+  ``={{$env.RADAR_WEBHOOK_SECRET}}`` so n8n's HTTP Request nodes can
+  authenticate. Either one works for the client.
 
 Dev / local short-circuit: if every settings/env source is empty, the
 caller is accepted and labelled ``"webhook"``. This matches the legacy
@@ -67,18 +75,22 @@ def require_admin(
     ):
         return "secret"
 
-    webhook_expected = (
-        settings.app_secret_key
-        or os.environ.get("RADAR_WEBHOOK_SECRET", "")
-    )
-    if webhook_expected and x_webhook and hmac.compare_digest(
-        hashlib.sha256(x_webhook.encode()).hexdigest(),
-        hashlib.sha256(webhook_expected.encode()).hexdigest(),
-    ):
-        return "webhook"
+    # Webhook — accept *any* of the configured webhook sources. See the
+    # module docstring for why two env vars are accepted.
+    webhook_candidates: list[str] = [
+        settings.app_secret_key,
+        os.environ.get("RADAR_WEBHOOK_SECRET", ""),
+    ]
+    if x_webhook:
+        for candidate in webhook_candidates:
+            if candidate and hmac.compare_digest(
+                hashlib.sha256(x_webhook.encode()).hexdigest(),
+                hashlib.sha256(candidate.encode()).hexdigest(),
+            ):
+                return "webhook"
 
     # Dev / local — only when EVERY source is unconfigured.
-    if not admins and not admin_secret and not webhook_expected:
+    if not admins and not admin_secret and not any(webhook_candidates):
         return "webhook"
 
     raise HTTPException(
