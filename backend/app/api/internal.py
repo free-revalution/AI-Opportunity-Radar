@@ -7,19 +7,17 @@ secret header (`X-Radar-Webhook`).
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
-import os
 from decimal import Decimal
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import Response
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps import require_admin
 from app.config import get_settings
 from app.db import get_session
 from app.metrics import record_pipeline_run
@@ -45,30 +43,6 @@ router = APIRouter()
 logger = get_logger(__name__)
 
 
-def _check_webhook_secret(
-    provided: str | None = Header(default=None, alias="X-Radar-Webhook"),
-) -> None:
-    settings = get_settings()
-    expected = (
-        settings.app_secret_key  # use the app secret as a stand-in
-        or os.environ.get("RADAR_WEBHOOK_SECRET", "")
-    )
-    if not expected:
-        return  # dev / local — accept all
-    if not provided:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="missing webhook secret header",
-        )
-    if not hmac.compare_digest(
-        hashlib.sha256(provided.encode()).hexdigest(),
-        hashlib.sha256(expected.encode()).hexdigest(),
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid webhook secret"
-        )
-
-
 @router.post(
     "/discovery/run",
     summary="Run a one-shot ingestion across enabled source connectors",
@@ -76,7 +50,7 @@ def _check_webhook_secret(
 async def run_discovery(
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _actor: str = Depends(require_admin),
 ) -> dict[str, Any]:
     """Called by the n8n daily cron (and the worker in Phase 4).
 
@@ -107,7 +81,7 @@ async def run_discovery(
 async def build_digest(
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 3 stub. Phase 8 wires this to the Telegram sender."""
     from app.repositories import OpportunityRepository
@@ -135,7 +109,7 @@ async def build_digest(
 async def run_clustering(
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 4 endpoint — called by n8n after `discovery/run`.
 
@@ -176,7 +150,7 @@ async def run_clustering(
 async def run_screening(
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 5 endpoint — called by n8n after `clustering/run`.
 
@@ -208,7 +182,7 @@ async def run_screening(
 async def run_scoring(
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 6 endpoint — called by n8n after `screening/run`.
 
@@ -243,7 +217,7 @@ async def score_one(
     opportunity_id: int,
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 6 endpoint — explicit single-opportunity scoring.
 
@@ -279,7 +253,7 @@ async def score_one(
 async def run_research(
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 7 endpoint — called by n8n after `scoring/run`.
 
@@ -331,7 +305,7 @@ async def run_one_research_job(
     job_id: int,
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 7 endpoint — explicit single-job research trigger.
 
@@ -383,7 +357,7 @@ async def run_one_research_job(
 async def cancel_research_job(
     job_id: int,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 7 endpoint — marks a non-terminal job as `cancelled`.
 
@@ -466,7 +440,7 @@ def _build_notification_service(
 async def preview_digest(
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 8 endpoint — returns the MarkdownV2 text + a warnings list.
 
@@ -504,7 +478,7 @@ async def preview_digest(
 async def send_digest(
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 8 endpoint — sends the digest to the configured chat.
 
@@ -561,7 +535,7 @@ async def preview_opportunity_alert(
     opportunity_id: int,
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 8 endpoint — returns the MarkdownV2 text for one alert."""
     body = body or {}
@@ -585,7 +559,7 @@ async def send_opportunity_alert(
     opportunity_id: int,
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 8 endpoint — sends one alert to the chat.
 
@@ -631,7 +605,7 @@ async def list_notifications(
     limit: int = 50,
     channel: str | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 8 endpoint — recent `Notification` rows for the dashboard."""
     service = _build_notification_service(session)
@@ -662,7 +636,7 @@ async def list_notifications(
 async def run_content_generation(
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 1 (v2.0) — fan-out content production.
 
@@ -731,7 +705,7 @@ async def run_content_generation(
 async def send_feishu_digest(
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 2 (v2.0) — push the top opportunities to a Feishu group.
 
@@ -801,7 +775,7 @@ async def list_content_by_opportunity(
     limit: int = 20,
     channel: str | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 3 + Phase 8 (v2.0) — Content Center backend.
 
@@ -945,7 +919,7 @@ async def mark_content_published(
     opportunity_id: int,
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 3 + Phase 8 (v2.0) — flip an Opportunity's `content_status`.
 
@@ -1024,7 +998,7 @@ async def mark_content_sold(
     opportunity_id: int,
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 3 / 4 (v2.0) — flip `content_status` to `sold`.
 
@@ -1121,7 +1095,7 @@ async def regenerate_opportunity_content(
     opportunity_id: int,
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 8 (v2.0) — single-opportunity regenerate.
 
@@ -1236,7 +1210,7 @@ async def regenerate_opportunity_content(
 async def export_content(
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> Response:
     """Phase 8 (v2.0) — batch export.
 
@@ -1417,7 +1391,7 @@ async def edit_notification_content(
     notification_id: int,
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 9 (v2.0) — operator-edited content becomes a new version.
 
@@ -1512,7 +1486,7 @@ async def list_content_versions(
     channel: str | None = None,
     limit: int = 50,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 9 (v2.0) — full version history per (opp, channel).
 
@@ -1589,7 +1563,7 @@ async def score_content_quality(
     notification_id: int,
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 10 (v2.0) — score a single piece of generated content.
 
@@ -1685,7 +1659,7 @@ async def auto_improve_content(
     notification_id: int,
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 10 (v2.0) — score → if below threshold, regenerate up to N
     times until the score is acceptable (or attempts run out).
@@ -1827,7 +1801,7 @@ async def auto_improve_content(
     summary="List channels with a registered publisher (Phase 11 v2.0)",
 )
 async def list_publish_channels(
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Return which channels can be published to right now and which
     publishers are unconfigured (so the frontend can show a friendly
@@ -1865,7 +1839,7 @@ async def publish_notification(
     notification_id: int,
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 11 (v2.0) — fan out to the publisher for the notification's
     channel. Body (all optional):
@@ -1951,7 +1925,7 @@ async def publish_notification(
 async def batch_publish_notifications(
     body: dict[str, Any] | None = None,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 11 (v2.0) — publish up to N notifications in one call.
 
@@ -2079,7 +2053,7 @@ def _serialize_order(order: Any, *, opportunity_title: str | None = None) -> dic
 async def create_order(
     body: OrderCreateRequest,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 4 — record one sale of an Opportunity.
 
@@ -2143,7 +2117,7 @@ async def list_orders(
     limit: int = 50,
     offset: int = 0,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 4 — paginated order list for the /orders dashboard.
 
@@ -2194,7 +2168,7 @@ async def list_orders(
 )
 async def get_order_stats(
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 4 — totals, by-channel breakdown, by-delivery-status counts."""
     from app.repositories.orders import OrderRepository
@@ -2210,7 +2184,7 @@ async def get_order_stats(
 async def get_order(
     order_id: int,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 4 — single-order detail view."""
     from app.models import Opportunity
@@ -2237,7 +2211,7 @@ async def update_order_status(
     order_id: int,
     body: OrderStatusUpdateRequest,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 4 — flip an order's `delivery_status`.
 
@@ -2314,7 +2288,7 @@ def _on_demand_seed_field(opportunity: Any, body: dict[str, Any] | None) -> tupl
 async def run_on_demand_research(
     body: OnDemandResearchRequest,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 5 — pay-per-report service.
 
@@ -2462,7 +2436,7 @@ async def run_on_demand_research(
 async def list_on_demand_research(
     limit: int = 20,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 5 — `/on-demand` dashboard list.
 
@@ -2538,7 +2512,7 @@ async def list_on_demand_research(
 async def get_on_demand_research(
     job_id: int,
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _secret: None = Depends(require_admin),
 ) -> dict[str, Any]:
     """Phase 5 — single-job detail view.
 

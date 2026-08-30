@@ -1,10 +1,13 @@
 """Admin API — Phase 13B.
 
-Mounted at ``/api/admin``. Two auth paths (either is sufficient):
+Mounted at ``/api/admin``. Phase 21 unified the auth paths into a single
+``require_admin`` dependency (see ``app/api/deps.py``). Any one of these
+headers is accepted:
 
-  * ``X-Radar-Admin-Secret`` header matches ``settings.admin_api_secret``
-    (HMAC-compare, constant time).
-  * ``X-Feishu-Open-Id`` header appears in ``settings.admin_open_ids``.
+  * ``X-Radar-Webhook`` — internal operator UI + n8n workflows.
+  * ``X-Radar-Admin-Secret`` — manual/CLI admin operations.
+  * ``X-Feishu-Open-Id`` ∈ ``settings.admin_open_ids`` — Feishu bot
+    (forward-compat hook; no live callers today).
 
 Endpoints (per docs/下一阶段开发技术方案.md §55, §88, §65-66):
 
@@ -20,7 +23,7 @@ Endpoints (per docs/下一阶段开发技术方案.md §55, §88, §65-66):
       POST   /api/admin/subscriptions/{id}/cancel — set status='cancelled'
 
     Audit
-      GET    /api/admin/audit                    — list audit logs (filter: actor_type, action, result, since, limit)
+      GET    /api/admin/audit_logs               — paginated viewer (Phase 20)
 
     Sources
       GET    /api/admin/sources                  — list with compliance posture
@@ -32,18 +35,15 @@ reject callers silently — no enumeration hints in error responses.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
-import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import Settings, get_settings
+from app.api.deps import require_admin
 from app.db import get_session
 from app.models import (
     ActivationCode,
@@ -89,37 +89,8 @@ def _to_utc_iso(dt: Optional[datetime]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Auth dependency
+# Auth dependency — Phase 21 unified into app/api/deps.py::require_admin
 # ---------------------------------------------------------------------------
-def _require_admin(
-    x_admin_secret: Optional[str] = Header(default=None, alias="X-Radar-Admin-Secret"),
-    x_feishu_open_id: Optional[str] = Header(default=None, alias="X-Feishu-Open-Id"),
-    settings: Settings = Depends(get_settings),
-) -> str:
-    """Verify the caller is an admin. Returns the caller's id for audit.
-
-    Two accepted paths:
-      1. ``X-Radar-Admin-Secret`` matches ``settings.admin_api_secret``.
-      2. ``X-Feishu-Open-Id`` is in ``settings.admin_open_ids``.
-
-    Otherwise 401 with a deliberately opaque message.
-    """
-    secret = settings.admin_api_secret
-    if secret and x_admin_secret:
-        if hmac.compare_digest(
-            hashlib.sha256(x_admin_secret.encode()).hexdigest(),
-            hashlib.sha256(secret.encode()).hexdigest(),
-        ):
-            return "secret"
-
-    admins = settings.admin_open_ids or []
-    if x_feishu_open_id and x_feishu_open_id in admins:
-        return x_feishu_open_id
-
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="admin credentials required",
-    )
 
 
 async def _audit_db(
@@ -143,43 +114,6 @@ async def _audit_db(
         result=result,
         metadata=metadata,
     )
-
-
-def _require_webhook(
-    provided: Optional[str] = Header(default=None, alias="X-Radar-Webhook"),
-    settings: Settings = Depends(get_settings),
-) -> str:
-    """Verify the caller carries a valid internal webhook secret.
-
-    Phase 17 — the Content Center admin endpoints (``/content_opportunities``)
-    use this dependency instead of ``_require_admin``. The two are
-    intentionally separate auth paths today; Phase 18 should unify them
-    in ``app/api/deps.py``. Returns the actor label "webhook" for audit.
-
-    Logic is duplicated from ``app/api/internal.py::_check_webhook_secret``
-    because admin.py should not depend on internal.py (would create a
-    cycle once internal.py ever imports admin helpers).
-    """
-    expected = (
-        settings.app_secret_key
-        or os.environ.get("RADAR_WEBHOOK_SECRET", "")
-    )
-    if not expected:
-        return "webhook"  # dev / local — accept all
-    if not provided:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="missing webhook secret header",
-        )
-    if not hmac.compare_digest(
-        hashlib.sha256(provided.encode()).hexdigest(),
-        hashlib.sha256(expected.encode()).hexdigest(),
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="invalid webhook secret",
-        )
-    return "webhook"
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +144,7 @@ class UpdateComplianceRequest(BaseModel):
 async def issue_activation_code(
     body: IssueCodeRequest,
     session: AsyncSession = Depends(get_session),
-    actor: str = Depends(_require_admin),
+    actor: str = Depends(require_admin),
 ) -> dict[str, Any]:
     plan = body.plan.lower()
     if plan not in PLAN_CATALOGUE:
@@ -256,7 +190,7 @@ async def list_activation_codes(
     plan: Optional[str] = Query(default=None),
     limit: int = Query(default=50, ge=1, le=1000),
     session: AsyncSession = Depends(get_session),
-    _actor: str = Depends(_require_admin),
+    _actor: str = Depends(require_admin),
 ) -> dict[str, Any]:
     stmt = select(ActivationCode).order_by(ActivationCode.created_at.desc()).limit(limit)
     if status_filter:
@@ -292,7 +226,7 @@ async def list_activation_codes(
 async def revoke_activation_code(
     code_id: int,
     session: AsyncSession = Depends(get_session),
-    actor: str = Depends(_require_admin),
+    actor: str = Depends(require_admin),
 ) -> dict[str, Any]:
     row = await session.get(ActivationCode, code_id)
     if row is None:
@@ -323,7 +257,7 @@ async def list_subscriptions(
     plan: Optional[str] = Query(default=None),
     limit: int = Query(default=50, ge=1, le=1000),
     session: AsyncSession = Depends(get_session),
-    _actor: str = Depends(_require_admin),
+    _actor: str = Depends(require_admin),
 ) -> dict[str, Any]:
     stmt = select(Subscription).order_by(Subscription.created_at.desc()).limit(limit)
     if status_filter:
@@ -361,7 +295,7 @@ async def list_subscriptions(
 async def get_subscription(
     sub_id: int,
     session: AsyncSession = Depends(get_session),
-    _actor: str = Depends(_require_admin),
+    _actor: str = Depends(require_admin),
 ) -> dict[str, Any]:
     row = await session.get(Subscription, sub_id)
     if row is None:
@@ -388,7 +322,7 @@ async def extend_subscription(
     sub_id: int,
     body: ExtendSubscriptionRequest,
     session: AsyncSession = Depends(get_session),
-    actor: str = Depends(_require_admin),
+    actor: str = Depends(require_admin),
 ) -> dict[str, Any]:
     row = await session.get(Subscription, sub_id)
     if row is None:
@@ -428,7 +362,7 @@ async def extend_subscription(
 async def cancel_subscription(
     sub_id: int,
     session: AsyncSession = Depends(get_session),
-    actor: str = Depends(_require_admin),
+    actor: str = Depends(require_admin),
 ) -> dict[str, Any]:
     row = await session.get(Subscription, sub_id)
     if row is None:
@@ -448,71 +382,17 @@ async def cancel_subscription(
 
 
 # ---------------------------------------------------------------------------
-# Audit log endpoint
-# ---------------------------------------------------------------------------
-@router.get(
-    "/audit",
-    summary="List audit log entries (admin)",
-)
-async def list_audit_logs(
-    actor_type: Optional[str] = Query(default=None),
-    action: Optional[str] = Query(default=None),
-    result_filter: Optional[str] = Query(default=None, alias="result"),
-    since: Optional[datetime] = Query(default=None, description="ISO-8601 lower bound"),
-    limit: int = Query(default=100, ge=1, le=1000),
-    session: AsyncSession = Depends(get_session),
-    _actor: str = Depends(_require_admin),
-) -> dict[str, Any]:
-    stmt = select(AuditLog).order_by(AuditLog.created_at.desc()).limit(limit)
-    if actor_type:
-        stmt = stmt.where(AuditLog.actor_type == actor_type)
-    if action:
-        stmt = stmt.where(AuditLog.action == action)
-    if result_filter:
-        if result_filter not in {"success", "failure", "blocked", "partial"}:
-            raise HTTPException(422, "invalid result filter")
-        stmt = stmt.where(AuditLog.result == result_filter)
-    if since:
-        if since.tzinfo is None:
-            since = since.replace(tzinfo=timezone.utc)
-        stmt = stmt.where(AuditLog.created_at >= since)
-    result = await session.execute(stmt)
-    rows = list(result.scalars().all())
-    return {
-        "count": len(rows),
-        "items": [
-            {
-                "id": r.id,
-                "actor_type": r.actor_type,
-                "actor_id": r.actor_id,
-                "action": r.action,
-                "resource_type": r.resource_type,
-                "resource_id": r.resource_id,
-                "result": r.result,
-                "metadata_json": r.metadata_json,
-                "created_at": _to_utc_iso(r.created_at),
-            }
-            for r in rows
-        ],
-    }
-
-
-# ---------------------------------------------------------------------------
 # Audit log viewer (Phase 20)
 # ---------------------------------------------------------------------------
-# The Phase 12 ``GET /api/admin/audit`` endpoint above is admin-secret
-# auth and capped at no offset / no resource filters — fine for back-of-
-# envelope grepping but not a real viewer. Phase 20 adds ``GET /api/admin/
-# audit_logs`` with webhook auth (so the Phase 18 AdminGuard flow works)
-# and a richer filter set: actor_id, resource_type, resource_id, until,
-# offset. Response carries ``total`` (full count, not the slice) so the
-# UI can paginate properly.
-#
-# Both endpoints coexist intentionally — Phase 21 will unify them.
+# Replaces the Phase 12 ``GET /api/admin/audit`` endpoint (admin-secret
+# auth, no offset / no resource filters — deprecated in Phase 21 in
+# favour of this richer viewer). Filters: actor_type, actor_id, action,
+# result, resource_type, resource_id, since, until. Response carries
+# ``total`` (full count, not the slice) so the UI can paginate properly.
 
 @router.get(
     "/audit_logs",
-    summary="Paginated audit log viewer (admin, webhook)",
+    summary="Paginated audit log viewer (admin)",
 )
 async def list_audit_logs_v2(
     actor_type: Optional[str] = Query(default=None),
@@ -526,7 +406,7 @@ async def list_audit_logs_v2(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
-    _actor: str = Depends(_require_webhook),
+    _actor: str = Depends(require_admin),
 ) -> dict[str, Any]:
     """Sole-operator audit viewer backed by AuditLog indexes.
 
@@ -606,7 +486,7 @@ async def list_sources(
     compliance_level: Optional[str] = Query(default=None, description="A | B | C | D | E"),
     limit: int = Query(default=100, ge=1, le=1000),
     session: AsyncSession = Depends(get_session),
-    _actor: str = Depends(_require_admin),
+    _actor: str = Depends(require_admin),
 ) -> dict[str, Any]:
     stmt = select(Source).order_by(Source.id).limit(limit)
     if compliance_level:
@@ -642,7 +522,7 @@ async def update_source_compliance(
     source_id: int,
     body: UpdateComplianceRequest,
     session: AsyncSession = Depends(get_session),
-    actor: str = Depends(_require_admin),
+    actor: str = Depends(require_admin),
 ) -> dict[str, Any]:
     level = body.compliance_level.upper()
     if level not in {"A", "B", "C", "D", "E"}:
@@ -718,7 +598,7 @@ def _serialize_content_opportunity(row: ContentOpportunity) -> dict[str, Any]:
 
 @router.get(
     "/content_opportunities",
-    summary="List content opportunities (admin, webhook)",
+    summary="List content opportunities (admin)",
 )
 async def list_content_opportunities(
     status_filter: Optional[str] = Query(
@@ -731,7 +611,7 @@ async def list_content_opportunities(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
-    _actor: str = Depends(_require_webhook),
+    _actor: str = Depends(require_admin),
 ) -> dict[str, Any]:
     """List ContentOpportunity rows for the admin Content Center.
 
@@ -760,12 +640,12 @@ async def list_content_opportunities(
 
 @router.get(
     "/content_opportunities/{co_id}",
-    summary="Single content opportunity (admin, webhook)",
+    summary="Single content opportunity (admin)",
 )
 async def get_content_opportunity(
     co_id: int,
     session: AsyncSession = Depends(get_session),
-    _actor: str = Depends(_require_webhook),
+    _actor: str = Depends(require_admin),
 ) -> dict[str, Any]:
     repo = ContentOpportunityRepository(session)
     row = await repo.get_by_id(co_id)
@@ -818,12 +698,12 @@ async def _transition_content_opportunity(
 
 @router.post(
     "/content_opportunities/{co_id}/approve",
-    summary="draft → approved (admin, webhook)",
+    summary="draft → approved (admin)",
 )
 async def approve_content_opportunity(
     co_id: int,
     session: AsyncSession = Depends(get_session),
-    actor: str = Depends(_require_webhook),
+    actor: str = Depends(require_admin),
 ) -> dict[str, Any]:
     return await _transition_content_opportunity(
         session, co_id=co_id, new_status="approved", actor=actor,
@@ -832,13 +712,13 @@ async def approve_content_opportunity(
 
 @router.post(
     "/content_opportunities/{co_id}/reject",
-    summary="* → rejected (admin, webhook)",
+    summary="* → rejected (admin)",
 )
 async def reject_content_opportunity(
     co_id: int,
     body: ContentOpportunityRejectRequest,
     session: AsyncSession = Depends(get_session),
-    actor: str = Depends(_require_webhook),
+    actor: str = Depends(require_admin),
 ) -> dict[str, Any]:
     return await _transition_content_opportunity(
         session,
@@ -851,12 +731,12 @@ async def reject_content_opportunity(
 
 @router.post(
     "/content_opportunities/{co_id}/publish",
-    summary="approved → published (admin, webhook)",
+    summary="approved → published (admin)",
 )
 async def publish_content_opportunity(
     co_id: int,
     session: AsyncSession = Depends(get_session),
-    actor: str = Depends(_require_webhook),
+    actor: str = Depends(require_admin),
 ) -> dict[str, Any]:
     return await _transition_content_opportunity(
         session, co_id=co_id, new_status="published", actor=actor,
@@ -868,8 +748,9 @@ async def publish_content_opportunity(
 # ---------------------------------------------------------------------------
 # Sole-operator console: one endpoint that returns everything the
 # `/admin` landing page needs — ContentOpportunity + Signal status
-# breakdowns + recent activity feed from AuditLog. Webhook auth (not
-# _require_admin) so the Phase 18 sessionStorage prompt works.
+# breakdowns + recent activity feed from AuditLog. Uses the Phase 21
+# unified ``require_admin`` (webhook / admin secret / Feishu open_id)
+# so the Phase 18 sessionStorage prompt works.
 #
 # Three serial SELECTs against indexed columns; expected < 200ms even
 # at 10k rows. No caching — Phase 20+ may add ETags.
@@ -993,11 +874,11 @@ async def _build_dashboard(session: AsyncSession) -> dict[str, Any]:
 
 @router.get(
     "/dashboard",
-    summary="Admin dashboard summary (admin, webhook)",
+    summary="Admin dashboard summary (admin)",
 )
 async def get_dashboard(
     session: AsyncSession = Depends(get_session),
-    _actor: str = Depends(_require_webhook),
+    _actor: str = Depends(require_admin),
 ) -> dict[str, Any]:
     """Aggregated stats + recent activity feed for the operator console.
 

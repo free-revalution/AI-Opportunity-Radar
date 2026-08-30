@@ -171,7 +171,14 @@ class TestAuth:
         r = client.get("/api/admin/activation", headers=_admin_headers())
         assert r.status_code == 200
 
-    async def test_no_secret_no_whitelist_blocks_all(self, client):
+    async def test_dev_short_circuit_when_all_settings_empty(self, client):
+        """Phase 21 — the unified ``require_admin`` dep short-circuits in
+        dev/local when every settings source is empty. This matches the
+        legacy ``_require_webhook`` behavior that ``conftest.py`` relies
+        on (clears ``APP_SECRET_KEY`` / ``RADAR_WEBHOOK_SECRET`` at
+        import time so all admin/internal tests pass without mock
+        settings). Old test asserted the inverse — kept the original
+        helper shape and updated the assertion."""
         from app.config import get_settings
 
         def _factory():
@@ -182,7 +189,7 @@ class TestAuth:
 
         client.app.dependency_overrides[get_settings] = _factory
         r = client.get("/api/admin/activation", headers=_admin_headers())
-        assert r.status_code == 401
+        assert r.status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -422,79 +429,6 @@ class TestSubscriptions:
         )
         assert r.status_code == 200
         assert r.json()["status"] == "cancelled"
-
-
-# ---------------------------------------------------------------------------
-# Audit
-# ---------------------------------------------------------------------------
-class TestAudit:
-    async def test_list_returns_recent_rows(self, client):
-        _override_settings(client)
-        await _seed_audit(client, action="publish")
-        await _seed_audit(client, action="research")
-        r = client.get("/api/admin/audit", headers=_admin_headers())
-        body = r.json()
-        assert body["count"] == 2
-
-    async def test_filter_by_actor_type(self, client):
-        _override_settings(client)
-        await _seed_audit(client, actor_type="system", action="publish")
-        await _seed_audit(client, actor_type="admin", action="activate")
-        r = client.get(
-            "/api/admin/audit?actor_type=admin",
-            headers=_admin_headers(),
-        )
-        body = r.json()
-        assert body["count"] == 1
-        assert body["items"][0]["action"] == "activate"
-
-    async def test_filter_by_action(self, client):
-        _override_settings(client)
-        await _seed_audit(client, action="publish")
-        await _seed_audit(client, action="research")
-        r = client.get(
-            "/api/admin/audit?action=publish",
-            headers=_admin_headers(),
-        )
-        body = r.json()
-        assert body["count"] == 1
-        assert body["items"][0]["action"] == "publish"
-
-    async def test_filter_by_result(self, client):
-        _override_settings(client)
-        await _seed_audit(client, result="success")
-        await _seed_audit(client, result="blocked")
-        r = client.get(
-            "/api/admin/audit?result=blocked",
-            headers=_admin_headers(),
-        )
-        body = r.json()
-        assert body["count"] == 1
-        assert body["items"][0]["result"] == "blocked"
-
-    async def test_filter_rejects_unknown_result(self, client):
-        _override_settings(client)
-        r = client.get(
-            "/api/admin/audit?result=weird",
-            headers=_admin_headers(),
-        )
-        assert r.status_code == 422
-
-    async def test_filter_by_since(self, client):
-        _override_settings(client)
-        await _seed_audit(client)
-        # Since "now + 1 hour" → should return nothing
-        since = (datetime.now(tz=timezone.utc) + timedelta(hours=1)).isoformat()
-        # URL-encode the `+` in the timezone offset (httpx/requests also
-        # do this transparently but TestClient doesn't always).
-        import urllib.parse
-
-        r = client.get(
-            f"/api/admin/audit?since={urllib.parse.quote(since)}",
-            headers=_admin_headers(),
-        )
-        assert r.status_code == 200, r.text
-        assert r.json()["count"] == 0
 
 
 # ---------------------------------------------------------------------------

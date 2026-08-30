@@ -3,9 +3,8 @@
 ``GET /api/signals`` returns recent signals with optional filters
 (``status``, ``min_signal_score``) for the admin Content Center.
 
-Auth: ``X-Radar-Webhook`` (HMAC-SHA256 of the configured webhook
-secret). Same dependency as the internal endpoints — Phase 18 should
-unify the dependency in ``app/api/deps.py``.
+Auth: Phase 21 unified — ``require_admin`` from ``app/api/deps.py``
+(webhook / admin secret / Feishu open_id).
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.internal import _check_webhook_secret
+from app.api.deps import require_admin
 from app.db import get_session
 from app.repositories.signals import SignalRepository
 
@@ -37,7 +36,7 @@ def _to_utc_iso(dt: Any) -> Optional[str]:
     return dt.astimezone(timezone.utc).isoformat()
 
 
-@router.get("/signals", summary="List recent signals (admin/webhook)")
+@router.get("/signals", summary="List recent signals (admin)")
 async def list_signals(
     status: Optional[str] = Query(
         default=None,
@@ -53,7 +52,7 @@ async def list_signals(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
-    _secret: None = Depends(_check_webhook_secret),
+    _actor: str = Depends(require_admin),
 ) -> dict[str, Any]:
     repo = SignalRepository(session)
     rows, total = await repo.list_recent(
