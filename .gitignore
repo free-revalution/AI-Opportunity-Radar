@@ -67,6 +67,12 @@ coverage/
 
 # --- Docs build ---
 docs/_build/
+
+# --- Docs directory ---
+# Phase 25 — docs/ is intentionally excluded from the public repo.
+# Kept on disk locally for operator reference; see README for inline
+# architecture notes if needed.
+docs/
 site/
 
 # --- Worktrees / Branches ---
