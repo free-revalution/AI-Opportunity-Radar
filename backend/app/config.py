@@ -203,6 +203,23 @@ class Settings(BaseSettings):
     # Max rows any admin list endpoint returns per request. Default 200.
     admin_max_list_limit: int = 200
 
+    # ---------- Phase 23 — auto-send activation code + renewal reminders ----------
+    # When true, `POST /api/admin/activation/issue` will IM the
+    # activation code to the operator-supplied `feishu_open_id`
+    # after committing the new row. Disable for dry-runs / local dev
+    # with no real Feishu App credentials.
+    send_activation_code_via_im: bool = True
+    # Daily cron `POST /api/internal/subscriptions/send_renewal_reminders`
+    # scans active subscriptions expiring within `subscription_renewal_
+    # reminder_days` and sends an IM to the bound `feishu_open_id`.
+    # Set to false to short-circuit (return `skipped_disabled=True`).
+    subscription_renewal_reminder_enabled: bool = True
+    subscription_renewal_reminder_days: int = 3
+    # Minimum hours between two reminders for the same subscription —
+    # a no-op when only one reminder has been sent, but stops the
+    # daily cron from spamming the same user if the cron overlap.
+    subscription_renewal_reminder_cooldown_hours: int = 24
+
     # ---------- Validators ----------
     @field_validator(
         "cors_allow_origins",

@@ -99,7 +99,7 @@ async def test_send_message_fetches_token_on_first_call() -> None:
     client = FeishuAppClient(settings=s, http_client=http)
     try:
         await client.send_message(
-            chat_id="oc_chat",
+            receive_id="oc_chat",
             msg_type="interactive",
             content={"elements": []},
         )
@@ -117,13 +117,13 @@ async def test_send_message_reuses_cached_token() -> None:
     client = FeishuAppClient(settings=s, http_client=http)
     try:
         await client.send_message(
-            chat_id="oc_1", msg_type="text", content={"text": "a"}
+            receive_id="oc_1", msg_type="text", content={"text": "a"}
         )
         await client.send_message(
-            chat_id="oc_2", msg_type="text", content={"text": "b"}
+            receive_id="oc_2", msg_type="text", content={"text": "b"}
         )
         await client.send_message(
-            chat_id="oc_3", msg_type="text", content={"text": "c"}
+            receive_id="oc_3", msg_type="text", content={"text": "c"}
         )
         assert transport._token_calls == 1
         assert transport._message_calls == 3
@@ -146,7 +146,7 @@ async def test_send_message_request_has_bearer_token_and_stringified_content() -
             "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "hi"}}],
         }
         await client.send_message(
-            chat_id="oc_target", msg_type="interactive", content=card
+            receive_id="oc_target", msg_type="interactive", content=card
         )
         msg_request = transport.calls[-1]
         assert msg_request.url.path.endswith("/im/v1/messages")
@@ -189,7 +189,7 @@ async def test_send_message_raises_on_feishu_rejection() -> None:
     try:
         with pytest.raises(FeishuAppError, match="robot disabled"):
             await client.send_message(
-                chat_id="oc_chat",
+                receive_id="oc_chat",
                 msg_type="text",
                 content={"text": "hi"},
             )
@@ -203,19 +203,56 @@ async def test_send_message_raises_when_not_configured() -> None:
     client = FeishuAppClient(settings=s, http_client=httpx.AsyncClient())
     with pytest.raises(FeishuAppError, match="not configured"):
         await client.send_message(
-            chat_id="oc_chat",
+            receive_id="oc_chat",
             msg_type="text",
             content={"text": "hi"},
         )
 
 
 @pytest.mark.asyncio
-async def test_send_message_raises_on_empty_chat_id() -> None:
+async def test_send_message_raises_on_empty_receive_id() -> None:
     s = _make_settings()
     client = FeishuAppClient(settings=s, http_client=httpx.AsyncClient())
-    with pytest.raises(FeishuAppError, match="chat_id is empty"):
+    with pytest.raises(FeishuAppError, match="receive_id is empty"):
         await client.send_message(
-            chat_id="",
+            receive_id="",
+            msg_type="text",
+            content={"text": "hi"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_send_message_supports_open_id_receive_id_type() -> None:
+    """Phase 23 v2.0 — `receive_id_type=open_id` is the typical choice
+    when sending DMs to a user's Feishu open id (e.g. activation code
+    delivery, subscription renewal reminders)."""
+    s = _make_settings()
+    transport = _RecordingTransport()
+    http = httpx.AsyncClient(transport=transport)
+    client = FeishuAppClient(settings=s, http_client=http)
+    try:
+        await client.send_message(
+            receive_id="ou_user_x",
+            receive_id_type="open_id",
+            msg_type="text",
+            content={"text": "hello"},
+        )
+        msg_request = transport.calls[-1]
+        assert msg_request.url.params["receive_id_type"] == "open_id"
+        body = json.loads(msg_request.content.decode("utf-8"))
+        assert body["receive_id"] == "ou_user_x"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_send_message_rejects_unknown_receive_id_type() -> None:
+    s = _make_settings()
+    client = FeishuAppClient(settings=s, http_client=httpx.AsyncClient())
+    with pytest.raises(FeishuAppError, match="unsupported receive_id_type"):
+        await client.send_message(
+            receive_id="ou_user",
+            receive_id_type="bogus_id",
             msg_type="text",
             content={"text": "hi"},
         )

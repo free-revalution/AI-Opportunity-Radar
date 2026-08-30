@@ -15,6 +15,7 @@ Endpoints (per docs/下一阶段开发技术方案.md §55, §88, §65-66):
       POST   /api/admin/activation/issue         — body: {plan, ttl_days?}
       GET    /api/admin/activation               — list codes (filter: status, plan, limit)
       POST   /api/admin/activation/{id}/revoke   — set status='revoked'
+      POST   /api/admin/activation/{id}/resend  — Phase 23 IM resend hint
 
     Subscriptions
       GET    /api/admin/subscriptions            — list (filter: status, plan, limit)
@@ -29,12 +30,17 @@ Endpoints (per docs/下一阶段开发技术方案.md §55, §88, §65-66):
       GET    /api/admin/sources                  — list with compliance posture
       PATCH  /api/admin/sources/{id}/compliance — body: {compliance_level, retention_policy?, source_block_reason?}
 
+    Messages (Phase 23)
+      GET    /api/admin/notifications            — paginated Notification history
+                                                 — filter: kind, channel, since
+
 All list endpoints honour ``admin_max_list_limit`` (default 200) and
 reject callers silently — no enumeration hints in error responses.
 """
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -44,11 +50,13 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_admin
+from app.config import get_settings
 from app.db import get_session
 from app.models import (
     ActivationCode,
     AuditLog,
     ContentOpportunity,
+    Notification,
     Signal,
     Source,
     Subscription,
@@ -65,6 +73,7 @@ from app.services.activation import (
 )
 from app.services.audit import AuditService, default_service as default_audit_service
 from app.services.compliance.models import ComplianceLevel
+from app.services.feishu.app_client import FeishuAppClient, FeishuAppError
 from app.services.subscriptions import PLAN_CATALOGUE
 
 
@@ -117,11 +126,303 @@ async def _audit_db(
 
 
 # ---------------------------------------------------------------------------
+# Phase 23 — Feishu IM helpers (activation-code delivery + renewal
+# reminders). Both write a Notification row + AuditLog row regardless of
+# success/failure so the operator has a single source of truth for "who
+# got what message when".
+# ---------------------------------------------------------------------------
+def _activation_code_card(
+    *,
+    plan: str,
+    code: str,
+    expires_at: Optional[datetime],
+) -> dict[str, Any]:
+    """Build the interactive card body for a freshly issued activation
+    code. Mirrors the Phase 6 `_feishu_card(reply)` shape so the
+    downstream `send_message` call is symmetric with the chat-reply path.
+    """
+    expires_iso = (
+        expires_at.astimezone(timezone.utc).isoformat() if expires_at else "—"
+    )
+    text = (
+        f"**您的 AI 机会雷达 {plan} 订阅激活码**\n\n"
+        f"激活码：`{code}`\n\n"
+        f"有效期至：{expires_iso}\n\n"
+        "请复制本激活码，然后向 AI 机会雷达 飞书机器人发送 `/activate "
+        f"{code}` 完成绑定。"
+    )
+    return {
+        "msg_type": "interactive",
+        "card": {
+            "config": {"wide_screen_mode": True},
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {"tag": "lark_md", "content": text},
+                }
+            ],
+            "header": {
+                "title": {
+                    "tag": "plain_text",
+                    "content": f"激活码 · {plan}",
+                },
+                "template": "blue",
+            },
+        },
+    }
+
+
+def _renewal_reminder_card(
+    *,
+    plan: str,
+    expires_at: datetime,
+    days_until: int,
+    sub_id: int,
+) -> dict[str, Any]:
+    """Build the interactive card body for a renewal reminder."""
+    expires_iso = expires_at.astimezone(timezone.utc).isoformat()
+    text = (
+        f"**您的 AI 机会雷达 {plan} 订阅即将到期**\n\n"
+        f"剩余 {days_until} 天后到期（{expires_iso}）。\n\n"
+        f"续订请回复 `/renew sub={sub_id}` 或联系管理员。"
+    )
+    return {
+        "msg_type": "interactive",
+        "card": {
+            "config": {"wide_screen_mode": True},
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {"tag": "lark_md", "content": text},
+                }
+            ],
+            "header": {
+                "title": {
+                    "tag": "plain_text",
+                    "content": f"续期提醒 · {plan}",
+                },
+                "template": "orange",
+            },
+        },
+    }
+
+
+async def _write_notification(
+    session: AsyncSession,
+    *,
+    channel: str,
+    payload: dict[str, Any],
+    delivered_at: Optional[datetime] = None,
+    error: Optional[str] = None,
+) -> Notification:
+    """Persist a Notification audit row. Pure INSERT — `payload` is free
+    form JSON; ``delivered_at`` is set on success, ``error`` on failure.
+    Caller is responsible for committing the session."""
+    row = Notification(
+        channel=channel,
+        payload=payload,
+        delivered_at=delivered_at,
+        error=error,
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def _send_activation_code_im(
+    session: AsyncSession,
+    *,
+    code_id: int,
+    code: str,
+    plan: str,
+    expires_at: Optional[datetime],
+    open_id: str,
+    actor: str,
+) -> dict[str, Any]:
+    """Phase 23 — auto-IM a freshly issued activation code.
+
+    Always writes a Notification row + AuditLog row (success OR failure)
+    so the operator has a complete record under `/admin/messages`.
+
+    Returns:
+      ``{sent: bool, message_id?: str, error?: str}`` — surfaced in the
+      admin issue endpoint's response under the ``im_send`` key so the
+      UI banner can show the result.
+    """
+    card = _activation_code_card(plan=plan, code=code, expires_at=expires_at)
+    base_payload: dict[str, Any] = {
+        "kind": "activation_code_issued",
+        "activation_code_id": code_id,
+        "plan": plan,
+        "open_id": open_id,
+    }
+
+    now = datetime.now(tz=timezone.utc)
+    sent = False
+    message_id: Optional[str] = None
+    error: Optional[str] = None
+    try:
+        settings = get_settings()
+        client = FeishuAppClient(settings=settings)
+        try:
+            response = await client.send_message(
+                receive_id=open_id,
+                receive_id_type="open_id",
+                msg_type=card["msg_type"],
+                content=card["card"],
+            )
+            data = response.get("data") or {}
+            message_id = data.get("message_id")
+            sent = True
+        finally:
+            await client.aclose()
+    except FeishuAppError as exc:
+        error = str(exc)
+
+    await _write_notification(
+        session,
+        channel="feishu",
+        payload={
+            **base_payload,
+            "code_preview": f"{code[:4]}…{code[-4:]}",  # never store plaintext
+            "message_id": message_id,
+        },
+        delivered_at=now if sent else None,
+        error=error,
+    )
+    await _audit_db(
+        session,
+        action="activation_im_send",
+        actor=actor,
+        resource_type="activation_code",
+        resource_id=str(code_id),
+        result="success" if sent else "failure",
+        metadata={
+            "open_id": open_id,
+            "message_id": message_id,
+            "error": error,
+        },
+    )
+    return {"sent": sent, "message_id": message_id, "error": error}
+
+
+async def _send_renewal_reminder_im(
+    session: AsyncSession,
+    *,
+    sub_id: int,
+    plan: str,
+    expires_at: datetime,
+    open_id: str,
+    actor: str,
+    days_until: int,
+) -> dict[str, Any]:
+    """Phase 23 — IM a renewal reminder to a subscription's bound user.
+
+    Same Notification + AuditLog pattern as ``_send_activation_code_im``,
+    but the payload is keyed by ``kind=subscription_renewal_reminder``
+    and ``subscription_id`` so the admin /messages page can deep-link
+    back to the subscription list.
+    """
+    card = _renewal_reminder_card(
+        plan=plan,
+        expires_at=expires_at,
+        days_until=days_until,
+        sub_id=sub_id,
+    )
+    base_payload: dict[str, Any] = {
+        "kind": "subscription_renewal_reminder",
+        "subscription_id": sub_id,
+        "plan": plan,
+        "open_id": open_id,
+        "days_until": days_until,
+        "expires_at": _to_utc_iso(expires_at),
+    }
+    sent = False
+    message_id: Optional[str] = None
+    error: Optional[str] = None
+    try:
+        settings = get_settings()
+        client = FeishuAppClient(settings=settings)
+        try:
+            response = await client.send_message(
+                receive_id=open_id,
+                receive_id_type="open_id",
+                msg_type=card["msg_type"],
+                content=card["card"],
+            )
+            data = response.get("data") or {}
+            message_id = data.get("message_id")
+            sent = True
+        finally:
+            await client.aclose()
+    except FeishuAppError as exc:
+        error = str(exc)
+
+    now = datetime.now(tz=timezone.utc)
+    await _write_notification(
+        session,
+        channel="feishu",
+        payload={**base_payload, "message_id": message_id},
+        delivered_at=now if sent else None,
+        error=error,
+    )
+    await _audit_db(
+        session,
+        action="subscription_renewal_reminder",
+        actor=actor,
+        resource_type="subscription",
+        resource_id=str(sub_id),
+        result="success" if sent else "failure",
+        metadata={
+            "open_id": open_id,
+            "days_until": days_until,
+            "message_id": message_id,
+            "error": error,
+        },
+    )
+    return {"sent": sent, "message_id": message_id, "error": error}
+
+
+def _notification_deep_link(payload: dict[str, Any]) -> Optional[str]:
+    """Compute the in-app deep link for a Notification row.
+
+    Mirrors the frontend's ``notificationDeepLink`` helper in
+    ``frontend/src/lib/adminCrud.ts`` — keeping them in sync is the only
+    way the `/admin/messages` view's "打开资源" button lands somewhere
+    sensible.
+    """
+    kind = payload.get("kind")
+    if kind == "activation_code_issued" or kind == "activation_code_resend":
+        code_id = payload.get("activation_code_id")
+        if code_id is not None:
+            return f"/admin/activation?id={code_id}"
+        return "/admin/activation"
+    if kind == "subscription_renewal_reminder":
+        sub_id = payload.get("subscription_id")
+        if sub_id is not None:
+            return f"/admin/subscriptions?id={sub_id}"
+        return "/admin/subscriptions"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Request schemas
 # ---------------------------------------------------------------------------
 class IssueCodeRequest(BaseModel):
     plan: str = Field(..., description="free | basic | pro | creator")
     ttl_days: int = Field(default=365, ge=1, le=3650)
+    # Phase 23 — when supplied, the freshly issued plaintext is IM'd to
+    # the customer's Feishu open_id via `POST /im/v1/messages` right
+    # after the activation_codes row commits. The plaintext is still
+    # returned in the response so the operator banner can show it.
+    feishu_open_id: Optional[str] = Field(
+        default=None,
+        description="Phase 23 — destination Feishu open_id for auto-IM",
+    )
+    # Phase 23 — operator toggle. Default true. Set false to issue the
+    # code without an outbound IM (e.g. when the operator hands the
+    # code over by hand).
+    send_im: bool = Field(default=True, description="Phase 23 — auto-IM toggle")
 
 
 class ExtendSubscriptionRequest(BaseModel):
@@ -172,13 +473,39 @@ async def issue_activation_code(
         metadata={"plan": plan, "ttl_days": body.ttl_days},
     )
 
-    return {
+    response: dict[str, Any] = {
         "id": row.id,
         "code": issued.code,           # plaintext — returned ONCE
         "plan": row.plan,
         "status": row.status,
         "expires_at": _to_utc_iso(row.expires_at),
     }
+
+    # Phase 23 — auto-IM the activation code to the operator-supplied
+    # open_id. Disabled when:
+    #   * `send_im=false` (operator wants to hand-deliver),
+    #   * no `feishu_open_id` supplied,
+    #   * the setting `send_activation_code_via_im=false` (kill switch
+    #     for dev / dry-runs).
+    # We still return `im_send=null` in those cases so the UI's response
+    # shape is uniform.
+    settings = get_settings()
+    if body.send_im and body.feishu_open_id and settings.send_activation_code_via_im:
+        im_status = await _send_activation_code_im(
+            session,
+            code_id=row.id,
+            code=issued.code,
+            plan=plan,
+            expires_at=row.expires_at,
+            open_id=body.feishu_open_id,
+            actor=actor,
+        )
+        await session.commit()
+        response["im_send"] = im_status
+    else:
+        response["im_send"] = None
+
+    return response
 
 
 @router.get(
@@ -243,6 +570,244 @@ async def revoke_activation_code(
     )
 
     return {"id": code_id, "status": "revoked"}
+
+
+# ---------------------------------------------------------------------------
+# Phase 23 — re-send a previously issued (unused) code's plaintext
+# notification. The plaintext is gone from the DB so we can't reconstitute
+# the original — the resend composes a fresh card that says "your
+# activation code has been re-issued; please contact support for the
+# plaintext". For real reuse, the operator should issue a NEW code.
+# ---------------------------------------------------------------------------
+class ResendActivationRequest(BaseModel):
+    open_id: Optional[str] = Field(
+        default=None,
+        description="Phase 23 — Feishu open_id to send the reminder to",
+    )
+
+
+@router.post(
+    "/activation/{code_id}/resend",
+    summary="Resend a 'please contact us' reminder for an unused code",
+)
+async def resend_activation_code(
+    code_id: int,
+    body: ResendActivationRequest,
+    session: AsyncSession = Depends(get_session),
+    actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    row = await session.get(ActivationCode, code_id)
+    if row is None:
+        raise HTTPException(404, "code not found")
+    if row.status not in {"unused", "active"}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"cannot resend — code status is {row.status}",
+        )
+    target = body.open_id or row.bound_feishu_open_id
+    if not target:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="`open_id` required (code has no bound_feishu_open_id)",
+        )
+    settings = get_settings()
+    if not settings.send_activation_code_via_im:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="send_activation_code_via_im disabled by setting",
+        )
+
+    # The plaintext is gone — we can only hint the user to contact us.
+    # In production this is paired with the operator pulling the code
+    # out of the original banner before it 30s-expires; for a resend
+    # the operator has to walk the customer through a new code.
+    sent = False
+    message_id: Optional[str] = None
+    error: Optional[str] = None
+    try:
+        client = FeishuAppClient(settings=settings)
+        try:
+            card = {
+                "msg_type": "interactive",
+                "card": {
+                    "config": {"wide_screen_mode": True},
+                    "elements": [
+                        {
+                            "tag": "div",
+                            "text": {
+                                "tag": "lark_md",
+                                "content": (
+                                    f"您的 AI 机会雷达 {row.plan} 激活码 #"
+                                    f"{row.id} 仍在等待绑定。请联系管理员索取"
+                                    " 明文，或等待新激活码。\n\n"
+                                    f"有效期至：{_to_utc_iso(row.expires_at) or '—'}"
+                                ),
+                            },
+                        }
+                    ],
+                    "header": {
+                        "title": {
+                            "tag": "plain_text",
+                            "content": "激活码 · 待绑定",
+                        },
+                        "template": "orange",
+                    },
+                },
+            }
+            response = await client.send_message(
+                receive_id=target,
+                receive_id_type="open_id",
+                msg_type=card["msg_type"],
+                content=card["card"],
+            )
+            data = response.get("data") or {}
+            message_id = data.get("message_id")
+            sent = True
+        finally:
+            await client.aclose()
+    except FeishuAppError as exc:
+        error = str(exc)
+
+    now = datetime.now(tz=timezone.utc)
+    await _write_notification(
+        session,
+        channel="feishu",
+        payload={
+            "kind": "activation_code_resend",
+            "activation_code_id": code_id,
+            "plan": row.plan,
+            "open_id": target,
+            "message_id": message_id,
+        },
+        delivered_at=now if sent else None,
+        error=error,
+    )
+    await _audit_db(
+        session,
+        action="activation_im_resend",
+        actor=actor,
+        resource_type="activation_code",
+        resource_id=str(code_id),
+        result="success" if sent else "failure",
+        metadata={
+            "open_id": target,
+            "message_id": message_id,
+            "error": error,
+        },
+    )
+    await session.commit()
+
+    return {
+        "id": code_id,
+        "sent": sent,
+        "message_id": message_id,
+        "error": error,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Notification history (Phase 23) — powers /admin/messages
+# ---------------------------------------------------------------------------
+@router.get(
+    "/notifications",
+    summary="List notification delivery history (Phase 23)",
+)
+async def list_notifications(
+    kind: Optional[str] = Query(
+        default=None,
+        description=(
+            "Filter by payload.kind (cross-dialect JSON path) — "
+            "e.g. 'activation_code_issued', 'subscription_renewal_reminder'."
+        ),
+    ),
+    channel: Optional[str] = Query(
+        default=None,
+        description="Filter by Notification.channel (e.g. 'feishu').",
+    ),
+    since: Optional[datetime] = Query(
+        default=None,
+        description="Lower bound on created_at (ISO-8601).",
+    ),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    session: AsyncSession = Depends(get_session),
+    _actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    """Paginated Notification history for the ``/admin/messages`` viewer.
+
+    Each row is augmented with:
+      * ``kind`` — extracted from ``payload.kind`` (cross-dialect JSON
+        path; mirrors the cooldown check in
+        ``send_subscription_renewal_reminders``).
+      * ``deep_link`` — admin path that takes the operator back to the
+        related resource (activation code, subscription, …).
+      * ``failed`` — boolean convenience flag for the UI's red-chip row.
+
+    Cross-dialect JSON extraction: PostgreSQL uses ``payload['kind'].astext``;
+    SQLite uses ``func.json_extract(payload, '$.kind')``. Mirrors the
+    pattern already used by ``_fetch_grouped_content`` for
+    ``payload['opportunity_id']``.
+    """
+    base = select(Notification).order_by(
+        Notification.created_at.desc(),
+        Notification.id.desc(),
+    )
+    count_base = select(func.count()).select_from(Notification)
+
+    bind = session.bind
+    dialect_name = bind.dialect.name if bind is not None else "sqlite"
+
+    if kind:
+        if dialect_name == "postgresql":
+            kind_filter = Notification.payload["kind"].astext == kind
+        else:
+            kind_filter = (
+                func.json_extract(Notification.payload, "$.kind") == kind
+            )
+        base = base.where(kind_filter)
+        count_base = count_base.where(kind_filter)
+
+    if channel:
+        ch_filter = Notification.channel == channel
+        base = base.where(ch_filter)
+        count_base = count_base.where(ch_filter)
+
+    if since is not None:
+        # SQLite strips tzinfo — coerce to UTC for a stable compare.
+        since_dt = since
+        if since_dt.tzinfo is None:
+            since_dt = since_dt.replace(tzinfo=timezone.utc)
+        since_filter = Notification.created_at >= since_dt
+        base = base.where(since_filter)
+        count_base = count_base.where(since_filter)
+
+    stmt = base.limit(limit).offset(offset)
+    rows = list((await session.execute(stmt)).scalars().all())
+    total = int((await session.execute(count_base)).scalar_one())
+
+    items: list[dict[str, Any]] = []
+    for n in rows:
+        payload = dict(n.payload or {})
+        items.append(
+            {
+                "id": n.id,
+                "channel": n.channel,
+                "kind": payload.get("kind"),
+                "payload": payload,
+                "delivered_at": _to_utc_iso(n.delivered_at),
+                "error": n.error,
+                "failed": n.error is not None,
+                "deep_link": _notification_deep_link(payload),
+                "created_at": _to_utc_iso(n.created_at),
+            }
+        )
+
+    return {
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 # ---------------------------------------------------------------------------

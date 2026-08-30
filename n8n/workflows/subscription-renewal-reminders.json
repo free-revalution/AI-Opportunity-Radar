@@ -1,0 +1,55 @@
+{
+  "name": "subscription-renewal-reminders",
+  "active": true,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "cronExpression", "expression": "30 3 * * *" }
+          ]
+        }
+      },
+      "id": "cron-trigger",
+      "name": "Cron (daily 03:30 UTC, after digest)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.API_BASE_URL_INTERNAL}}/api/internal/subscriptions/send_renewal_reminders",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-Radar-Webhook", "value": "={{$env.APP_SECRET_KEY}}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"days\": 3, \"dry_run\": false}",
+        "options": {
+          "timeout": 300000,
+          "retry": { "maxTries": 2, "waitBetweenTries": 5000 }
+        }
+      },
+      "id": "step-send-reminders",
+      "name": "Send renewal reminders (Phase 23)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [520, 300]
+    }
+  ],
+  "connections": {
+    "Cron (daily 03:30 UTC, after digest)": {
+      "main": [
+        [
+          { "node": "Send renewal reminders (Phase 23)", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "settings": { "executionOrder": "v1" }
+}

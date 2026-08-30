@@ -222,7 +222,13 @@ describe("ActivationCodesPanel", () => {
     fireEvent.click(screen.getByTestId("issue-submit"));
 
     await waitFor(() => {
-      expect(mockedIssue).toHaveBeenCalledWith({ plan: "pro", ttl_days: 365 });
+      // Phase 23 — defaults now include `send_im: true` so the operator
+      // gets the IM delivery attempt unless they explicitly uncheck.
+      expect(mockedIssue).toHaveBeenCalledWith({
+        plan: "pro",
+        ttl_days: 365,
+        send_im: true,
+      });
     });
 
     // Modal closes, banner + toast display the code.

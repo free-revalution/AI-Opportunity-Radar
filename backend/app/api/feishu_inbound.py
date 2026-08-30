@@ -244,7 +244,8 @@ async def handle_feishu_event(request: Request) -> dict[str, Any]:
     card_payload = _feishu_card(reply)
     try:
         await app_client.send_message(
-            chat_id=event.chat_id,
+            receive_id=event.chat_id,
+            receive_id_type="chat_id",
             msg_type=card_payload["msg_type"],
             content=card_payload["card"],
         )

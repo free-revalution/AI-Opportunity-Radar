@@ -8,12 +8,13 @@ secret header (`X-Radar-Webhook`).
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import Response
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,6 +22,7 @@ from app.api.deps import require_admin
 from app.config import get_settings
 from app.db import get_session
 from app.metrics import record_pipeline_run
+from app.models import Subscription
 from app.schemas.on_demand import OnDemandResearchRequest
 from app.schemas.order import (
     OrderCreateRequest,
@@ -623,6 +625,163 @@ async def list_notifications(
             }
             for r in rows
         ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 23 — daily cron: send renewal reminders N days before expiry.
+# n8n workflow calls this once per day (default 03:30 UTC) with
+# `X-Radar-Webhook`. Behaviour:
+#
+#   * scan subscriptions where status='active' AND expires_at ≤ now+days
+#     AND expires_at > now (skip already-expired rows) AND feishu_open_id
+#     IS NOT NULL;
+#   * skip subscriptions whose cooldown window has a fresh reminder
+#     (default 24h, configurable via
+#     ``settings.subscription_renewal_reminder_cooldown_hours``);
+#   * call ``_send_renewal_reminder_im`` per surviving sub — that helper
+#     writes Notification + AuditLog rows regardless of success/failure;
+#   * write a final ``subscription_renewal_reminders_run`` audit row
+#     summarising the pass.
+# ---------------------------------------------------------------------------
+class _RenewalReminderRequest(BaseModel):
+    days: Optional[int] = None
+    dry_run: bool = False
+
+
+@router.post(
+    "/subscriptions/send_renewal_reminders",
+    summary="Daily cron: send Feishu renewal reminders",
+)
+async def send_subscription_renewal_reminders(
+    body: Optional[_RenewalReminderRequest] = None,
+    session: AsyncSession = Depends(get_session),
+    _actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    from app.api.admin import _send_renewal_reminder_im, _audit_db
+    from app.models import Notification
+    from sqlalchemy import Integer, func
+
+    body = body or _RenewalReminderRequest()
+    settings = get_settings()
+    if not settings.subscription_renewal_reminder_enabled:
+        return {"scanned": 0, "sent": 0, "skipped_disabled": True}
+
+    days = body.days or settings.subscription_renewal_reminder_days
+    now = datetime.now(tz=timezone.utc)
+    cutoff = now + timedelta(days=days)
+
+    scan_stmt = (
+        select(Subscription)
+        .where(
+            Subscription.status == "active",
+            Subscription.expires_at.isnot(None),
+            Subscription.expires_at <= cutoff,
+            Subscription.expires_at > now,
+            Subscription.feishu_open_id.isnot(None),
+        )
+        .order_by(Subscription.expires_at.asc())
+    )
+    rows = list((await session.execute(scan_stmt)).scalars().all())
+
+    cooldown_cutoff = now - timedelta(
+        hours=settings.subscription_renewal_reminder_cooldown_hours
+    )
+    bind = session.bind
+    dialect_name = bind.dialect.name if bind is not None else "sqlite"
+    sent_count = 0
+    skipped_cooldown = 0
+    failures: list[dict[str, Any]] = []
+
+    for sub in rows:
+        # Cooldown check — has the same subscription already been
+        # notified inside the cooldown window? Cross-dialect JSON path:
+        # SQLite uses json_extract, PostgreSQL uses ->>/astext.
+        cooldown_stmt = (
+            select(func.count())
+            .select_from(Notification)
+            .where(
+                Notification.channel == "feishu",
+                Notification.error.is_(None),
+                Notification.delivered_at >= cooldown_cutoff,
+            )
+        )
+        if dialect_name == "postgresql":
+            cooldown_stmt = cooldown_stmt.where(
+                Notification.payload["kind"].astext == "subscription_renewal_reminder",
+                Notification.payload["subscription_id"].astext.cast(Integer) == sub.id,
+            )
+        else:
+            cooldown_stmt = cooldown_stmt.where(
+                func.json_extract(Notification.payload, "$.kind")
+                == "subscription_renewal_reminder",
+                func.json_extract(Notification.payload, "$.subscription_id")
+                == sub.id,
+            )
+        in_cooldown = (await session.execute(cooldown_stmt)).scalar_one() > 0
+        if in_cooldown:
+            skipped_cooldown += 1
+            continue
+
+        if body.dry_run:
+            continue
+
+        # Normalise naive datetimes from SQLite before any arithmetic.
+        sub_expires = sub.expires_at
+        if sub_expires is not None and sub_expires.tzinfo is None:
+            sub_expires = sub_expires.replace(tzinfo=timezone.utc)
+
+        days_until = max(0, (sub_expires - now).days) if sub_expires else 0
+
+        result = await _send_renewal_reminder_im(
+            session,
+            sub_id=sub.id,
+            plan=sub.plan,
+            expires_at=sub_expires,
+            open_id=sub.feishu_open_id,
+            actor="renewal_cron",
+            days_until=days_until,
+        )
+        if result["sent"]:
+            sent_count += 1
+        else:
+            failures.append(
+                {"subscription_id": sub.id, "error": result.get("error")}
+            )
+
+    await _audit_db(
+        session,
+        action="subscription_renewal_reminders_run",
+        actor="renewal_cron",
+        resource_type="subscription",
+        resource_id="batch",
+        result="success" if not failures else "partial",
+        metadata={
+            "scanned": len(rows),
+            "sent": sent_count,
+            "skipped_cooldown": skipped_cooldown,
+            "failures": failures,
+            "days": days,
+            "dry_run": body.dry_run,
+        },
+    )
+    await session.commit()
+
+    logger.info(
+        "subscription_renewal_reminders_run_complete",
+        scanned=len(rows),
+        sent=sent_count,
+        skipped_cooldown=skipped_cooldown,
+        failure_count=len(failures),
+        dry_run=body.dry_run,
+    )
+    return {
+        "scanned": len(rows),
+        "sent": sent_count,
+        "skipped_cooldown": skipped_cooldown,
+        "failures": failures,
+        "days": days,
+        "dry_run": body.dry_run,
     }
 
 

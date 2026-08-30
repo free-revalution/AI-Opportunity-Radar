@@ -101,3 +101,43 @@ export function auditDeepLink(
   });
   return `/admin/audit-logs?${params.toString()}`;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 23 — Notification (IM delivery history) chips + deep links.
+// Mirrors `_notification_deep_link` in `backend/app/api/admin.py` —
+// keep them in sync so the messages panel's "打开资源" button lands
+// somewhere sensible.
+// ---------------------------------------------------------------------------
+export const NOTIFICATION_KIND_LABELS: Record<string, string> = {
+  activation_code_issued: "激活码发放",
+  activation_code_resend: "激活码补发",
+  subscription_renewal_reminder: "续期提醒",
+};
+
+export const NOTIFICATION_KIND_CHIP: Record<string, string> = {
+  activation_code_issued: "bg-blue-500/20 text-blue-300",
+  activation_code_resend: "bg-violet-500/20 text-violet-300",
+  subscription_renewal_reminder: "bg-amber-500/20 text-amber-300",
+};
+
+export const NOTIFICATION_CHANNEL_CHIP: Record<string, string> = {
+  feishu: "bg-emerald-500/20 text-emerald-300",
+  telegram: "bg-sky-500/20 text-sky-300",
+};
+
+/** Server-side `payload` → admin route the operator can open in one click. */
+export function notificationDeepLink(
+  payload: Record<string, unknown>,
+): string | null {
+  const kind = payload.kind as string | undefined;
+  if (
+    (kind === "activation_code_issued" || kind === "activation_code_resend") &&
+    payload.activation_code_id != null
+  ) {
+    return `/admin/activation?id=${encodeURIComponent(String(payload.activation_code_id))}`;
+  }
+  if (kind === "subscription_renewal_reminder" && payload.subscription_id != null) {
+    return `/admin/subscriptions?id=${encodeURIComponent(String(payload.subscription_id))}`;
+  }
+  return null;
+}

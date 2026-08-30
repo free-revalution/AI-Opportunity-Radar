@@ -8,10 +8,11 @@ a message to be sent.
 Per the Feishu Open API spec:
   * `POST /auth/v3/tenant_access_token/internal` returns a 2-hour
     `tenant_access_token`; we cache it and refresh lazily on expiry.
-  * `POST /im/v1/messages?receive_id_type=chat_id` sends one message
-    to a chat; body shape:
+  * `POST /im/v1/messages?receive_id_type=...` sends one message to a
+    chat or a user. Phase 23 v2.0 — supports `receive_id_type` ∈
+    {"chat_id", "open_id", "union_id", "email"}. body shape:
         {
-          "receive_id": "oc_xxx",
+          "receive_id": "<oc_xxx | ou_xxx | ...>",
           "msg_type": "text" | "interactive" | "post",
           "content": "{\"text\":\"...\"}"  # string of JSON
         }
@@ -144,28 +145,48 @@ class FeishuAppClient:
     async def send_message(
         self,
         *,
-        chat_id: str,
+        receive_id: str,
         msg_type: str,
         content: dict[str, Any],
+        receive_id_type: str = "chat_id",
     ) -> dict[str, Any]:
-        """POST /im/v1/messages to send a message to one chat.
+        """POST /im/v1/messages to send one message.
+
+        Phase 23 v2.0 — the parameter was renamed from ``chat_id`` to
+        the semantically more accurate ``receive_id`` so the same
+        method can target a chat (``oc_xxx``), an open user id
+        (``ou_xxx``), a union id, or an email. ``receive_id_type``
+        defaults to ``"chat_id"`` so existing callers keep working
+        without changes.
 
         Args:
-          chat_id: the `oc_xxx` chat identifier from the inbound event.
-          msg_type: one of `"text"`, `"interactive"`, `"post"`, etc.
-          content: the typed message body — Feishu expects this dict to
-            be JSON-serialised into the request's `content` field as
-            a STRING (not an object).
+          receive_id: the target identifier — ``oc_xxx`` for chat,
+            ``ou_xxx`` for a user's open_id, etc. Match the value
+            passed to ``receive_id_type``.
+          msg_type: one of ``"text"``, ``"interactive"``, ``"post"``.
+          content: typed message body — Feishu expects this dict to
+            be JSON-serialised into the request's ``content`` field
+            as a STRING (not an object).
+          receive_id_type: one of ``chat_id``, ``open_id``,
+            ``union_id``, ``email``. Phase 23 — ``open_id`` is the
+            typical choice for activation-code delivery and
+            subscription renewal reminders because the
+            ``Subscription.feishu_open_id`` row stores the user
+            identifier (not a chat).
 
         Returns:
           The Feishu response body (a dict with `code`, `msg`, `data`).
 
         Raises:
-          FeishuAppError: on HTTP failure, non-zero `code`, or missing
-            credentials.
+          FeishuAppError: on HTTP failure, non-zero ``code``, or
+            missing credentials / unsupported ``receive_id_type``.
         """
-        if not chat_id:
-            raise FeishuAppError("send_message: chat_id is empty")
+        if not receive_id:
+            raise FeishuAppError("send_message: receive_id is empty")
+        if receive_id_type not in {"chat_id", "open_id", "union_id", "email"}:
+            raise FeishuAppError(
+                f"send_message: unsupported receive_id_type {receive_id_type!r}"
+            )
         if not self.is_configured:
             raise FeishuAppError(
                 "feishu app not configured (set FEISHU_APP_ID + FEISHU_APP_SECRET)"
@@ -174,9 +195,9 @@ class FeishuAppClient:
         import json
 
         token = await self._get_token()
-        url = f"{self.base_url}{_MESSAGE_PATH}?receive_id_type=chat_id"
+        url = f"{self.base_url}{_MESSAGE_PATH}?receive_id_type={receive_id_type}"
         body = {
-            "receive_id": chat_id,
+            "receive_id": receive_id,
             "msg_type": msg_type,
             "content": json.dumps(content, ensure_ascii=False),
         }
@@ -208,7 +229,8 @@ class FeishuAppClient:
                 )
         logger.info(
             "feishu_app_message_sent",
-            chat_id=chat_id,
+            receive_id_type=receive_id_type,
+            receive_id=receive_id,
             msg_type=msg_type,
             message_id=(data.get("data") or {}).get("message_id"),
         )

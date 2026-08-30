@@ -87,6 +87,13 @@ export async function SiteHeader() {
             Audit Log
           </Link>
           <Link
+            href="/admin/messages"
+            className="hover:text-accent"
+            data-testid="nav-admin-messages"
+          >
+            Messages
+          </Link>
+          <Link
             href="/admin/activation"
             className="hover:text-accent"
             data-testid="nav-admin-activation"

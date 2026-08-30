@@ -706,6 +706,8 @@ import type {
   ActivationIssueRequest,
   ActivationIssueResponse,
   ActivationListResponse,
+  ActivationResendResponse,
+  NotificationListResponse,
   Source,
   SourceComplianceUpdateRequest,
   SourceListResponse,
@@ -757,6 +759,50 @@ export async function revokeActivationCode(
   return jsonFetchWithSecret<ActivationCode>(
     `/api/admin/activation/${codeId}/revoke`,
     { method: "POST" },
+  );
+}
+
+/** Phase 23 — send a 'please contact us' reminder for an unused/active
+ *  code. Backend only ever IM's a hint card — plaintext recovery is
+ *  impossible (codes are hashed at rest). `openId` is required; falls
+ *  back to `bound_feishu_open_id` server-side if null is passed. */
+export async function resendActivationCode(
+  codeId: number,
+  openId: string,
+): Promise<ActivationResendResponse> {
+  return jsonFetchWithSecret<ActivationResendResponse>(
+    `/api/admin/activation/${codeId}/resend`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ open_id: openId }),
+    },
+  );
+}
+
+export interface NotificationListParams {
+  kind?: string;
+  channel?: string;
+  /** ISO-8601 lower bound on created_at. */
+  since?: string;
+  limit?: number;
+  offset?: number;
+}
+
+/** Phase 23 — paginated Notification history for the /admin/messages
+ *  viewer. Filter by `kind` / `channel` / `since`. */
+export async function fetchNotifications(
+  params: NotificationListParams = {},
+): Promise<NotificationListResponse> {
+  const search = new URLSearchParams();
+  if (params.kind) search.set("kind", params.kind);
+  if (params.channel) search.set("channel", params.channel);
+  if (params.since) search.set("since", params.since);
+  if (typeof params.limit === "number") search.set("limit", String(params.limit));
+  if (typeof params.offset === "number") search.set("offset", String(params.offset));
+  const qs = search.toString();
+  return jsonFetchWithSecret<NotificationListResponse>(
+    `/api/admin/notifications${qs ? `?${qs}` : ""}`,
   );
 }
 

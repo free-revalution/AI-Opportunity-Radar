@@ -108,16 +108,47 @@ export interface HealthResponse {
 export interface NotificationItem {
   id: number;
   channel: string;
+  // Phase 23 — discriminator lifted out of payload.kind so the
+  // `/admin/messages` table can filter + chip without a second
+  // round-trip. Older rows written before Phase 23 may have `null`.
+  kind?: string | null;
   payload: Record<string, unknown>;
   delivered_at: string | null;
   error: string | null;
   created_at: string;
+  // Phase 23 — `true` when the row failed delivery (server-side helper
+  // for the red "FAILED" chip in the table).
+  failed?: boolean;
+  // Phase 23 — admin URL the operator can jump to in one click
+  // (e.g. /admin/activation?id=42 for `activation_code_issued` rows).
+  // `null` when no resource can be derived from the payload.
+  deep_link?: string | null;
 }
 
 export interface NotificationsResponse {
   count: number;
   items: NotificationItem[];
 }
+
+// Phase 23 — paginated shape returned by GET /api/admin/notifications.
+// (The legacy `/api/internal/notifications/history` shape above still
+// works for the operator dashboard's recent-activity feed.)
+export interface NotificationListResponse {
+  items: NotificationItem[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+// Discriminator constants for the two Phase 23 IM kinds. Adding a new
+// kind requires extending `NOTIFICATION_KIND_LABELS` + `NOTIFICATION_KIND_CHIP`
+// in `lib/adminCrud.ts` so the messages panel renders it.
+export const NOTIFICATION_KINDS = [
+  "activation_code_issued",
+  "activation_code_resend",
+  "subscription_renewal_reminder",
+] as const;
+export type NotificationKind = (typeof NOTIFICATION_KINDS)[number];
 
 // ---------------------------------------------------------------------------
 // Content Center (Phase 3 v2.0)
@@ -690,13 +721,36 @@ export interface ActivationListResponse {
 export interface ActivationIssueRequest {
   plan: string;
   ttl_days?: number;
+  // Phase 23 — destination Feishu open_id. When set + `send_im` true,
+  // the backend IM's the plaintext to the user via /im/v1/messages
+  // right after the row commits.
+  feishu_open_id?: string;
+  // Phase 23 — operator toggle. Default true. False = hand-deliver.
+  send_im?: boolean;
+}
+
+// Phase 23 — server's IM delivery status for the issue call. `null`
+// when no auto-IM was attempted (operator toggle off, no open_id,
+// or the `send_activation_code_via_im` kill-switch is flipped).
+export interface ActivationImSend {
+  sent: boolean;
+  message_id?: string | null;
+  error?: string | null;
 }
 
 export interface ActivationIssueResponse extends ActivationCode {
   /** Plaintext code — returned ONCE by the backend. Caller must display
    * it to the operator immediately; never re-fetchable. */
   code: string;
+  // Phase 23 — see `ActivationImSend`. Null on no-op paths.
+  im_send?: ActivationImSend | null;
 }
+
+// Phase 23 — `POST /api/admin/activation/{id}/resend` returns the
+// `ActivationImSend` envelope directly. Backend only ever IM's a
+// "please contact us" hint card — plaintext recovery is impossible
+// (codes are hashed at rest).
+export type ActivationResendResponse = ActivationImSend & { id: number };
 
 export type SubscriptionStatusValue =
   | "active"

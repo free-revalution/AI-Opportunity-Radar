@@ -465,9 +465,24 @@ def feishu_client(monkeypatch):
 
         is_configured = True
 
-        async def send_message(self, *, chat_id, msg_type, content):
+        # Phase 23A — `send_message` renamed `chat_id` → `receive_id`
+        # and gained `receive_id_type`. Default `chat_id` keeps the
+        # stub in sync with the production caller.
+        async def send_message(
+            self,
+            *,
+            receive_id,
+            msg_type,
+            content,
+            receive_id_type="chat_id",
+        ):
             sent_app_messages.append(
-                {"chat_id": chat_id, "msg_type": msg_type, "content": content}
+                {
+                    "receive_id": receive_id,
+                    "receive_id_type": receive_id_type,
+                    "msg_type": msg_type,
+                    "content": content,
+                }
             )
             return {"code": 0, "msg": "ok", "data": {"message_id": "om_stub"}}
 
@@ -562,7 +577,12 @@ def test_feishu_endpoint_routes_today_command(feishu_client):
     # (not echoed in the response body — Feishu callbacks don't work that way).
     sent = feishu_client._sent_app_messages  # type: ignore[attr-defined]
     assert len(sent) == 1
-    assert sent[0]["chat_id"] == "oc_chat"
+    # Phase 23A — `receive_id` (not `chat_id`) is the new keyword +
+    # stored key. The endpoint explicitly passes receive_id_type=
+    # "chat_id" for the inbound chat-reply path so the assertion
+    # is symmetric with the production call.
+    assert sent[0]["receive_id"] == "oc_chat"
+    assert sent[0]["receive_id_type"] == "chat_id"
     assert sent[0]["msg_type"] == "interactive"
     assert "elements" in sent[0]["content"]
 

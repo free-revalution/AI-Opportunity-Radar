@@ -19,6 +19,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import {
   fetchActivationCodes,
   issueActivationCode,
+  resendActivationCode,
   revokeActivationCode,
   type ActivationListParams,
 } from "@/lib/api";
@@ -94,6 +95,11 @@ export function ActivationCodesPanel({
 
   const [issueOpen, setIssueOpen] = useState(false);
   const [revokeTarget, setRevokeTarget] = useState<ActivationCode | null>(null);
+  // Phase 23 — resend modal target. Resend only works for codes that
+  // are still redeemable (`unused` or `active`); backend rejects others
+  // with 409. The modal asks for an `open_id` since plaintext recovery
+  // is impossible — we can only IM a "please contact us" hint card.
+  const [resendTarget, setResendTarget] = useState<ActivationCode | null>(null);
 
   const showToast = useCallback(
     (kind: "ok" | "err", text: string) => {
@@ -174,7 +180,25 @@ export function ActivationCodesPanel({
         plan: resp.plan,
         expires_at: resp.expires_at,
       });
-      showToast("ok", `✅ 激活码已发放: ${resp.code} (${resp.plan})`);
+      // Phase 23 — surface the auto-IM result in the toast so the
+      // operator knows whether the customer received the code.
+      const im = resp.im_send;
+      if (im?.sent) {
+        showToast(
+          "ok",
+          `✅ 激活码已发放 + 已发飞书消息 (${im.message_id ?? "—"})`,
+        );
+      } else if (im && !im.sent) {
+        // Backend reports the IM failure but the issue itself succeeded —
+        // treat the toast as err (red) so the operator's attention is
+        // pulled to /admin/messages for the failure row.
+        showToast(
+          "err",
+          `⚠️ 激活码已发放但飞书发送失败: ${im.error ?? "unknown error"}`,
+        );
+      } else {
+        showToast("ok", `✅ 激活码已发放: ${resp.code} (${resp.plan})`);
+      }
       window.setTimeout(() => setBannerCode(null), 30_000);
       void refresh(form);
     },
@@ -434,6 +458,20 @@ export function ActivationCodesPanel({
                           撤销
                         </button>
                       )}
+                      {/* Phase 23 — Resend only works for unused/active
+                          codes. Plaintext is unrecoverable, so this IM's
+                          a "please contact us" hint to the open_id. */}
+                      {(it.status === "unused" || it.status === "active") && (
+                        <button
+                          type="button"
+                          onClick={() => setResendTarget(it)}
+                          disabled={loading}
+                          className="rounded-md border border-accent/40 bg-accent/10 px-2 py-0.5 text-xs text-accent hover:bg-accent/20 disabled:opacity-50"
+                          data-testid={`activation-resend-${it.id}`}
+                        >
+                          补发
+                        </button>
+                      )}
                     </div>
                   </td>
                 </tr>
@@ -448,6 +486,20 @@ export function ActivationCodesPanel({
         <IssueActivationModal
           onClose={() => setIssueOpen(false)}
           onIssued={onIssued}
+          onError={(msg) => showToast("err", msg)}
+        />
+      )}
+
+      {/* Resend modal (Phase 23) ------------------------------------------*/}
+      {resendTarget && (
+        <ResendActivationModal
+          target={resendTarget}
+          defaultOpenId={resendTarget.bound_feishu_open_id ?? ""}
+          onClose={() => setResendTarget(null)}
+          onSent={(msgId) => {
+            setResendTarget(null);
+            showToast("ok", `✅ 飞书补发提示已发送 (${msgId ?? "—"})`);
+          }}
           onError={(msg) => showToast("err", msg)}
         />
       )}
@@ -501,6 +553,11 @@ function IssueActivationModal({
 }) {
   const [plan, setPlan] = useState<string>("basic");
   const [ttlDays, setTtlDays] = useState<string>("365");
+  // Phase 23 — IM delivery is opt-in but on by default. The operator
+  // can disable it for hand-delivery, or supply an explicit open_id to
+  // DM the code straight to the customer.
+  const [feishuOpenId, setFeishuOpenId] = useState<string>("");
+  const [sendIm, setSendIm] = useState<boolean>(true);
   const [busy, setBusy] = useState(false);
   const submitDisabled =
     busy ||
@@ -521,9 +578,12 @@ function IssueActivationModal({
           if (submitDisabled) return;
           setBusy(true);
           try {
+            const trimmed = feishuOpenId.trim();
             const resp = await issueActivationCode({
               plan,
               ttl_days: Number.parseInt(ttlDays, 10),
+              ...(trimmed ? { feishu_open_id: trimmed } : {}),
+              send_im: sendIm,
             });
             onIssued(resp);
           } catch (err) {
@@ -571,6 +631,30 @@ function IssueActivationModal({
               data-testid="issue-ttl"
             />
           </div>
+          <div>
+            <label className="text-xs text-muted-foreground">
+              Feishu open_id (可选 — 填了就直接 IM 给客户)
+            </label>
+            <input
+              type="text"
+              value={feishuOpenId}
+              onChange={(e) => setFeishuOpenId(e.target.value)}
+              placeholder="ou_xxxxxxxx"
+              className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 font-mono text-xs"
+              data-testid="issue-feishu-open-id"
+            />
+          </div>
+          <label className="flex cursor-pointer items-center gap-2">
+            <input
+              type="checkbox"
+              checked={sendIm}
+              onChange={(e) => setSendIm(e.target.checked)}
+              data-testid="issue-send-im"
+            />
+            <span className="text-xs">
+              自动通过飞书发送激活码 (Phase 23)
+            </span>
+          </label>
         </div>
         <footer className="mt-6 flex justify-end gap-2">
           <button
@@ -589,6 +673,98 @@ function IssueActivationModal({
             data-testid="issue-submit"
           >
             {busy ? "处理中…" : "确认发放"}
+          </button>
+        </footer>
+      </form>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 23 — Resend modal
+// ---------------------------------------------------------------------------
+function ResendActivationModal({
+  target,
+  defaultOpenId,
+  onClose,
+  onSent,
+  onError,
+}: {
+  target: ActivationCode;
+  defaultOpenId: string;
+  onClose: () => void;
+  onSent: (messageId: string | null) => void;
+  onError: (msg: string) => void;
+}) {
+  const [openId, setOpenId] = useState<string>(defaultOpenId);
+  const [busy, setBusy] = useState(false);
+  const submitDisabled = busy || openId.trim().length === 0;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      data-testid="resend-modal"
+      role="dialog"
+      aria-modal="true"
+    >
+      <form
+        onSubmit={async (e) => {
+          e.preventDefault();
+          if (submitDisabled) return;
+          setBusy(true);
+          try {
+            const resp = await resendActivationCode(target.id, openId.trim());
+            if (resp.sent) {
+              onSent(resp.message_id ?? null);
+            } else {
+              onError(`飞书发送失败: ${resp.error ?? "unknown error"}`);
+            }
+          } catch (err) {
+            onError((err as Error).message);
+          } finally {
+            setBusy(false);
+          }
+        }}
+        className="w-full max-w-md rounded-xl border border-border bg-background p-6 shadow-2xl"
+        data-testid="resend-form"
+      >
+        <header className="mb-4">
+          <h2 className="text-lg font-semibold">补发激活码 #{target.id}</h2>
+          <p className="mt-1 text-xs text-muted-foreground">
+            明文已被哈希丢弃,只能给客户发一条“请联系我们索取新激活码”的提示。
+          </p>
+        </header>
+        <div className="space-y-3 text-sm">
+          <div>
+            <label className="text-xs text-muted-foreground">Feishu open_id</label>
+            <input
+              type="text"
+              value={openId}
+              onChange={(e) => setOpenId(e.target.value)}
+              placeholder="ou_xxxxxxxx"
+              className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 font-mono text-xs"
+              data-testid="resend-open-id"
+              autoFocus
+            />
+          </div>
+        </div>
+        <footer className="mt-6 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={busy}
+            className="rounded-md border border-border bg-card/40 px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
+            data-testid="resend-cancel"
+          >
+            取消
+          </button>
+          <button
+            type="submit"
+            disabled={submitDisabled}
+            className="rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-accent-foreground disabled:opacity-50"
+            data-testid="resend-submit"
+          >
+            {busy ? "发送中…" : "发送飞书提示"}
           </button>
         </footer>
       </form>
