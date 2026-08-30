@@ -1,66 +1,39 @@
 # =================================================================
-# AI Opportunity Radar — Makefile
+# AI Opportunity Radar — Makefile (MVP)
 # =================================================================
-# Convenience entrypoints. Real implementation lives in each service.
+# Convenience entrypoints for the MVP surface.
+#
+# The legacy `frontend / lint / format / seed / backup / restore`
+# targets were removed in the simplify refactor — frontend lives in
+# `experimental/frontend/` and the backup / restore scripts were
+# retired with their FREEZE consumers.
 # =================================================================
 
 PYTHON       ?= python3
 PIP          ?= python3 -m pip
 COMPOSE      ?= docker compose
 BACKEND_DIR  := backend
-FRONTEND_DIR := frontend
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install dev backend frontend test test-backend test-frontend \
-        lint format migrate seed docker-up docker-down docker-logs clean \
-        n8n-sync n8n-validate backup backup-dry restore restore-dry metrics-scrape
+.PHONY: help install-backend dev-backend test-backend migrate \
+        docker-up docker-down docker-logs clean \
+        n8n-sync n8n-validate metrics-scrape
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-22s\033[0m %s\n", $$1, $$2}'
 
-install: ## Install local dependencies (backend + frontend)
-	$(MAKE) install-backend
-	$(MAKE) install-frontend
-
 install-backend: ## Install backend Python dependencies
 	cd $(BACKEND_DIR) && $(PIP) install -e ".[dev]"
-
-install-frontend: ## Install frontend Node dependencies
-	cd $(FRONTEND_DIR) && npm install
-
-dev: ## Run backend + frontend locally (no docker)
-	$(MAKE) -j2 dev-backend dev-frontend
 
 dev-backend: ## Run FastAPI dev server
 	cd $(BACKEND_DIR) && uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
-dev-frontend: ## Run Next.js dev server
-	cd $(FRONTEND_DIR) && npm run dev
-
-test: ## Run all tests
-	$(MAKE) test-backend
-	$(MAKE) test-frontend
-
 test-backend: ## Run backend pytest suite
 	cd $(BACKEND_DIR) && pytest -q
 
-test-frontend: ## Run frontend tests
-	cd $(FRONTEND_DIR) && npm test --silent
-
-lint: ## Lint everything
-	cd $(BACKEND_DIR) && ruff check app tests
-	cd $(FRONTEND_DIR) && npm run lint
-
-format: ## Format everything
-	cd $(BACKEND_DIR) && ruff format app tests
-	cd $(FRONTEND_DIR) && npm run format 2>/dev/null || true
-
 migrate: ## Run alembic migrations
 	cd $(BACKEND_DIR) && alembic upgrade head
-
-seed: ## Seed demo fixtures
-	cd $(BACKEND_DIR) && python -m app.scripts.seed
 
 docker-up: ## Bring up full docker stack
 	$(COMPOSE) up -d --build
@@ -82,18 +55,6 @@ n8n-validate: ## Validate every n8n/workflows/*.json (no network calls)
 
 n8n-sync: ## Push n8n/workflows/*.json into the running n8n container (activate)
 	cd $(BACKEND_DIR) && $(PYTHON) -m scripts.n8n_sync --activate
-
-backup: ## Dump the Postgres container to ./backups/radar-<UTC>.sql
-	cd $(BACKEND_DIR) && bash scripts/backup_postgres.sh
-
-backup-dry: ## Show what `make backup` would do without running docker
-	cd $(BACKEND_DIR) && bash scripts/backup_postgres.sh --dry-run
-
-restore: ## Restore a SQL dump into the Postgres container (use --file=path)
-	cd $(BACKEND_DIR) && bash scripts/restore_postgres.sh
-
-restore-dry: ## Show what `make restore` would do (pass --file=path)
-	cd $(BACKEND_DIR) && bash scripts/restore_postgres.sh
 
 metrics-scrape: ## Curl the Prometheus metrics endpoint and grep for radar_*
 	@curl -sf http://localhost:8000/api/metrics | grep '^radar_' | head -40 || echo "(backend not running on localhost:8000)"
