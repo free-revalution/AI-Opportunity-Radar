@@ -353,8 +353,12 @@ class FeishuDriveClient(_TokenMixin):
     ) -> str:
         """Create a new folder under ``parent_token`` (or the root).
 
-        ``POST /open-apis/drive/v1/files?type=folder`` — body
-        ``{"folder_token": "<parent>", "name": "<name>"}``.
+        ``POST /open-apis/drive/v1/files`` — body
+        ``{"folder_token": "<parent>", "name": "<name>", "type": "folder"}``.
+
+        Phase 27 — earlier versions put ``type=folder`` in the query
+        string (``?type=folder``). That path returns 404; Feishu
+        expects ``type`` as a body field.
 
         Returns the new folder's ``token``. The folder name is
         idempotent at the API level (Feishu will create a duplicate
@@ -370,10 +374,14 @@ class FeishuDriveClient(_TokenMixin):
                 "create_folder: parent_token missing "
                 "(set FEISHU_DRIVE_ROOT_FOLDER_TOKEN or pass parent_token)"
             )
-        body = {"folder_token": parent, "name": name.strip()[:200]}
+        body = {
+            "folder_token": parent,
+            "name": name.strip()[:200],
+            "type": "folder",
+        }
         response = await self._request(
             method="POST",
-            path="/drive/v1/files?type=folder",
+            path="/drive/v1/files",
             json_body=body,
         )
         if response.get("code") != 0:
