@@ -956,7 +956,10 @@ class FeishuCommandRouter:
             parse_docs_subcommand,
             run_docs_subcommand,
         )
-        from app.services.feishu.rbac import DocsCommandAuthorizer
+        from app.services.feishu.rbac import (
+            DocsCommandAuthorizer,
+            user_facing_deny_message,
+        )
 
         # — RBAC: 先解析子命令拿到命令名(即便 reply 失败也能给出
         # 准确 denial 文案)。

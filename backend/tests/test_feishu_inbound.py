@@ -411,6 +411,28 @@ async def test_router_unknown_kind_returns_help_hint():
 
 
 # ---------------------------------------------------------------------------
+# Phase 26 + 27 — /docs RBAC denial must not raise NameError
+# ---------------------------------------------------------------------------
+async def test_router_docs_rbac_denied_returns_friendly_reply():
+    """Regression for the ``NameError: user_facing_deny_message`` crash
+    in the live bot: every Feishu `/docs` invocation lands in
+    ``FeishuCommandRouter._docs`` which checks RBAC; if the sender is
+    not admin, the denial branch must return a friendly Chinese reply
+    rather than letting the unbound name bubble up as a 500."""
+    router = _make_router(_opportunities_handler)
+    settings = get_settings()
+    # — Lock down admin_open_ids so an empty sender_open_id fails RBAC.
+    settings.admin_open_ids = ["ou_someone_else"]
+    router._sender_open_id = "ou_random_user"
+
+    reply = await router.route(BotCommand(kind="docs", args=""))
+    assert reply.text  # non-empty
+    assert "权限" in reply.text or "联系管理员" in reply.text
+    assert reply.metadata.get("denied") is True
+    assert reply.metadata.get("command") == "docs"
+
+
+# ---------------------------------------------------------------------------
 # FastAPI endpoint integration
 # ---------------------------------------------------------------------------
 @pytest.fixture(autouse=True)
