@@ -498,6 +498,104 @@ async def list_audit_logs(
 
 
 # ---------------------------------------------------------------------------
+# Audit log viewer (Phase 20)
+# ---------------------------------------------------------------------------
+# The Phase 12 ``GET /api/admin/audit`` endpoint above is admin-secret
+# auth and capped at no offset / no resource filters — fine for back-of-
+# envelope grepping but not a real viewer. Phase 20 adds ``GET /api/admin/
+# audit_logs`` with webhook auth (so the Phase 18 AdminGuard flow works)
+# and a richer filter set: actor_id, resource_type, resource_id, until,
+# offset. Response carries ``total`` (full count, not the slice) so the
+# UI can paginate properly.
+#
+# Both endpoints coexist intentionally — Phase 21 will unify them.
+
+@router.get(
+    "/audit_logs",
+    summary="Paginated audit log viewer (admin, webhook)",
+)
+async def list_audit_logs_v2(
+    actor_type: Optional[str] = Query(default=None),
+    actor_id: Optional[str] = Query(default=None),
+    action: Optional[str] = Query(default=None),
+    result_filter: Optional[str] = Query(default=None, alias="result"),
+    resource_type: Optional[str] = Query(default=None),
+    resource_id: Optional[str] = Query(default=None),
+    since: Optional[datetime] = Query(default=None, description="ISO-8601 lower bound"),
+    until: Optional[datetime] = Query(default=None, description="ISO-8601 upper bound"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    session: AsyncSession = Depends(get_session),
+    _actor: str = Depends(_require_webhook),
+) -> dict[str, Any]:
+    """Sole-operator audit viewer backed by AuditLog indexes.
+
+    All filter fields are exact match. ``actor_type`` / ``action`` are
+    NOT enum-validated at the API boundary — the model is a free-form
+    ``String(32/64)`` so new action strings (e.g. ``content_opportunity
+    _transition``) pass through. ``result`` IS validated (4-value set)
+    to keep the chip filter UI honest.
+    """
+    filters = []
+    if actor_type:
+        filters.append(AuditLog.actor_type == actor_type)
+    if actor_id:
+        filters.append(AuditLog.actor_id == actor_id)
+    if action:
+        filters.append(AuditLog.action == action)
+    if result_filter:
+        if result_filter not in {"success", "failure", "blocked", "partial"}:
+            raise HTTPException(422, "invalid result filter")
+        filters.append(AuditLog.result == result_filter)
+    if resource_type:
+        filters.append(AuditLog.resource_type == resource_type)
+    if resource_id:
+        filters.append(AuditLog.resource_id == resource_id)
+    if since:
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        filters.append(AuditLog.created_at >= since)
+    if until:
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        filters.append(AuditLog.created_at <= until)
+
+    count_stmt = select(func.count()).select_from(AuditLog)
+    items_stmt = (
+        select(AuditLog)
+        .order_by(AuditLog.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    for f in filters:
+        count_stmt = count_stmt.where(f)
+        items_stmt = items_stmt.where(f)
+
+    total = (await session.execute(count_stmt)).scalar_one()
+    rows = list((await session.execute(items_stmt)).scalars().all())
+
+    return {
+        "items": [
+            {
+                "id": r.id,
+                "actor_type": r.actor_type,
+                "actor_id": r.actor_id,
+                "action": r.action,
+                "resource_type": r.resource_type,
+                "resource_id": r.resource_id,
+                "result": r.result,
+                "metadata_json": r.metadata_json,
+                "created_at": _to_utc_iso(r.created_at),
+            }
+            for r in rows
+        ],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Source compliance endpoints
 # ---------------------------------------------------------------------------
 @router.get(
@@ -684,8 +782,19 @@ async def _transition_content_opportunity(
     actor: str,
     reason: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Shared helper for approve/reject/publish endpoints."""
+    """Shared helper for approve/reject/publish endpoints.
+
+    Phase 20 — capture the *previous* status before mutating so the
+    AuditLog row records `from` along with `to`. Without it the
+    dashboard activity feed renders ``"? → approved"``.
+    """
     repo = ContentOpportunityRepository(session)
+    current = await repo.get_by_id(co_id)
+    if current is None:
+        raise HTTPException(
+            status_code=404, detail="content_opportunity not found"
+        )
+    from_status = current.status
     try:
         row = await repo.transition_status(co_id, new_status)
     except ContentOpportunityRepository.NotFound:
@@ -702,7 +811,7 @@ async def _transition_content_opportunity(
         actor=actor,
         resource_type="content_opportunity",
         resource_id=str(co_id),
-        metadata={"to": new_status, "reason": reason},
+        metadata={"from": from_status, "to": new_status, "reason": reason},
     )
     return _serialize_content_opportunity(row)
 

@@ -560,6 +560,8 @@ export async function batchPublishNotifications(
 // Phase 18 — admin Content Center (HTTP endpoints added by Phase 17)
 // ---------------------------------------------------------------------------
 import type {
+  AuditLogFilters,
+  AuditLogsResponse,
   ContentOpportunity,
   ContentOpportunityListResponse,
   ContentOpportunityRejectRequest,
@@ -675,6 +677,25 @@ export async function fetchSignals(
  *  Signal health, last 20 content_opportunity_transition AuditLog rows. */
 export async function fetchDashboard(): Promise<DashboardResponse> {
   return jsonFetchWithSecret<DashboardResponse>("/api/admin/dashboard");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 20 — /admin/audit-logs paginated viewer
+// ---------------------------------------------------------------------------
+/** Phase 20 — sole-operator audit viewer with rich filters + pagination.
+ *  Webhook auth (same as dashboard) so the Phase 18 AdminGuard works. */
+export async function fetchAuditLogs(
+  filters: AuditLogFilters = {},
+): Promise<AuditLogsResponse> {
+  const search = new URLSearchParams();
+  for (const [k, v] of Object.entries(filters)) {
+    if (v === undefined || v === null || v === "") continue;
+    search.set(k, String(v));
+  }
+  const qs = search.toString();
+  return jsonFetchWithSecret<AuditLogsResponse>(
+    `/api/admin/audit_logs${qs ? `?${qs}` : ""}`,
+  );
 }
 
 // Re-export the new types so consumers can import them from `@/lib/api`.

@@ -623,3 +623,41 @@ export interface DashboardResponse {
   signals: DashboardSignalStats;
   recent_activity: DashboardActivityItem[];
 }
+
+// ---------------------------------------------------------------------------
+// Phase 20 — /admin/audit-logs viewer
+// ---------------------------------------------------------------------------
+/** Mirrors the backend AuditLog row. `metadata_json` keeps the backend's
+ * wire naming — we don't rename it in the dashboard feed either. */
+export interface AuditLogItem {
+  id: number;
+  actor_type: string;
+  actor_id: string | null;
+  action: string;
+  resource_type: string | null;
+  resource_id: string | null;
+  result: string;
+  metadata_json: Record<string, unknown> | null;
+  created_at: string | null;
+}
+
+export interface AuditLogsResponse {
+  items: AuditLogItem[];
+  /** Total matching the filter (independent of limit/offset). */
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface AuditLogFilters {
+  actor_type?: string;
+  actor_id?: string;
+  action?: string;
+  result?: string;
+  resource_type?: string;
+  resource_id?: string;
+  since?: string;
+  until?: string;
+  limit?: number;
+  offset?: number;
+}

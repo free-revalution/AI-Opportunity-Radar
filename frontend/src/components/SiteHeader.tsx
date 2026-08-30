@@ -79,6 +79,13 @@ export async function SiteHeader() {
           >
             Signals (Admin)
           </Link>
+          <Link
+            href="/admin/audit-logs"
+            className="hover:text-accent"
+            data-testid="nav-admin-audit-logs"
+          >
+            Audit Log
+          </Link>
           <Link href="/settings" className="hover:text-accent">
             Settings
           </Link>
