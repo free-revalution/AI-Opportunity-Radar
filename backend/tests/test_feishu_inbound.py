@@ -340,10 +340,20 @@ def _opportunities_handler(request: httpx.Request) -> httpx.Response:
 
 
 async def test_router_help_returns_menu():
+    """MVP: /help must show the 5 kept commands, not the legacy FREEZE menu."""
     router = _make_router(_opportunities_handler)
     reply = await router.route(BotCommand(kind="help"))
+    # MVP commands surfaced in the menu
     assert "/help" in reply.text
-    assert "/research" in reply.text
+    assert "/today" in reply.text
+    assert "/run" in reply.text
+    assert "/status" in reply.text
+    assert "/sources" in reply.text
+    # FREEZE-era commands must not be advertised
+    assert "/research" not in reply.text
+    assert "/content" not in reply.text
+    assert "/activate" not in reply.text
+    assert "/preferences" not in reply.text
     assert reply.card is None
 
 
@@ -678,9 +688,11 @@ async def test_router_content_alias_recognised():
 
 
 async def test_router_help_includes_content():
+    """MVP: /help must show only the 5 MVP commands (no FREEZE content/search)."""
     router = _make_router(_opportunities_handler)
     reply = await router.route(BotCommand(kind="help"))
-    assert "/content" in reply.text
-    assert "/search" in reply.text
-    # The "Phase 16 上线" placeholder must be gone.
+    # FREEZE-era commands must not be advertised
+    assert "/content" not in reply.text
+    assert "/search" not in reply.text
+    # The "Phase 16" placeholder must be gone.
     assert "Phase 16" not in reply.text

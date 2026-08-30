@@ -572,14 +572,6 @@ class FeishuCommandRouter:
             or self.settings.feishu_internal_api_url
             or self.DEFAULT_BASE_URL
         ).rstrip("/")
-        # — Base URL for *user-visible* links — users click these in
-        # the Feishu reply, so it must point at a publicly reachable
-        # host (frontend or the ngrok tunnel), not at the docker
-        # internal DNS name we use for backend self-callbacks.
-        self.public_base_url = (
-            (self.settings.app_base_url or "").rstrip("/")
-            or self.base_url
-        )
         # — owned by caller; if None, create a one-shot per call.
         self._http = http_client
 
@@ -750,15 +742,22 @@ class FeishuCommandRouter:
         # SADD the actually-shown IDs (Phase 16 — distinct quota).
         ids = [o.get("id") for o in items if o.get("id") is not None]
         recorded = await self._record_signal_ids(sender_open_id, ids)
-        # — render as plain text (Feishu lark_md). Card rendering is
-        # reserved for Phase 7 knowledge-base replies.
+        # — render as plain text (Feishu lark_md). MVP keeps no
+        # frontend / external link target — users read the digest
+        # directly inside the Feishu chat, with sources surfaced
+        # by the daily Docx the bot writes each morning.
         lines = ["**🔥 AI 机会雷达 · 今日 Top 信号**", ""]
         for idx, opp in enumerate(items, start=1):
             score = float(opp.get("total_score") or 0)
             title = opp.get("title") or "(无标题)"
-            url = f"{self.public_base_url}/opportunities/{opp.get('id')}"
-            lines.append(f"{idx}. **{title}** — ⭐ {int(round(score))}")
-            lines.append(f"   [查看详情]({url})")
+            category = opp.get("category") or "未分类"
+            summary = (opp.get("summary") or "").strip()
+            lines.append(f"{idx}. **{title}** — ⭐ {int(round(score))} · {category}")
+            if summary:
+                # Trim to a single line so the IM message stays under
+                # Feishu's 4000-char limit (5 entries × ~400 chars).
+                one_line = summary.splitlines()[0][:240]
+                lines.append(f"   {one_line}")
         return CommandReply(
             text="\n".join(lines),
             metadata={
@@ -900,26 +899,22 @@ class FeishuCommandRouter:
 # Reply builders for static commands
 # ---------------------------------------------------------------------------
 def _help_reply() -> CommandReply:
+    """MVP command menu — only the 5 commands kept after the simplify refactor.
+
+    Chinese aliases (``/今日`` etc.) are accepted by ``_COMMAND_ALK``
+    in :func:`parse_command` but the canonical English names are the
+    ones surfaced here.
+    """
     lines = [
         "**AI 机会雷达 — 命令菜单**",
         "",
-        "/help — 显示本菜单",
-        "/today — 今日信号(每日额度内)",
-        "/top — 全历史 Top 信号(共享每日额度)",
-        "/search <关键词> — 按关键词搜索(共享每日额度)",
-        "/research <主题> — 按需生成研究报告(深度研究配额)",
-        "/refresh — 触发数据抓取",
-        "/score — 触发重新评分",
-        "/daily — 触发日报推送(同时同步 Top 10 到多维表格)",
-        "/report <job_id> — 将已完成的研究报告推送至飞书云文档",
-        "/doc <job_id> — /report 的别名",
-        "/table — 手动同步机会表到多维表格",
-        "/content <opportunity_id> — 基于偏好生成内容方案(内容配额)",
-        "/preferences — 查看 / 设置偏好(vertical / niche / platform …)",
-        "/activate <激活码> — 绑定闲鱼购买的激活码",
+        "/help    — 显示本菜单",
+        "/today   — 今日信号（每日额度内）",
+        "/run     — 手动触发完整流水线（采集→研究→飞书摘要）",
+        "/status  — 上次运行摘要 + 信息源健康度",
+        "/sources — 每个信息源的上次采集时间",
         "",
-        "💎 套餐:免费 1 信号/天 · 基础 ¥29(5/天) · 专业 ¥59(20/天)",
-        "更多能力见 Web 端 /dashboard",
+        "每日 08:00 CST 自动运行一次完整流水线并推送飞书摘要。",
     ]
     return CommandReply(text="\n".join(lines))
 
