@@ -53,8 +53,8 @@ async def test_clustering_run_with_no_data_is_noop(client):
 
 
 async def test_clustering_run_rejects_invalid_threshold(client):
-    response = client.post("/api/internal/clustering/run", json={"threshold": 1.5})
-    assert response.status_code == 400
+    # FREEZE — threshold override removed in MVP (simplify §6).
+    pytest.skip("FREEZE parameter removed in MVP")
 
 
 async def test_clustering_run_requires_no_webhook_when_secret_empty(client):

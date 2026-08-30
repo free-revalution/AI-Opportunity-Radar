@@ -75,36 +75,13 @@ async def test_scoring_run_marks_eligible_above_threshold(client):
 
 
 async def test_score_one_endpoint_returns_payload(client):
-    cluster_body = await _ingest_cluster_screen(client)
-    if cluster_body.get("opportunities_created", 0) == 0:
-        pytest.skip("no opportunities")
-
-    listing = client.get("/api/opportunities?limit=10")
-    items = listing.json()["items"]
-    if not items:
-        pytest.skip("listing empty")
-    opp_id = items[0]["id"]
-
-    response = client.post(
-        f"/api/internal/scoring/score/{opp_id}",
-        json={"blend_signals": True},
-    )
-    assert response.status_code == 200
-    body = response.json()
-    for key in (
-        "opportunity_id",
-        "total_score",
-        "recommendation",
-        "status",
-        "research_job_id",
-        "changed",
-    ):
-        assert key in body, f"missing field {key}"
+    # FREEZE — /api/internal/scoring/score/{id} removed in MVP (simplify §6).
+    pytest.skip("FREEZE endpoint removed in MVP")
 
 
 async def test_score_one_endpoint_404_for_missing(client):
-    response = client.post("/api/internal/scoring/score/9999", json={})
-    assert response.status_code == 404
+    # FREEZE — /api/internal/scoring/score/{id} removed in MVP (simplify §6).
+    pytest.skip("FREEZE endpoint removed in MVP")
 
 
 async def test_scoring_run_respects_custom_threshold(client):

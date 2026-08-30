@@ -1,16 +1,15 @@
 # =================================================================
-# AI Opportunity Radar — local development stack
+# AI Opportunity Radar — local development stack (MVP)
 # =================================================================
 # Services:
 #   postgres    primary database
-#   redis       cache / queue
+#   redis       cache / dedup
 #   backend     FastAPI (uvicorn) — http://localhost:8000
-#   frontend    Next.js dev server — http://localhost:3000
-#   worker      async job runner (later phases)
 #   n8n         workflow orchestrator — http://localhost:5678
 #
-# Firecrawl / Browser Use / DeepResearch run as managed services
-# (hosted APIs), so they are NOT in this compose file.
+# Removed in MVP (simplify §6):
+#   * worker    — daily cron runs in n8n, not a Python worker
+#   * frontend  — moved to experimental/frontend/
 # =================================================================
 
 services:
@@ -92,63 +91,6 @@ services:
       timeout: 5s
       retries: 5
 
-  worker:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    container_name: radar-worker
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      backend:
-        condition: service_healthy
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: postgresql+asyncpg://radar:radar@postgres:5432/radar
-      DATABASE_URL_SYNC: postgresql://radar:radar@postgres:5432/radar
-      REDIS_URL: redis://redis:6379/0
-      REDIS_RESULT_BACKEND: redis://redis:6379/1
-    # Real upstream DNS — same reason as `backend` (see above).
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
-      - 9.9.9.9
-    volumes:
-      - ./backend:/app
-      # n8n/workflows/* needs to be visible to the backend too — the
-      # n8n_sync script reads them when pushing into the n8n container.
-      - ./n8n/workflows:/n8n/workflows:ro
-    command: ["python", "-m", "app.worker"]
-    # No ports — worker is internal only.
-
-  frontend:
-    image: node:20-alpine
-    container_name: radar-frontend
-    restart: unless-stopped
-    working_dir: /app
-    depends_on:
-      backend:
-        condition: service_healthy
-    env_file:
-      - .env
-    environment:
-      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
-      API_BASE_URL_INTERNAL: http://backend:8000
-    volumes:
-      - ./frontend:/app
-      - frontend_node_modules:/app/node_modules
-    ports:
-      - "3000:3000"
-    # Check for `next` itself (not just `node_modules`) — the volume mount
-    # above creates an empty `node_modules/` dir, so `test -d node_modules`
-    # would always be true and the install would be skipped. Without
-    # `next` installed, `npm run dev` fails with "next: not found".
-    command: ["sh", "-c", "corepack enable && (test -x node_modules/.bin/next || npm install) && npm run dev"]
-
   n8n:
     image: n8nio/n8n:1
     container_name: radar-n8n
@@ -189,4 +131,3 @@ volumes:
   pgdata:
   redisdata:
   n8ndata:
-  frontend_node_modules:

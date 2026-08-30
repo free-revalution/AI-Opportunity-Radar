@@ -235,21 +235,20 @@ def test_parse_event_strips_multi_word_display_name_mention():
 # parse_command
 # ---------------------------------------------------------------------------
 def test_parse_command_recognises_english_aliases():
+    # MVP surface only (simplify §10): /help /today /run /status /sources.
     assert parse_command("/help").kind == "help"
     assert parse_command("/today").kind == "today"
-    assert parse_command("/top").kind == "top"
-    assert parse_command("/research AI").kind == "research"
-    assert parse_command("/refresh").kind == "refresh"
-    assert parse_command("/score").kind == "score"
-    assert parse_command("/daily").kind == "daily"
+    assert parse_command("/run").kind == "run"
+    assert parse_command("/status").kind == "status"
+    assert parse_command("/sources").kind == "sources"
 
 
 def test_parse_command_recognises_chinese_aliases():
+    # MVP surface only.
     assert parse_command("/今日").kind == "today"
-    assert parse_command("/分析 X").kind == "research"
-    assert parse_command("/刷新").kind == "refresh"
-    assert parse_command("/重评").kind == "score"
-    assert parse_command("/日报").kind == "daily"
+    assert parse_command("/运行").kind == "run"
+    assert parse_command("/状态").kind == "status"
+    assert parse_command("/源").kind == "sources"
 
 
 def test_parse_command_unknown_kind():
@@ -294,7 +293,7 @@ def _stub_paywall(monkeypatch):
     from app.services.feishu import inbound as inbound_module
 
     async def _noop_paywall(**_kwargs):
-        from app.services.subscriptions.paywall import PaywallVerdict
+        from app.services.paywall import PaywallVerdict
 
         return PaywallVerdict(
             allowed=True,
@@ -366,74 +365,33 @@ async def test_router_today_handles_empty_database():
 
 
 async def test_router_top_uses_opportunities_endpoint():
-    router = _make_router(_opportunities_handler)
-    reply = await router.route(BotCommand(kind="top", args=""))
-    assert "AI Coach" in reply.text
+    # FREEZE — /top dispatcher removed in MVP (simplify §10).
+    pytest.skip("FREEZE dispatcher removed in MVP")
 
 
 async def test_router_research_requires_topic():
-    router = _make_router(_opportunities_handler)
-    reply = await router.route(BotCommand(kind="research", args=""))
-    assert "用法" in reply.text or "例如" in reply.text
+    # FREEZE — /research dispatcher removed in MVP (simplify §10).
+    pytest.skip("FREEZE dispatcher removed in MVP")
 
 
 async def test_router_research_calls_on_demand_endpoint():
-    captured: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured.append(request)
-        if "/research/on_demand" in request.url.path:
-            body = json.loads(request.content)
-            return httpx.Response(200, json={"job_id": "job-42", "topic": body["topic"]})
-        return httpx.Response(200, json={})
-
-    router = _make_router(handler)
-    reply = await router.route(BotCommand(kind="research", args="AI 法律合同"))
-    assert "job-42" in reply.text
-    assert any("/research/on_demand" in r.url.path for r in captured)
-    # — the topic payload reaches the endpoint verbatim.
-    on_demand = next(r for r in captured if "/research/on_demand" in r.url.path)
-    payload = json.loads(on_demand.content)
-    assert payload["topic"] == "AI 法律合同"
+    # FREEZE — /research dispatcher removed in MVP (simplify §10).
+    pytest.skip("FREEZE dispatcher removed in MVP")
 
 
 async def test_router_refresh_triggers_discovery():
-    captured: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured.append(request.url.path)
-        return httpx.Response(200, json={"status": "queued"})
-
-    router = _make_router(handler)
-    reply = await router.route(BotCommand(kind="refresh"))
-    assert "抓取" in reply.text or "触发" in reply.text
-    assert any("/discovery/run" in p for p in captured)
+    # FREEZE — /refresh dispatcher removed in MVP (simplify §10).
+    pytest.skip("FREEZE dispatcher removed in MVP")
 
 
 async def test_router_score_triggers_scoring():
-    captured: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured.append(request.url.path)
-        return httpx.Response(200, json={"status": "queued"})
-
-    router = _make_router(handler)
-    reply = await router.route(BotCommand(kind="score"))
-    assert "评分" in reply.text or "触发" in reply.text
-    assert any("/scoring/run" in p for p in captured)
+    # FREEZE — /score dispatcher removed in MVP (simplify §10).
+    pytest.skip("FREEZE dispatcher removed in MVP")
 
 
 async def test_router_daily_triggers_digest():
-    captured: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured.append(request.url.path)
-        return httpx.Response(200, json={"status": "queued"})
-
-    router = _make_router(handler)
-    reply = await router.route(BotCommand(kind="daily"))
-    assert "日报" in reply.text or "推送" in reply.text
-    assert any("/notifications/digest/send" in p for p in captured)
+    # FREEZE — /daily dispatcher removed in MVP (simplify §10).
+    pytest.skip("FREEZE dispatcher removed in MVP")
 
 
 async def test_router_unknown_kind_returns_help_hint():
@@ -683,88 +641,40 @@ def test_feishu_endpoint_rejects_invalid_json(feishu_client):
 # ---------------------------------------------------------------------------
 async def test_router_today_sadds_distinct_ids(fake_redis):
     """`/today` writes the shown signal IDs into a per-day Redis SET
-    so a second `/today` (or `/top`) does not re-bill the same signal."""
-    router = _make_router(_opportunities_handler)
-    router._sender_open_id = "ou_today_sadd"
-    router._redis = fake_redis
-    reply = await router.route(BotCommand(kind="today", args=""))
-    assert reply.metadata["view_top_signals_recorded"] is True
-
-    from app.services.subscriptions.paywall import (
-        peek_view_top_signals_count,
-    )
-    used = await peek_view_top_signals_count(fake_redis, "ou_today_sadd")
-    assert used == 2  # _opportunities_handler returns 2 items
+    so a second `/today` (or `/top`) does not re-bill the same signal.
+    FREEZE — paywall distinct-id tracking removed in MVP (simplify §6).
+    """
+    pytest.skip("FREEZE quota tracking removed in MVP")
 
 
 async def test_router_top_sadds_distinct_ids(fake_redis):
-    router = _make_router(_opportunities_handler)
-    router._sender_open_id = "ou_top_sadd"
-    router._redis = fake_redis
-    reply = await router.route(BotCommand(kind="top", args=""))
-    assert reply.metadata["view_top_signals_recorded"] is True
-
-    from app.services.subscriptions.paywall import (
-        peek_view_top_signals_count,
-    )
-    used = await peek_view_top_signals_count(fake_redis, "ou_top_sadd")
-    assert used == 2
+    # FREEZE — see test_router_today_sadds_distinct_ids.
+    pytest.skip("FREEZE quota tracking removed in MVP")
 
 
 async def test_router_today_today_dedupes_across_calls(fake_redis):
     """Same `/today` called twice → SCARD stays at 2 (not 4) because
-    SADD is idempotent for already-present IDs."""
-    router = _make_router(_opportunities_handler)
-    router._sender_open_id = "ou_dedup"
-    router._redis = fake_redis
-    await router.route(BotCommand(kind="today", args=""))
-    await router.route(BotCommand(kind="today", args=""))
-
-    from app.services.subscriptions.paywall import (
-        peek_view_top_signals_count,
-    )
-    used = await peek_view_top_signals_count(fake_redis, "ou_dedup")
-    assert used == 2
+    SADD is idempotent for already-present IDs.
+    FREEZE — see test_router_today_sadds_distinct_ids.
+    """
+    pytest.skip("FREEZE quota tracking removed in MVP")
 
 
 async def test_router_today_quota_exhausted_returns_deny(monkeypatch):
-    """`/today` peeks the residual quota from `_last_verdict`. When
-    `quota_used == quota_limit`, the handler short-circuits with a
-    denial message."""
-    from app.services.feishu import inbound as inbound_module
-    from app.services.subscriptions.paywall import PaywallVerdict
-
-    async def _free_used_up(*, command, redis_client, sender_open_id):
-        return PaywallVerdict(
-            allowed=True,  # paywall passes — the *handler* denies
-            plan="free",
-            quota_type="view_top_signals",
-            quota_limit=1,
-            quota_used=1,
-        )
-
-    monkeypatch.setattr(
-        inbound_module, "_paywall_check", _free_used_up
-    )
-    router = _make_router(_opportunities_handler)
-    reply = await router.route(BotCommand(kind="today", args=""))
-    assert "额度已用完" in reply.text
-    assert reply.metadata.get("denied") is True
+    """FREEZE — paywall quota-exhaustion denial removed in MVP
+    (simplify §6). All MVP commands return success.
+    """
+    pytest.skip("FREEZE quota tracking removed in MVP")
 
 
 async def test_router_search_alias_recognised():
-    """Phase 16E — ALK has `/搜索` as a `/search` alias."""
-    from app.services.feishu.inbound import parse_command
-
-    assert parse_command("/search AI").kind == "search"
-    assert parse_command("/搜索 AI").kind == "search"
+    # FREEZE — /search dispatcher removed in MVP (simplify §10).
+    pytest.skip("FREEZE dispatcher removed in MVP")
 
 
 async def test_router_content_alias_recognised():
-    from app.services.feishu.inbound import parse_command
-
-    assert parse_command("/content 42").kind == "content"
-    assert parse_command("/内容 42").kind == "content"
+    # FREEZE — /content dispatcher removed in MVP (simplify §10).
+    pytest.skip("FREEZE dispatcher removed in MVP")
 
 
 async def test_router_help_includes_content():

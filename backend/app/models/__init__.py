@@ -481,6 +481,46 @@ class Notification(Base):
 
 
 # ---------------------------------------------------------------------------
+# runs (MVP — simplify §37)
+# ---------------------------------------------------------------------------
+# Per AI Opportunity Radar MVP 大幅裁剪与代码重构方案.md §37, every
+# collection/AI/Feishu pipeline execution records exactly one Run row so
+# the `/status` Feishu command can show what the system is doing right
+# now and what it last did.
+#
+# Lifecycle:
+#   pending   → row inserted, pipeline hasn't started yet
+#   running   → pipeline is mid-flight
+#   success   → pipeline finished, no error
+#   failed    → pipeline raised; `error` carries the message
+#
+# `trigger` records who / what kicked off the run:
+#   - "scheduler" — the daily n8n cron
+#   - "manual"    — an operator hit `/api/internal/pipeline/run`
+#   - "bot_run"   — a user typed `/run` in Feishu
+class Run(Base):
+    __tablename__ = "runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(
+        String(16), default="pending", nullable=False, index=True
+    )
+    trigger: Mapped[str] = mapped_column(
+        String(16), default="manual", nullable=False
+    )
+    # Counts captured at finish time. All nullable so a "running" row
+    # has no counts yet.
+    raw_count: Mapped[Optional[int]] = mapped_column(Integer)
+    new_count: Mapped[Optional[int]] = mapped_column(Integer)
+    signal_count: Mapped[Optional[int]] = mapped_column(Integer)
+    error: Mapped[Optional[str]] = mapped_column(Text)
+
+
+# ---------------------------------------------------------------------------
 # subscriptions (Phase 12E v2.0 — subscription tiers)
 # ---------------------------------------------------------------------------
 class Subscription(Base):
@@ -682,6 +722,7 @@ __all__ = [
     "RawItem",
     "ResearchJob",
     "ResearchReport",
+    "Run",
     "Signal",
     "SignalSource",
     "Source",

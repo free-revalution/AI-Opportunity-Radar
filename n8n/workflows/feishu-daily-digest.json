@@ -6,7 +6,7 @@
       "parameters": {
         "rule": {
           "interval": [
-            { "field": "cronExpression", "expression": "30 2 * * *" }
+            { "field": "cronExpression", "expression": "30 0 * * *" }
           ]
         }
       },

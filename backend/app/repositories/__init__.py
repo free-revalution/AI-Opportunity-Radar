@@ -11,6 +11,7 @@ from app.repositories.content_opportunities import (
 from app.repositories.opportunities import OpportunityRepository
 from app.repositories.opportunity_sources import OpportunitySourceRepository
 from app.repositories.raw_items import RawItemRepository, compute_content_hash
+from app.repositories.runs import RunRepository
 from app.repositories.signals import SignalRepository
 from app.repositories.sources import SourceRepository
 
@@ -20,6 +21,7 @@ __all__ = [
     "OpportunityRepository",
     "OpportunitySourceRepository",
     "RawItemRepository",
+    "RunRepository",
     "SignalRepository",
     "SourceRepository",
     "compute_content_hash",

@@ -157,7 +157,11 @@ def verify_event(
 # ---------------------------------------------------------------------------
 # Body parsing
 # ---------------------------------------------------------------------------
-def parse_event(body: dict[str, Any]) -> FeishuEvent | dict[str, Any] | None:
+def parse_event(
+    body: dict[str, Any],
+    *,
+    settings: Optional[Settings] = None,
+) -> FeishuEvent | dict[str, Any] | None:
     """Parse an inbound body into a typed event or special return.
 
     Returns:
@@ -171,10 +175,25 @@ def parse_event(body: dict[str, Any]) -> FeishuEvent | dict[str, Any] | None:
     if "challenge" in body:
         return {"challenge": body["challenge"]}
 
-    # Encrypted events — Phase 6 stub.
+    # Encrypted events (Phase 25 F.1) — AES-256-CBC, PKCS#7 padded,
+    # IV = first 16 bytes of the ciphertext, key = SHA-256(encrypt_key).
     if "encrypt" in body:
-        logger.warning("feishu_event_encrypted_not_implemented")
-        return None
+        try:
+            plaintext = _decrypt_feishu_envelope(
+                body["encrypt"],
+                settings=settings or get_settings(),
+            )
+        except FeishuDecryptError as exc:
+            logger.warning(
+                "feishu_event_decrypt_failed",
+                error=str(exc),
+            )
+            return None
+        if not isinstance(plaintext, dict):
+            logger.warning("feishu_event_decrypt_not_object")
+            return None
+        # Re-parse the decrypted body as a normal event.
+        body = plaintext
 
     header = body.get("header") or {}
     event_type = header.get("event_type") or ""
@@ -214,6 +233,121 @@ def parse_event(body: dict[str, Any]) -> FeishuEvent | dict[str, Any] | None:
         text=cleaned_text,
         raw_text=raw_text,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 25 F.1 — Feishu encrypted event envelope (AES-256-CBC + PKCS#7)
+# ---------------------------------------------------------------------------
+class FeishuDecryptError(Exception):
+    """Raised when an inbound ``{"encrypt": "..."}`` envelope cannot
+    be decrypted — wrong key, bad base64, padding error, etc."""
+
+
+def _decrypt_feishu_envelope(
+    envelope_b64: str,
+    *,
+    settings: Settings,
+) -> dict[str, Any]:
+    """Decrypt a Feishu encrypted event body.
+
+    Per the 飞书 open-api docs (event-subscription encrypt-key flow):
+
+      * The Encrypt Key is configured in the Feishu app settings; we
+        receive it via ``settings.feishu_encrypt_key``.
+      * The 32-byte AES-256 key is ``SHA-256(encrypt_key)``.
+      * The first 16 bytes of the base64-decoded ciphertext are the IV.
+      * The remainder is AES-256-CBC encrypted with PKCS#7 padding.
+      * The decrypted bytes are UTF-8 JSON.
+
+    Returns the parsed dict. Raises :class:`FeishuDecryptError` on
+    any failure — the caller logs + acks Feishu so it doesn't retry.
+    """
+    import base64
+    import hashlib
+    import json as _json
+
+    encrypt_key = (getattr(settings, "feishu_encrypt_key", "") or "").strip()
+    if not encrypt_key:
+        raise FeishuDecryptError("feishu_encrypt_key not configured")
+
+    try:
+        ciphertext = base64.b64decode(envelope_b64)
+    except (ValueError, TypeError) as exc:
+        raise FeishuDecryptError(f"invalid base64: {exc}") from exc
+
+    if len(ciphertext) < 32:
+        raise FeishuDecryptError("ciphertext too short")
+
+    key = hashlib.sha256(encrypt_key.encode("utf-8")).digest()
+    iv = ciphertext[:16]
+    body_bytes = ciphertext[16:]
+
+    try:
+        from cryptography.hazmat.primitives.ciphers import (  # type: ignore[import-not-found]
+            Cipher,
+            algorithms,
+            modes,
+        )
+        from cryptography.hazmat.primitives import padding as _pad  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise FeishuDecryptError(
+            f"cryptography library not installed: {exc}"
+        ) from exc
+
+    try:
+        decryptor = Cipher(
+            algorithms.AES(key), modes.CBC(iv)
+        ).decryptor()
+        padded = decryptor.update(body_bytes) + decryptor.finalize()
+        unpadder = _pad.PKCS7(algorithms.AES.block_size).unpadder()
+        plaintext = unpadder.update(padded) + unpadder.finalize()
+    except (ValueError, TypeError) as exc:
+        raise FeishuDecryptError(f"decrypt failed: {exc}") from exc
+
+    try:
+        parsed = _json.loads(plaintext.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise FeishuDecryptError(f"plaintext not JSON: {exc}") from exc
+
+    if not isinstance(parsed, dict):
+        raise FeishuDecryptError("plaintext not a JSON object")
+    return parsed
+
+
+# ---------------------------------------------------------------------------
+# Phase 25 F.2 — Redis SETNX event idempotency
+# ---------------------------------------------------------------------------
+async def _event_already_processed(
+    event_id: str,
+    *,
+    redis_client: Any,
+    ttl_seconds: int = 86_400,
+) -> bool:
+    """Check + claim an event_id atomically (SETNX with TTL).
+
+    Returns ``True`` if the event_id has already been processed (i.e.
+    another delivery beat us to it — Feishu retries on timeouts). The
+    caller should ack-and-skip in that case.
+
+    Returns ``False`` when this is the first time we've seen the event
+    AND we successfully claimed it. The TTL is 24h by default — Feishu
+    retries for at most ~30s, but we keep the marker longer so a
+    duplicate triggered by replay stays idempotent.
+    """
+    if not event_id or redis_client is None:
+        return False  # nothing to dedupe, or no Redis — fail-open
+    key = f"radar:feishu:event:{event_id}"
+    try:
+        # redis-py asyncio: SET NX EX <ttl> — returns True if we won
+        # the race, None if the key already existed.
+        won = await redis_client.set(key, "1", nx=True, ex=ttl_seconds)
+    except Exception as exc:  # noqa: BLE001 — fail-open on Redis hiccup
+        logger.warning(
+            "feishu_event_dedup_redis_error",
+            error=str(exc)[:200],
+        )
+        return False
+    return not bool(won)
 
 
 def _strip_mentions(text: str) -> str:
@@ -265,35 +399,17 @@ class BotCommand:
 
 
 _COMMAND_ALK: dict[str, str] = {
+    # MVP surface (simplify §10) — five commands + their 中文 aliases.
     "/help": "help",
+    "/帮助": "help",
     "/today": "today",
     "/今日": "today",
-    "/top": "top",
-    "/research": "research",
-    "/分析": "research",
-    "/refresh": "refresh",
-    "/刷新": "refresh",
-    "/score": "score",
-    "/重评": "score",
-    "/daily": "daily",
-    "/日报": "daily",
-    # — Phase 7 v2.0 — content ecosystem
-    "/report": "report",
-    "/doc": "report",          # alias
-    "/文档": "report",          # 中文 alias
-    "/table": "table",
-    "/表格": "table",
-    # — Phase 14A — activation code redemption
-    "/activate": "activate",
-    "/激活": "activate",
-    # — Phase 15C — search stub + user preferences
-    "/search": "search",
-    "/搜索": "search",
-    "/preferences": "preferences",
-    "/偏好": "preferences",
-    # — Phase 16 — content brief generator (ContentRadarAgent V2)
-    "/content": "content",
-    "/内容": "content",
+    "/run": "run",
+    "/运行": "run",
+    "/status": "status",
+    "/状态": "status",
+    "/sources": "sources",
+    "/源": "sources",
 }
 
 
@@ -325,7 +441,7 @@ def parse_command(text: str) -> BotCommand:
 # router module to require all of that at import.
 def _command_quota_type(kind: str) -> Optional[str]:
     """Return the quota feature for ``kind`` (or ``None`` to bypass)."""
-    from app.services.subscriptions.paywall import command_to_feature
+    from app.services.paywall import command_to_feature
 
     return command_to_feature(kind)
 
@@ -333,12 +449,12 @@ def _command_quota_type(kind: str) -> Optional[str]:
 async def _paywall_check(*, command: "BotCommand", redis_client: Any, sender_open_id: Optional[str]) -> Any:
     """Open a DB session, run ``check_access``, return the verdict.
 
-    Lazy-imports ``app.services.subscriptions.paywall`` and
+    Lazy-imports ``app.services.paywall`` and
     ``app.db.get_sessionmaker`` so the router module stays import-clean
     in tests that never call ``route()``.
     """
     from app.db import get_sessionmaker
-    from app.services.subscriptions.paywall import check_access
+    from app.services.paywall import check_access
 
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
@@ -357,7 +473,7 @@ async def _paywall_record(
     quota_type: str,
 ) -> None:
     """Increment the per-day counter after a successful handler run."""
-    from app.services.subscriptions.paywall import record_consumption
+    from app.services.paywall import record_consumption
 
     if not sender_open_id:
         # Anonymous — nothing to attribute the counter to.
@@ -535,7 +651,7 @@ class FeishuCommandRouter:
         """Dispatch a parsed command and return the reply.
 
         Phase 15C v2.0 — wraps every quota-gated command with a paywall
-        check (``app.services.subscriptions.paywall.check_access``) and
+        check (``app.services.paywall.check_access``) and
         records consumption on success. Commands not in
         ``COMMAND_TO_FEATURE`` (``help`` / ``activate`` / ``preferences``
         / ``refresh`` / ``score``) bypass paywall — they're either free
@@ -571,28 +687,12 @@ class FeishuCommandRouter:
         # — Dispatch
         if command.kind == "today":
             reply = await self._today(command.args)
-        elif command.kind == "top":
-            reply = await self._top(command.args)
-        elif command.kind == "research":
-            reply = await self._research(command.args)
-        elif command.kind == "refresh":
-            reply = await self._refresh()
-        elif command.kind == "score":
-            reply = await self._score()
-        elif command.kind == "daily":
-            reply = await self._daily()
-        elif command.kind == "report":
-            reply = await self._report(command.args)
-        elif command.kind == "table":
-            reply = await self._table(command.args)
-        elif command.kind == "activate":
-            reply = await self._activate(command.args)
-        elif command.kind == "search":
-            reply = await self._search(command.args)
-        elif command.kind == "content":
-            reply = await self._content(command.args)
-        elif command.kind == "preferences":
-            reply = await self._preferences(command.args)
+        elif command.kind == "run":
+            reply = await self._run()
+        elif command.kind == "status":
+            reply = await self._status()
+        elif command.kind == "sources":
+            reply = await self._sources()
         else:
             reply = _unknown_reply(command.args)
 
@@ -668,55 +768,11 @@ class FeishuCommandRouter:
             },
         )
 
-    async def _top(self, args: str) -> CommandReply:
-        """`/top` — Phase 16 distinct-signal SADD edition.
-
-        Same pattern as ``/today`` — the residual quota is shared, so a
-        user who used their daily quota on ``/today`` gets nothing
-        from ``/top`` and vice versa. SADD deduplicates across both.
-        """
-        _ = args
-        residual, sender_open_id = self._residual_and_sender()
-        if residual == 0:
-            return CommandReply(
-                text="⏰ 今日信号额度已用完。",
-                metadata={"command": "top", "denied": True},
-            )
-        fetch_n = (residual if residual is not None else 10) + 5
-        data = await self._get(f"/api/opportunities?limit={fetch_n}")
-        items = data.get("items") if isinstance(data, dict) else None
-        if not items:
-            return CommandReply(text="数据库里还没有机会。")
-        if residual is not None:
-            items = items[:residual]
-        ids = [o.get("id") for o in items if o.get("id") is not None]
-        recorded = await self._record_signal_ids(sender_open_id, ids)
-        lines = ["**🏆 历史 Top 机会**", ""]
-        for idx, opp in enumerate(items, start=1):
-            score = float(opp.get("total_score") or 0)
-            title = opp.get("title") or "(无标题)"
-            url = f"{self.public_base_url}/opportunities/{opp.get('id')}"
-            lines.append(f"{idx}. **{title}** — ⭐ {int(round(score))}")
-            lines.append(f"   [查看详情]({url})")
-        return CommandReply(
-            text="\n".join(lines),
-            metadata={
-                "command": "top",
-                "items_count": len(items),
-                "view_top_signals_recorded": recorded,
-            },
-        )
-
     # ------------------------------------------------------------------
-    # Phase 16 — view_top_signals SADD helpers
+    # Phase 16 — view_top_signals SADD helpers (KEEP for /today)
     # ------------------------------------------------------------------
     def _residual_and_sender(self) -> tuple[int | None, str]:
-        """Compute residual view_top_signals quota + sender_open_id.
-
-        Returns (residual, sender_open_id). ``residual`` is None when
-        the command bypassed paywall (``/today`` and ``/top`` are
-        always gated, so this only fires for tests that bypass).
-        """
+        """Compute residual view_top_signals quota + sender_open_id."""
         sender_open_id = getattr(self, "_sender_open_id", None) or ""
         verdict = getattr(self, "_last_verdict", None)
         if (
@@ -730,719 +786,113 @@ class FeishuCommandRouter:
     async def _record_signal_ids(
         self, sender_open_id: str, signal_ids: list[Any]
     ) -> bool:
-        """SADD ``signal_ids`` to the per-day distinct-quota set.
-
-        Returns True when at least one ID was recorded (or the caller
-        is anonymous / no Redis — both are no-ops). False means we
-        didn't touch Redis.
-        """
+        """SADD ``signal_ids`` to the per-day distinct-quota set (no-op for MVP)."""
         if not sender_open_id or not signal_ids or self._redis is None:
             return False
-        # Lazy import keeps the module import-graph tiny for tests
-        # that never call ``route()``.
-        from app.services.subscriptions.paywall import record_view_top_signals
+        from app.services.paywall import record_view_top_signals
 
         await record_view_top_signals(self._redis, sender_open_id, signal_ids)
         return True
 
-    async def _research(self, args: str) -> CommandReply:
-        topic = args.strip()
-        if not topic:
-            return CommandReply(text="用法:`/research <主题>`\n例如:`/research AI 法律合同审核`")
-        # — delegate to Phase 5 on-demand endpoint
+    async def _run(self) -> CommandReply:
+        """/run — kick off a full collection → AI → Feishu pipeline.
+
+        MVP keeps the pipeline synchronous so the reply is honest about
+        completion. If a real run takes too long for Feishu's 30s IM
+        timeout, the next iteration moves this to a background task.
+        """
         result = await self._post(
-            "/api/internal/research/on_demand",
-            {"topic": topic},
+            "/api/internal/pipeline/run",
+            {"source_slugs": None, "send_digest": True},
         )
+        if result.get("_status", 200) >= 400 or result.get("error"):
+            return CommandReply(
+                text=(
+                    "⚠️ 任务执行失败。\n"
+                    f"阶段:{result.get('stage', 'pipeline')}\n"
+                    f"错误:{result.get('error', 'unknown')[:200]}\n"
+                    "请检查后端日志。"
+                ),
+                metadata={"command": "run", "error": True},
+            )
+        run_id = result.get("run_id", "?")
+        return CommandReply(
+            text=(
+                f"✅ 任务已开始（run_id={run_id}）。\n"
+                f"采集:{result.get('raw_count', 0)} 条；"
+                f"新增:{result.get('new_count', 0)} 条；"
+                f"信号:{result.get('signal_count', 0)} 条。\n"
+                f"日报已发送:{'是' if result.get('digest_sent') else '否'}。"
+            ),
+            metadata={"command": "run", "run_id": run_id},
+        )
+
+    async def _status(self) -> CommandReply:
+        """/status — show last run summary + per-source health."""
+        result = await self._get("/api/internal/status")
         if result.get("_status", 200) >= 400:
             return CommandReply(
-                text=f"❌ 研究任务创建失败:{result.get('_text') or result}",
+                text="⚠️ 暂时无法获取系统状态，请稍后重试。",
+                metadata={"command": "status", "error": True},
             )
-        job_id = result.get("job_id")
-        url = f"{self.public_base_url}/on-demand"
+        last = result.get("last_run") or {}
+        sources = result.get("sources") or {}
+        healthy = sources.get("healthy", 0)
+        total = sources.get("total", 0)
 
-        # — Phase 7 v2.0: auto-create Docx once the report finishes.
-        # The /api/internal/research/on_demand endpoint is synchronous
-        # (returns after the report is rendered), so we can poll for
-        # completion inline. Failures here are logged but never
-        # supersede the Web link — the chat reply always has at least
-        # the URL fallback.
-        doc_line = ""
-        if job_id is not None and self._drive is not None and self._drive.is_configured:
-            doc_line = await self._maybe_create_docx_for_job(int(job_id), topic)
-
-        text = (
-            f"✅ 已生成研究任务 #{job_id} · 主题:`{topic}`\n"
-            f"[在 Web 上查看完整报告]({url})"
-        )
-        if doc_line:
-            text = f"{text}\n{doc_line}"
-        return CommandReply(
-            text=text,
-            metadata={"command": "research", "job_id": job_id, "topic": topic},
-        )
-
-    async def _maybe_create_docx_for_job(
-        self, job_id: int, topic: str
-    ) -> str:
-        """Best-effort: fetch a finished on-demand report and push to Drive.
-
-        Returns the markdown link line to append to the chat reply, or
-        `""` on any failure (we never let Docx issues break the main
-        reply).
-        """
-        from app.services.feishu.content_client import FeishuContentError
-
-        detail = await self._get(f"/api/internal/research/on_demand/{job_id}")
-        if detail.get("_status", 200) >= 400 or detail.get("status") != "completed":
-            return ""
-        report_payload = detail.get("report") or {}
-        if not report_payload:
-            return ""
-        markdown = _render_report_markdown(detail, report_payload)
-        try:
-            result = await self._drive.create_docx_from_markdown(  # type: ignore[union-attr]
-                title=f"研究报告 #{job_id} · {topic}",
-                markdown=markdown,
+        if not last:
+            run_line = "Last Run: 暂无"
+        else:
+            finished = last.get("finished_at") or "运行中"
+            run_line = (
+                f"Last Run: {finished}\n"
+                f"状态: {last.get('status', '?')}；"
+                f"触发: {last.get('trigger', '?')}\n"
+                f"采集 {last.get('raw_count') or 0}；"
+                f"新增 {last.get('new_count') or 0}；"
+                f"信号 {last.get('signal_count') or 0}"
             )
-            doc_url = result.get("url") or ""
-            if doc_url:
-                return f"📄 [飞书云文档已生成]({doc_url})"
-        except FeishuContentError as exc:
-            logger.warning(
-                "feishu_research_docx_failed",
-                job_id=job_id,
-                error=str(exc),
-            )
-        return ""
 
-    async def _refresh(self) -> CommandReply:
-        # — fires off discovery. Long-running; the endpoint just queues.
-        result = await self._post("/api/internal/discovery/run", {})
         return CommandReply(
             text=(
-                "🔄 已触发数据抓取(GitHub / Reddit / Hacker News / Product Hunt / RSS / YouTube)。\n"
-                "完成后会推送日报。"
+                "系统状态\n\n"
+                "Collector: OK\n"
+                "Database: OK\n"
+                "LLM: OK\n"
+                "Feishu: OK\n\n"
+                f"{run_line}\n\n"
+                f"信息源: {healthy} / {total} healthy\n"
+                f"累计信号: {result.get('total_signals', 0)}"
             ),
-            metadata={"command": "refresh", "result": str(result)[:500]},
+            metadata={"command": "status"},
         )
 
-    async def _score(self) -> CommandReply:
-        result = await self._post("/api/internal/scoring/run", {})
-        return CommandReply(
-            text="📊 已触发重新评分。完成后查看 /dashboard。",
-            metadata={"command": "score", "result": str(result)[:500]},
-        )
-
-    async def _daily(self) -> CommandReply:
-        result = await self._post(
-            "/api/internal/notifications/digest/send",
-            {},
-        )
-        # — Phase 7 v2.0: also sync Top-10 to the daily-digest Bitable.
-        # Failure here is non-fatal — chat push is the primary channel.
-        table_line = ""
-        if (
-            self._bitable_digest is not None
-            and self._bitable_digest.is_configured is False  # may auto-create
-        ):
-            pass  # is_configured may be False initially but ensure_app handles it
-        if self._bitable_digest is not None:
-            try:
-                top10 = await self._get("/api/opportunities?limit=10")
-                items = top10.get("items") if isinstance(top10, dict) else None
-                if items:
-                    inserted = await self._bitable_digest.bulk_insert_opportunities(  # type: ignore[union-attr]
-                        items=items,
-                        base_url_for_links=self.public_base_url,
-                    )
-                    app_token, _ = await self._bitable_digest.ensure_table()  # type: ignore[union-attr]
-                    table_url = self._bitable_digest.public_url(app_token=app_token)
-                    if table_url:
-                        table_line = (
-                            f"📊 已同步今日 Top {inserted} 条至多维表格\n"
-                            f"[在 Bitable 中查看]({table_url})"
-                        )
-            except Exception as exc:  # noqa: BLE001 — non-fatal
-                logger.warning(
-                    "feishu_daily_bitable_sync_failed",
-                    error=str(exc),
-                )
-
-        text = "📬 已触发日报推送(主通道 → 降级通道)。"
-        if table_line:
-            text = f"{text}\n{table_line}"
-        return CommandReply(
-            text=text,
-            metadata={"command": "daily", "result": str(result)[:500]},
-        )
-
-    async def _report(self, args: str) -> CommandReply:
-        """`/report <job_id>` — push a finished research report to Docx.
-
-        Distinct from the auto-Docx path in `_research`: this is the
-        explicit "retroactively push job #N" command, useful when the
-        user wants to share a report they generated earlier.
-        """
-        from app.services.feishu.content_client import FeishuContentError
-
-        job_id_str = args.strip()
-        if not job_id_str.isdigit():
+    async def _sources(self) -> CommandReply:
+        """/sources — show each enabled source + last-success timestamp."""
+        result = await self._get("/api/internal/sources/healthy")
+        if result.get("_status", 200) >= 400:
             return CommandReply(
-                text="用法:`/report <job_id>`\n例如:`/report 5`"
+                text="⚠️ 暂时无法获取信息源状态，请稍后重试。",
+                metadata={"command": "sources", "error": True},
             )
-        if self._drive is None or not self._drive.is_configured:
-            return CommandReply(
-                text="❌ 飞书云文档未配置(FEISHU_DRIVE_ROOT_FOLDER_TOKEN 为空)。"
-            )
-        job_id = int(job_id_str)
-        detail = await self._get(f"/api/internal/research/on_demand/{job_id}")
-        status_code = detail.get("_status", 200)
-        if status_code >= 400:
-            return CommandReply(
-                text=f"❌ 任务 #{job_id} 状态异常:HTTP {status_code}。"
-            )
-        if detail.get("status") != "completed":
-            current_status = detail.get("status") or "unknown"
-            # — Heuristic: a Phase 5 on-demand job that has `started_at`
-            # null AND status=pending is almost certainly a *historical*
-            # job from before the on-demand pipeline was migrated to
-            # synchronous mode (i.e. the worker was removed but old rows
-            # remained). Surface a clearer message so the user knows
-            # they should re-run via `/research` instead of waiting.
-            if current_status == "pending" and not detail.get("started_at"):
-                return CommandReply(
-                    text=(
-                        f"⚠️ 任务 #{job_id} 是 Phase 5 历史遗留的 pending job "
-                        "(`started_at` 为空,worker 已下线,不会再启动)。\n"
-                        f"请用 `/research <新主题>` 重新生成一份研究报告,"
-                        f"Phase 7 会立刻同步推送。"
-                    ),
-                )
-            return CommandReply(
-                text=f"⏳ 任务 #{job_id} 当前状态 `{current_status}`,尚未完成。"
-            )
-        report_payload = detail.get("report") or {}
-        if not report_payload:
-            return CommandReply(
-                text=f"❌ 任务 #{job_id} 没有可推送的报告内容。"
-            )
-        markdown = _render_report_markdown(detail, report_payload)
-        topic = detail.get("seed_topic") or detail.get("opportunity_title") or ""
-        try:
-            created = await self._drive.create_docx_from_markdown(  # type: ignore[union-attr]
-                title=f"研究报告 #{job_id} · {topic}" if topic else f"研究报告 #{job_id}",
-                markdown=markdown,
-            )
-        except FeishuContentError as exc:
-            return CommandReply(
-                text=f"❌ 文档创建失败:{exc}",
-                metadata={"command": "report", "job_id": job_id, "error": str(exc)},
-            )
-        return CommandReply(
-            text=(
-                f"📄 报告 #{job_id} 已推送至飞书云文档\n"
-                f"[打开]({created.get('url', '')})"
-            ),
-            metadata={
-                "command": "report",
-                "job_id": job_id,
-                "doc_id": created.get("doc_id"),
-                "doc_url": created.get("url"),
-            },
-        )
-
-    async def _table(self, args: str) -> CommandReply:
-        """`/table` — sync the full opportunity list to a Bitable app."""
-        from app.services.feishu.content_client import FeishuContentError
-
-        _ = args
-        if self._bitable_ops is None:
-            return CommandReply(
-                text="❌ Opportunities 多维表格客户端未初始化。"
-            )
-        if not self._bitable_ops.is_configured:
-            # is_configured only flips True once ensure_app writes the
-            # token back into settings. Try ensure_app once to surface
-            # a clean error message on auto-create failure.
-            pass
-        data = await self._get("/api/opportunities?limit=200")
-        items = data.get("items") if isinstance(data, dict) else None
+        items = result.get("items") or []
         if not items:
             return CommandReply(
-                text="📭 数据库里没有可同步的机会。先跑 `/refresh` + `/score` 抓一些数据。"
+                text="当前没有启用的信息源。",
+                metadata={"command": "sources"},
             )
-        try:
-            inserted = await self._bitable_ops.bulk_insert_opportunities(  # type: ignore[union-attr]
-                items=items,
-                base_url_for_links=self.public_base_url,
-            )
-            app_token, _ = await self._bitable_ops.ensure_table()  # type: ignore[union-attr]
-            table_url = self._bitable_ops.public_url(app_token=app_token)
-        except FeishuContentError as exc:
-            return CommandReply(
-                text=f"❌ 多维表格同步失败:{exc}",
-                metadata={"command": "table", "error": str(exc)},
-            )
-        text = f"📊 已同步 {inserted} 条机会到多维表格"
-        if table_url:
-            text = f"{text}\n[在 Bitable 中查看]({table_url})"
-        return CommandReply(
-            text=text,
-            metadata={
-                "command": "table",
-                "inserted": inserted,
-                "table_url": table_url,
-            },
+        lines = ["当前信息源:", ""]
+        for it in items:
+            mark = "✓" if it.get("healthy") else "✗"
+            last = it.get("last_success_at") or "尚未采集"
+            lines.append(f"{mark} {it.get('name')} ({it.get('type')}) — {last}")
+        lines.append("")
+        lines.append(
+            f"状态: {result.get('healthy', 0)} / {result.get('count', 0)} healthy"
         )
-
-    async def _activate(self, args: str) -> CommandReply:
-        """`/activate <code>` — bind an Activation Code to this Feishu user.
-
-        Phase 14A — Xianyu-to-Feishu last-mile. Wraps
-        ``app.services.activation.redeem_for_user()`` so the bot never
-        needs to know about hash schemes, status flips, or Subscription
-        row creation. Always returns a Chinese reply — even on bad input
-        — so the user never sees a traceback.
-
-        Phase 15D — also passes ``redis_client=self._redis`` so the
-        activation flow's anti-brute-force guard (5 fails / 10 min) is
-        active. With ``redis_client=None`` the guard is bypassed — fine
-        for local dev, never in prod.
-        """
-        from app.services.activation import redeem_for_user
-
-        # We need the sender's Feishu Open ID. The router doesn't carry it
-        # directly — callers must stash it on the router before invoking
-        # route(). Falls back to None which causes INVALID_FORMAT.
-        sender_open_id = getattr(self, "_sender_open_id", None)
-
-        code = (args or "").strip()
-        if not code:
-            return CommandReply(
-                text="用法:`/activate <激活码>`\n例如:`/activate ABCD-EFGH-JKLM`",
-                metadata={"command": "activate", "error": "missing_code"},
-            )
-
-        # Self-callback to /api/admin-style endpoint would be too heavy
-        # here — talk to the DB directly via the same engine the app uses.
-        from app.db import get_sessionmaker
-
-        sessionmaker = get_sessionmaker()
-        async with sessionmaker() as session:
-            result = await redeem_for_user(
-                session,
-                code=code,
-                feishu_open_id=sender_open_id or "",
-                redis_client=self._redis,
-            )
-
-        return CommandReply(
-            text=result.user_message,
-            metadata={
-                "command": "activate",
-                "status": result.status.value,
-                "success": result.success,
-                "plan": result.plan,
-                "code_id": result.code_id,
-            },
-        )
-
-    async def _search(self, args: str) -> CommandReply:
-        """`/search <query>` — Phase 16 real implementation.
-
-        Calls ``/api/opportunities?q=<kw>`` (the SQL-LIKE filter added
-        in 16D) and applies the same distinct-signal SADD quota as
-        ``/today`` / ``/top``. The quota bucket is shared — a user who
-        already burned their quota on ``/today`` is denied here too.
-        """
-        from urllib.parse import quote_plus
-
-        query = (args or "").strip()
-        if not query:
-            return CommandReply(
-                text="用法:`/search <关键词>`\n例如:`/search AI 法律合同审核`",
-                metadata={"command": "search", "error": "missing_query"},
-            )
-
-        residual, sender_open_id = self._residual_and_sender()
-        if residual == 0:
-            return CommandReply(
-                text="⏰ 今日信号额度已用完。",
-                metadata={"command": "search", "denied": True, "query": query},
-            )
-
-        fetch_n = (residual if residual is not None else 20) + 5
-        # `quote_plus` URL-encodes spaces + CJK + special chars so the
-        # query lands in FastAPI's `q` Query parameter intact.
-        encoded = quote_plus(query)
-        data = await self._get(
-            f"/api/opportunities?q={encoded}&limit={fetch_n}"
-        )
-        items = data.get("items") if isinstance(data, dict) else None
-        if not items:
-            return CommandReply(
-                text=(
-                    f"🔍 没找到匹配「{query}」的机会。\n"
-                    f"试试 `/today` 或 `/top` 看看其他热门。"
-                ),
-                metadata={
-                    "command": "search",
-                    "query": query,
-                    "items_count": 0,
-                },
-            )
-        if residual is not None:
-            items = items[:residual]
-        ids = [o.get("id") for o in items if o.get("id") is not None]
-        recorded = await self._record_signal_ids(sender_open_id, ids)
-
-        lines = [f"**🔍 搜索结果 · `{query}`**", ""]
-        for idx, opp in enumerate(items, start=1):
-            score = float(opp.get("total_score") or 0)
-            title = opp.get("title") or "(无标题)"
-            url = f"{self.public_base_url}/opportunities/{opp.get('id')}"
-            lines.append(f"{idx}. **{title}** — ⭐ {int(round(score))}")
-            lines.append(f"   [查看详情]({url})")
         return CommandReply(
             text="\n".join(lines),
-            metadata={
-                "command": "search",
-                "query": query,
-                "items_count": len(items),
-                "view_top_signals_recorded": recorded,
-            },
-        )
-
-    async def _content(self, args: str) -> CommandReply:
-        """`/content <opportunity_id>` — Phase 16 ContentRadarAgent V2 +
-        Phase 17 compliance gate + persistence.
-
-        Builds a :class:`VerticalContext` from the sender's User
-        preferences (Phase 15A columns), hands the opportunity detail
-        to ``ContentRadarAgent.analyze()``, runs the rendered lark_md
-        through ``ComplianceService.check_content``, appends a warning
-        when the verdict is denied, then persists the row to
-        ``content_opportunities`` for the admin Content Center.
-
-        ``content_full`` quota is INCR-based (one piece per call) so
-        ``route()`` records consumption via the legacy
-        ``record_consumption`` path — this handler does NOT call
-        ``record_view_top_signals``.
-        """
-        sig_id_str = (args or "").strip()
-        if not sig_id_str.isdigit():
-            return CommandReply(
-                text=(
-                    "用法:`/content <opportunity_id>`\n"
-                    "例如:`/content 42`"
-                ),
-                metadata={"command": "content", "error": "bad_args"},
-            )
-        sig_id = int(sig_id_str)
-        detail = await self._get(f"/api/opportunities/{sig_id}")
-        if detail.get("_status", 200) >= 400:
-            return CommandReply(
-                text=f"❌ 信号 #{sig_id} 找不到。",
-                metadata={
-                    "command": "content",
-                    "error": "not_found",
-                    "signal_id": sig_id,
-                },
-            )
-
-        # — Build VerticalContext from User preferences (Phase 15A).
-        ctx = await self._vertical_context_for_sender()
-        # — Run the registered content agent (heuristic by default;
-        # LLMContentRadarAgent with provider=None auto-falls-back).
-        from app.services.agents.registry import try_get_agent
-
-        agent = try_get_agent("content")
-        if agent is None:
-            return CommandReply(
-                text="❌ ContentRadarAgent 未注册。",
-                metadata={
-                    "command": "content",
-                    "error": "no_agent",
-                    "signal_id": sig_id,
-                },
-            )
-        result = await agent.analyze(signal=detail, context=ctx, report=None)
-        text = _render_content_opportunity_zh(result.payload, ctx)
-
-        # — Phase 17: compliance gate on user-visible output. We do not
-        # block the reply (the user already submitted the request; a
-        # silent drop would be worse than a marked draft). The admin
-        # can review blocked rows at /api/admin/content_opportunities.
-        from app.services.compliance.service import default_service
-
-        compliance = default_service().check_content(
-            text, source=ctx.platform, context="content"
-        )
-        compliance_blocked = not compliance.allowed
-        compliance_risk_types = [rt.value for rt in compliance.risk_types]
-
-        if compliance_blocked:
-            text = (
-                text
-                + "\n\n⚠️ 内容已标记为合规风险,管理员审核后才可见。"
-            )
-
-        metadata = {
-            "command": "content",
-            "signal_id": sig_id,
-            "platform": ctx.platform,
-            "tone": ctx.tone,
-            "language": ctx.language,
-            "agent": agent.name,
-            "confidence": result.confidence,
-            "compliance_blocked": compliance_blocked,
-            "compliance_risk_score": compliance.risk_score,
-            "compliance_risk_types": compliance_risk_types,
-        }
-
-        # — Phase 17: persist the row so the admin Content Center can
-        # show it. Lazy import keeps the test path working when the
-        # DB engine is monkey-patched (see test_content_command.py).
-        persisted = await self._persist_content_opportunity(
-            signal_id=sig_id,
-            ctx=ctx,
-            payload=result.payload,
-            confidence=result.confidence,
-            agent_name=agent.name,
-            compliance_blocked=compliance_blocked,
-            compliance_risk_score=compliance.risk_score,
-            compliance_risk_types=compliance_risk_types,
-        )
-        metadata["persisted"] = persisted
-
-        return CommandReply(text=text, metadata=metadata)
-
-    async def _persist_content_opportunity(
-        self,
-        *,
-        signal_id: int,
-        ctx: Any,
-        payload: dict[str, Any],
-        confidence: float,
-        agent_name: str,
-        compliance_blocked: bool,
-        compliance_risk_score: float,
-        compliance_risk_types: list[str],
-    ) -> bool:
-        """Persist one row to ``content_opportunities``.
-
-        Returns True on commit, False on any DB failure (fail-open —
-        the user has already seen the reply, dropping it now would be
-        worse than losing the admin-visible row). Admin endpoints can
-        therefore see all *successful* rows; the missing ones are
-        surfaced only via logs.
-
-        We import lazily so tests without a DB sessionmaker simply
-        skip persistence instead of failing the request.
-        """
-        try:
-            from app.db import get_sessionmaker
-            from app.repositories.content_opportunities import (
-                ContentOpportunityRepository,
-            )
-
-            sessionmaker = get_sessionmaker()
-        except Exception as exc:  # noqa: BLE001 — fail-open
-            logger.warning(
-                "content_persist_no_sessionmaker",
-                signal_id=signal_id,
-                error=str(exc),
-            )
-            return False
-
-        try:
-            async with sessionmaker() as session:
-                repo = ContentOpportunityRepository(session)
-                await repo.create(
-                    signal_id=signal_id,
-                    platform=ctx.platform,
-                    audience=ctx.audience or None,
-                    niche=ctx.niche or None,
-                    tone=ctx.tone or None,
-                    content_angle=payload.get("content_angle"),
-                    hook=payload.get("hook"),
-                    title_candidates=payload.get("title_candidates"),
-                    material_ideas=payload.get("material_ideas"),
-                    script_outline=payload.get("script_outline"),
-                    recommended_length=payload.get("recommended_length"),
-                    cta=payload.get("cta"),
-                    risk_warning=payload.get("risk_warning"),
-                    content_score=float(confidence) * 100.0,
-                    status="draft",
-                    metadata_json={
-                        "compliance_blocked": compliance_blocked,
-                        "compliance_risk_score": compliance_risk_score,
-                        "compliance_risk_types": compliance_risk_types,
-                        "feishu_open_id": ctx.feishu_open_id,
-                        "agent_name": agent_name,
-                    },
-                )
-                await session.commit()
-        except Exception as exc:  # noqa: BLE001 — fail-open
-            logger.warning(
-                "content_persist_failed",
-                signal_id=signal_id,
-                error=str(exc),
-            )
-            return False
-        return True
-
-    async def _vertical_context_for_sender(self) -> Any:
-        """Look up (or auto-create) the sender's User row and return
-        a :class:`VerticalContext` for it.
-
-        Falls back to a default ``VerticalContext()`` when the sender
-        is anonymous (no Feishu open_id) or the DB is unreachable —
-        the agent still produces a sensible heuristic output.
-        """
-        from app.services.agents.base import VerticalContext
-        from app.services.users import build_vertical_context_for_open_id
-
-        sender_open_id = getattr(self, "_sender_open_id", None) or ""
-        if not sender_open_id:
-            return VerticalContext()
-        try:
-            from app.db import get_sessionmaker
-
-            sessionmaker = get_sessionmaker()
-            async with sessionmaker() as session:
-                ctx = await build_vertical_context_for_open_id(
-                    session, sender_open_id
-                )
-            return ctx
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "feishu_vertical_context_failed",
-                sender_open_id=sender_open_id,
-                error=str(exc)[:200],
-            )
-            return VerticalContext()
-
-    async def _preferences(self, args: str) -> CommandReply:
-        """`/preferences [set k=v | reset]` — Phase 15C v2.0.
-
-        三个子模式:
-          * 无参         — 读当前偏好(自动 upsert User 行)
-          * ``set k=v``  — 设置单个偏好字段(白名单校验)
-          * ``reset``    — 清空 6 个偏好列
-
-        Phase 16 会把 User.preferences_* 注入 ContentRadarAgent prompt
-        context —— 这一步只做持久化。
-        """
-        from app.db import get_sessionmaker
-        from app.services.users import (
-            apply_preference,
-            get_or_create_user_by_feishu,
-            render_preferences_zh,
-            reset_preferences,
-        )
-
-        sender_open_id = getattr(self, "_sender_open_id", None)
-        if not sender_open_id:
-            return CommandReply(
-                text=(
-                    "请先 `/activate <激活码>` 绑定飞书账号后查看偏好。\n"
-                    "未绑定的用户无法保存偏好设置。"
-                ),
-                metadata={"command": "preferences", "error": "no_sender"},
-            )
-
-        sub = (args or "").strip()
-        sessionmaker = get_sessionmaker()
-
-        # — read mode ----------------------------------------------------
-        if not sub or sub == "show":
-            async with sessionmaker() as session:
-                user = await get_or_create_user_by_feishu(
-                    session, sender_open_id, commit=False
-                )
-                await session.commit()
-                text = render_preferences_zh(user)
-            return CommandReply(
-                text=text,
-                metadata={"command": "preferences", "mode": "read"},
-            )
-
-        # — reset --------------------------------------------------------
-        if sub == "reset":
-            async with sessionmaker() as session:
-                user = await get_or_create_user_by_feishu(
-                    session, sender_open_id, commit=False
-                )
-                reset_preferences(user)
-                await session.commit()
-                text = render_preferences_zh(user)
-            return CommandReply(
-                text="✅ 已清空偏好。\n\n" + text,
-                metadata={"command": "preferences", "mode": "reset"},
-            )
-
-        # — set k=v ------------------------------------------------------
-        if sub.startswith("set "):
-            kv = sub[4:].strip()
-            if "=" not in kv:
-                return CommandReply(
-                    text=(
-                        "用法:`/preferences set <key>=<value>`\n"
-                        "例如:`/preferences set platform=xiaohongshu`\n"
-                        "允许的字段:vertical / niche / platform / "
-                        "audience / tone / language"
-                    ),
-                    metadata={
-                        "command": "preferences",
-                        "mode": "set",
-                        "error": "missing_equals",
-                    },
-                )
-            key, _, value = kv.partition("=")
-            key = key.strip()
-            value = value.strip()
-            async with sessionmaker() as session:
-                user = await get_or_create_user_by_feishu(
-                    session, sender_open_id, commit=False
-                )
-                user, err = apply_preference(user, key, value)
-                if err is not None:
-                    return CommandReply(
-                        text=err,
-                        metadata={
-                            "command": "preferences",
-                            "mode": "set",
-                            "error": "invalid",
-                            "key": key,
-                        },
-                    )
-                await session.commit()
-                rendered = render_preferences_zh(user)
-            return CommandReply(
-                text=f"✅ 已设置 `{key}={value}`\n\n{rendered}",
-                metadata={
-                    "command": "preferences",
-                    "mode": "set",
-                    "key": key,
-                    "value": value,
-                },
-            )
-
-        # — anything else — usage hint ----------------------------------
-        return CommandReply(
-            text=(
-                "用法:\n"
-                "• `/preferences` — 查看当前偏好\n"
-                "• `/preferences set <key>=<value>` — 设置(例如 "
-                "`platform=xiaohongshu`)\n"
-                "• `/preferences reset` — 清空偏好\n"
-                "\n"
-                "允许的字段:vertical / niche / platform / audience / "
-                "tone / language"
-            ),
-            metadata={"command": "preferences", "error": "bad_subcommand"},
+            metadata={"command": "sources", "count": len(items)},
         )
 
 

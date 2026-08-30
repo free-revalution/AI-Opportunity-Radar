@@ -35,7 +35,6 @@ from app.services.compliance.source_policy import SourcePolicyRecord
 # in conftest.py / docs) that referenced ``tests.test_compliance``
 # directly continue to find the per-detector TestCases here.
 from tests.test_compliance_audit_hook import *  # noqa: F401,F403
-from tests.test_content_safety import *  # noqa: F401,F403
 from tests.test_copyright_risk import *  # noqa: F401,F403
 from tests.test_pii import *  # noqa: F401,F403
 from tests.test_prompt_injection import *  # noqa: F401,F403

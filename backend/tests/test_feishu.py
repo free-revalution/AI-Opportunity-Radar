@@ -489,28 +489,8 @@ async def test_feishu_digest_endpoint_returns_summary(
     client,
     sqlite_session,
 ) -> None:
-    from app.models import Opportunity
+    # FREEZE — /api/internal/feishu/digest/send removed in MVP (simplify §6).
+    pytest.skip("FREEZE endpoint removed in MVP")
 
-    sqlite_session.add(
-        Opportunity(
-            title="endpoint opp",
-            slug="endpoint-opp",
-            total_score=87.0,
-            commercial_status="qualified",
-            content_status="new",
-        )
-    )
-    await sqlite_session.flush()
 
-    # When FEISHU_WEBHOOK_URL is unset (default in tests) the endpoint
-    # routes through the mock provider, so the call always succeeds.
-    response = client.post(
-        "/api/internal/feishu/digest/send",
-        json={"limit": 1, "only_qualified": True, "window_hours": None},
-    )
-    assert response.status_code == 200, response.text
-    payload = response.json()
-    assert payload["sent"] is True
-    assert payload["opportunity_count"] == 1
-    assert payload["provider"] == "mock-feishu"
-    assert payload["error"] is None
+# ── FREEZE digest-build endpoint removed in MVP (simplify §6) ──

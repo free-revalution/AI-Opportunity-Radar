@@ -22,8 +22,5 @@ async def test_discovery_run_with_no_body_uses_defaults(client):
 
 
 async def test_digest_build_returns_top_opportunities(client):
-    response = client.post("/api/internal/digest/build", json={})
-    assert response.status_code == 200
-    body = response.json()
-    assert "top_opportunities" in body
-    assert isinstance(body["top_opportunities"], list)
+    # FREEZE — /api/internal/digest/build removed in MVP (simplify §6).
+    pytest.skip("FREEZE endpoint removed in MVP")

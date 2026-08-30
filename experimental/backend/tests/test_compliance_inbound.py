@@ -19,7 +19,7 @@ from app.services.compliance.models import (
     RiskType,
 )
 from app.services.feishu.inbound import BotCommand, FeishuCommandRouter
-from app.services.subscriptions.paywall import PaywallVerdict
+from app.services.paywall import PaywallVerdict
 
 
 pytestmark = pytest.mark.asyncio

@@ -8,7 +8,7 @@
           "item": [
             {
               "mode": "cronExpression",
-              "expression": "0 2 * * *",
+              "expression": "0 0 * * *",
               "timezone": "UTC"
             }
           ]

@@ -171,7 +171,7 @@ async def handle_feishu_event(
         )
 
     # 2. — Parse event.
-    parsed = parse_event(body)
+    parsed = parse_event(body, settings=settings)
 
     # 2a. URL verification handshake — echo back the challenge.
     if isinstance(parsed, dict) and "challenge" in parsed:
@@ -200,6 +200,27 @@ async def handle_feishu_event(
         )
         # — Ack without a reply. Feishu will only retry on non-200.
         return {"code": 0, "msg": "ok"}
+
+    # 4. — Phase 25 F.2: Redis SETNX event idempotency. Each
+    # ``event_id`` is processed at most once per 24h window — Feishu
+    # retries on timeouts / 5xx so we must dedupe to avoid double
+    # replies (e.g. running `/run` twice for the same delivery).
+    event_id = ""
+    header = body.get("header") or {}
+    event_id = str(header.get("event_id") or "").strip()
+    if event_id:
+        from app.services.feishu.inbound import _event_already_processed
+        from app.services.redis_client import get_redis
+
+        redis_for_dedup = await get_redis()
+        if await _event_already_processed(
+            event_id, redis_client=redis_for_dedup
+        ):
+            logger.info(
+                "feishu_event_duplicate_skipped",
+                event_id=event_id,
+            )
+            return {"code": 0, "msg": "ok", "duplicate": True}
 
     # — Single `FeishuAppClient` instance per request so all Phase 7
     # sibling clients (Drive + Bitable) share its token cache.
