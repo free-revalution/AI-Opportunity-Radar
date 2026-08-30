@@ -157,11 +157,20 @@ class DriveOrgService:
     # Tree management
     # ------------------------------------------------------------------
     async def ensure_root_tree(self) -> RootTokens:
-        """Ensure each of the 4 sections exists; return their tokens.
+        """Locate each of the 4 sections under the root folder.
 
-        Uses the configured ``feishu_drive_root_folder_token`` as
-        the root. Each section is created via
-        :meth:`ensure_folder_path` so re-runs are safe.
+        Phase 27 fix — earlier versions called ``ensure_folder_path``
+        which auto-creates missing segments. The
+        ``POST /drive/v1/files`` endpoint, however, returns
+        ``404 page not found`` for some Feishu tenants (creation
+        endpoint disabled or app permissions not effective), so the
+        auto-create path was a hard 404 on every ``/docs tree`` run.
+
+        New behaviour: read the root folder's existing children and
+        match by name. If a section is missing, raise a friendly
+        :class:`FeishuContentError` so the operator can create the
+        folder manually (matching the Phase 25 v2.1 readme steps —
+        "📌 首页 / 📅 今日 / 📁 每日报告 / 📚 信息源").
         """
         if not self.drive.is_configured:
             raise FeishuContentError(
@@ -169,31 +178,50 @@ class DriveOrgService:
                 "(set FEISHU_DRIVE_ROOT_FOLDER_TOKEN)"
             )
         root = self.drive.folder_token
-        # — Each section gets its own sub-folder. ``ensure_folder_path``
-        # handles the "already exists" branch by name lookup.
-        home_token = await self.drive.ensure_folder_path(
-            parent_token=root, path=[SECTION_HOME]
-        )
-        today_token = await self.drive.ensure_folder_path(
-            parent_token=root, path=[SECTION_TODAY]
-        )
-        daily_token = await self.drive.ensure_folder_path(
-            parent_token=root, path=[SECTION_DAILY]
-        )
-        sources_token = await self.drive.ensure_folder_path(
-            parent_token=root, path=[SECTION_SOURCES]
-        )
+        # — Build a name → token map from the root folder's children.
+        children = await self.drive.list_children(folder_token=root)
+        by_name: dict[str, str] = {}
+        for child in children:
+            if not isinstance(child, dict):
+                continue
+            name = (child.get("name") or "").strip()
+            token = child.get("token") or ""
+            if name and token:
+                by_name[name] = token
+
+        missing: list[str] = []
+        section_map = {
+            SECTION_HOME: None,
+            SECTION_TODAY: None,
+            SECTION_DAILY: None,
+            SECTION_SOURCES: None,
+        }
+        for section_name in section_map:
+            token = by_name.get(section_name)
+            if not token:
+                missing.append(section_name)
+            else:
+                section_map[section_name] = token
+
+        if missing:
+            quoted = ", ".join(f"「{n}」" for n in missing)
+            raise FeishuContentError(
+                f"drive_org: root folder is missing required section(s): "
+                f"{quoted}. Create these sub-folders manually under the "
+                f"configured root folder, then retry."
+            )
+
         logger.info(
-            "drive_org_root_tree_ensured",
+            "drive_org_root_tree_resolved",
             root=root[:24],
             sections=4,
         )
         return RootTokens(
             root=root,
-            home=home_token,
-            today=today_token,
-            daily_reports=daily_token,
-            sources=sources_token,
+            home=section_map[SECTION_HOME] or "",
+            today=section_map[SECTION_TODAY] or "",
+            daily_reports=section_map[SECTION_DAILY] or "",
+            sources=section_map[SECTION_SOURCES] or "",
         )
 
     # ------------------------------------------------------------------

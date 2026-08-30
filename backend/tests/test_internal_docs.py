@@ -230,9 +230,19 @@ async def test_docs_tree_returns_4_sections(client: Any, settings: Any) -> None:
     # — the endpoint lazy-imports ``FeishuDriveClient`` from
     # ``app.services.feishu.content_client`` so we patch the source
     # module (the lookup site) rather than ``app.api.internal``.
+    fake = _FakeDrive(settings=settings)
+    root = settings.feishu_drive_root_folder_token
+    for idx, name in enumerate(
+        ("📌 首页", "📅 今日", "📁 每日报告", "📚 信息源"), start=1
+    ):
+        fake._folders[(root, name)] = f"fld_section_{idx}"
     with pytest.MonkeyPatch.context() as mp:
         from app.services.feishu import content_client as cc_module
 
+        # — Make ``FeishuDriveClient.create_default(...)`` return THIS
+        # pre-populated fake (not the module-level _FAKE singleton).
+        global _FAKE  # type: ignore[misc]
+        _FAKE = fake
         mp.setattr(cc_module, "FeishuDriveClient", _FakeDrive)
         resp = client.get("/api/internal/docs/tree", headers=_ADMIN_HEADERS)
     assert resp.status_code == 200, resp.text
@@ -458,6 +468,15 @@ def _patch_docs_endpoints(monkeypatch: pytest.MonkeyPatch, *, settings: Any) -> 
 
     global _FAKE
     _FAKE = _FakeDrive(settings=settings)
+    # — Phase 27: ensure_root_tree is now read-only, so tests need
+    # the 4 section folders pre-populated to mimic a manually-built
+    # tree. We poke the fake's internal storage directly so the
+    # helper stays synchronous.
+    root = settings.feishu_drive_root_folder_token
+    for idx, section_name in enumerate(
+        ("📌 首页", "📅 今日", "📁 每日报告", "📚 信息源"), start=1
+    ):
+        _FAKE._folders[(root, section_name)] = f"fld_section_{idx}"
     fake_bitable = _FakeBitableClient()
     fake_app = _FakeAppClient(settings=settings)
 

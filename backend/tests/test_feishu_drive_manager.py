@@ -142,12 +142,21 @@ class _FakeRedis:
 
 
 @pytest.fixture
-def fake_drive() -> FakeDrive:
+async def fake_drive() -> FakeDrive:
     from app.config import get_settings
 
     s = get_settings()
     s.feishu_drive_root_folder_token = "root_tok"
-    return FakeDrive(settings=s)
+    drive = FakeDrive(settings=s)
+    # — Phase 27: ensure_root_tree is now read-only, so tests need
+    # the 4 section folders pre-populated to mimic a manually-built
+    # tree. Production gets these via the operator's manual setup
+    # (per the Phase 25 v2.1 README).
+    await drive.create_folder(parent_token="root_tok", name=SECTION_HOME)
+    await drive.create_folder(parent_token="root_tok", name=SECTION_TODAY)
+    await drive.create_folder(parent_token="root_tok", name=SECTION_DAILY)
+    await drive.create_folder(parent_token="root_tok", name=SECTION_SOURCES)
+    return drive
 
 
 @pytest.fixture
