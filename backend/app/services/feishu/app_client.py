@@ -149,6 +149,8 @@ class FeishuAppClient:
         msg_type: str,
         content: dict[str, Any],
         receive_id_type: str = "chat_id",
+        session: Optional[Any] = None,
+        compliance_context: str = "feishu_outbound",
     ) -> dict[str, Any]:
         """POST /im/v1/messages to send one message.
 
@@ -158,6 +160,15 @@ class FeishuAppClient:
         (``ou_xxx``), a union id, or an email. ``receive_id_type``
         defaults to ``"chat_id"`` so existing callers keep working
         without changes.
+
+        Phase 24 — adds a pre-send compliance gate (``session`` is
+        optional; when provided the gate verdict also writes an
+        ``AuditLog`` row). HIGH/BLOCKED verdicts raise
+        ``ComplianceBlockedError`` *before* the HTTP request — nothing
+        is sent to Feishu. LOW/MEDIUM still go through (audit row
+        written when ``session`` is provided). Setting
+        ``compliance_pre_send_gate_enabled=False`` disables the gate
+        entirely (emergency bypass).
 
         Args:
           receive_id: the target identifier — ``oc_xxx`` for chat,
@@ -173,6 +184,13 @@ class FeishuAppClient:
             subscription renewal reminders because the
             ``Subscription.feishu_open_id`` row stores the user
             identifier (not a chat).
+          session: optional SQLAlchemy ``AsyncSession``. When provided,
+            the compliance verdict writes an ``AuditLog`` row tagged
+            ``action="compliance_block"``. Default ``None`` skips the
+            audit row but the gate verdict is still produced.
+          compliance_context: ``context`` label forwarded to the
+            audit row's ``metadata_json`` (e.g.
+            ``"activation_code_issue"``, ``"renewal_reminder"``).
 
         Returns:
           The Feishu response body (a dict with `code`, `msg`, `data`).
@@ -180,6 +198,8 @@ class FeishuAppClient:
         Raises:
           FeishuAppError: on HTTP failure, non-zero ``code``, or
             missing credentials / unsupported ``receive_id_type``.
+          ComplianceBlockedError: when the compliance gate verdict is
+            HIGH or BLOCKED (only when the pre-send gate is enabled).
         """
         if not receive_id:
             raise FeishuAppError("send_message: receive_id is empty")
@@ -190,6 +210,23 @@ class FeishuAppClient:
         if not self.is_configured:
             raise FeishuAppError(
                 "feishu app not configured (set FEISHU_APP_ID + FEISHU_APP_SECRET)"
+            )
+
+        # Phase 24 — pre-send compliance gate. Runs before any HTTP work
+        # so BLOCKED verdicts never reach Feishu. Import lazily to keep
+        # the import graph tidy.
+        if self.settings.compliance_pre_send_gate_enabled:
+            import json as _json
+
+            from app.services.compliance.gate import enforce_gate_outbound
+
+            await enforce_gate_outbound(
+                _json.dumps(content, ensure_ascii=False),
+                channel="feishu",
+                resource_type="feishu_message",
+                resource_id=receive_id,
+                session=session,
+                context=compliance_context,
             )
 
         import json

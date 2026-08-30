@@ -25,9 +25,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.config import get_settings
+from app.db import get_session as _get_session_dep
 from app.services.feishu.app_client import FeishuAppClient, FeishuAppError
 from app.services.feishu.content_client import (
     FeishuBitableClient,
@@ -118,7 +119,10 @@ def _build_content_clients(
     "/event",
     summary="Feishu event-subscription callback",
 )
-async def handle_feishu_event(request: Request) -> dict[str, Any]:
+async def handle_feishu_event(
+    request: Request,
+    session: Any = Depends(_get_session_dep),  # noqa: B008 — FastAPI dep
+) -> dict[str, Any]:
     """Handle one inbound Feishu event.
 
     Returns:
@@ -129,6 +133,12 @@ async def handle_feishu_event(request: Request) -> dict[str, Any]:
 
     Feishu retries on non-200 responses, so we accept-and-log rather
     than 4xx-ing on unknown event types.
+
+    Phase 24 — `session` dep is used to thread an `AsyncSession` into
+    the pre-send compliance gate so HIGH/BLOCKED bot replies also
+    write an AuditLog row. The dep uses the FastAPI-overridable
+    ``app.db.get_session`` so tests can swap in a SQLite engine
+    without touching the production Postgres URL.
     """
     settings = get_settings()
 
@@ -241,14 +251,34 @@ async def handle_feishu_event(request: Request) -> dict[str, Any]:
     # response body does NOT itself cause a message to be sent —
     # we have to call /im/v1/messages explicitly. Failures here
     # are logged but we still return 200 so Feishu doesn't retry.
+    # Phase 24 — wire a session into the pre-send compliance gate so
+    # the audit trail catches any HIGH/BLOCKED verdict. A blocked
+    # verdict is treated like any other send failure: log + ack 200.
     card_payload = _feishu_card(reply)
     try:
-        await app_client.send_message(
-            receive_id=event.chat_id,
-            receive_id_type="chat_id",
-            msg_type=card_payload["msg_type"],
-            content=card_payload["card"],
-        )
+        from app.services.compliance.gate import ComplianceBlockedError
+
+        try:
+            await app_client.send_message(
+                receive_id=event.chat_id,
+                receive_id_type="chat_id",
+                msg_type=card_payload["msg_type"],
+                content=card_payload["card"],
+                session=session,
+                compliance_context=f"feishu_reply:{command.kind}",
+            )
+            await session.commit()
+        except ComplianceBlockedError as blocked:
+            logger.warning(
+                "feishu_reply_compliance_blocked",
+                command=command.kind,
+                chat_id=event.chat_id,
+                verdict=str(blocked.verdict.risk_level.value),
+                reason=blocked.verdict.reason,
+            )
+            # Don't propagate — Feishu must still get a 200 so it
+            # doesn't retry. The AuditLog row already recorded the
+            # block; the user just doesn't get their reply.
     except FeishuAppError as exc:
         logger.error(
             "feishu_reply_send_failed",

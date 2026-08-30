@@ -27,6 +27,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.config import get_settings
+from app.db import get_session as _get_session_dep
 from app.main import create_app
 from app.services.feishu.inbound import (
     BotCommand,
@@ -454,9 +455,24 @@ def _clear_settings_cache():
 
 
 @pytest.fixture
-def feishu_client(monkeypatch):
-    """A FastAPI TestClient with internal-api + Feishu App API calls stubbed."""
+def feishu_client(monkeypatch, sqlite_engine):
+    """A FastAPI TestClient with internal-api + Feishu App API calls stubbed.
+
+    Phase 24 — also overrides the ``get_session`` dep with the SQLite
+    engine so the pre-send compliance gate (called inside the handler)
+    can persist AuditLog rows without reaching the production Postgres.
+    """
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
     app = create_app()
+
+    sessionmaker = async_sessionmaker(sqlite_engine, expire_on_commit=False)
+
+    async def _override_session():
+        async with sessionmaker() as session:
+            yield session
+
+    app.dependency_overrides[_get_session_dep] = _override_session
 
     sent_app_messages: list[dict[str, object]] = []
 
@@ -475,6 +491,8 @@ def feishu_client(monkeypatch):
             msg_type,
             content,
             receive_id_type="chat_id",
+            session=None,  # Phase 24 — pre-send gate
+            compliance_context="feishu_outbound",  # Phase 24
         ):
             sent_app_messages.append(
                 {

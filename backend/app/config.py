@@ -220,6 +220,19 @@ class Settings(BaseSettings):
     # daily cron from spamming the same user if the cron overlap.
     subscription_renewal_reminder_cooldown_hours: int = 24
 
+    # ---------- Phase 24 — Compliance Engine wiring -----------------------
+    # When true, every outbound delivery (Feishu IM, Telegram/Feishu
+    # digest, multi-channel content writes, source pre-fetch) consults
+    # `ComplianceService` before sending. HIGH/BLOCKED verdicts raise
+    # `ComplianceBlockedError`; LOW/MEDIUM still pass-through but leave
+    # an AuditLog row. Disable for emergency bypass.
+    compliance_pre_send_gate_enabled: bool = True
+    # When true, the per-source pre-fetch policy check (ComplianceLevel
+    # + last_block_reason) gates `SourceConnector.fetch`. Disable for
+    # legacy ingestion paths that haven't yet adopted the connector
+    # block-reason capture.
+    compliance_source_gate_enabled: bool = True
+
     # ---------- Validators ----------
     @field_validator(
         "cors_allow_origins",

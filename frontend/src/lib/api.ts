@@ -699,6 +699,43 @@ export async function fetchAuditLogs(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 24 — /api/admin/compliance viewer + override
+// ---------------------------------------------------------------------------
+import type {
+  ComplianceAuditFilters,
+  ComplianceAuditResponse,
+  ComplianceOverrideResponse,
+} from "@/types";
+
+export async function fetchComplianceAudits(
+  filters: ComplianceAuditFilters = {},
+): Promise<ComplianceAuditResponse> {
+  const search = new URLSearchParams();
+  for (const [k, v] of Object.entries(filters)) {
+    if (v === undefined || v === null || v === "") continue;
+    search.set(k, String(v));
+  }
+  const qs = search.toString();
+  return jsonFetchWithSecret<ComplianceAuditResponse>(
+    `/api/admin/compliance${qs ? `?${qs}` : ""}`,
+  );
+}
+
+export async function overrideComplianceAudit(
+  auditLogId: number,
+  reason: string,
+): Promise<ComplianceOverrideResponse> {
+  return jsonFetchWithSecret<ComplianceOverrideResponse>(
+    `/api/admin/compliance/${auditLogId}/override`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Phase 22 — admin Activation / Subscription / Source CRUD
 // ---------------------------------------------------------------------------
 import type {

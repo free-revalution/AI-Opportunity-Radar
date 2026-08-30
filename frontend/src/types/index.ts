@@ -694,6 +694,63 @@ export interface AuditLogFilters {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 24 — Compliance Engine operator surface
+// ---------------------------------------------------------------------------
+/** Risk-level values the backend emits in `metadata_json.risk_level`. */
+export const COMPLIANCE_RISK_LEVELS = ["low", "medium", "high", "blocked"] as const;
+export type ComplianceRiskLevel = (typeof COMPLIANCE_RISK_LEVELS)[number];
+
+/** Risk-type values the backend emits in `metadata_json.risk_types`. */
+export const COMPLIANCE_RISK_TYPES = [
+  "pii",
+  "prompt_injection",
+  "content_safety",
+  "copyright",
+  "source_policy",
+] as const;
+export type ComplianceRiskType = (typeof COMPLIANCE_RISK_TYPES)[number];
+
+/** One row from `GET /api/admin/compliance`. */
+export interface ComplianceAuditItem {
+  id: number;
+  actor_id: string | null;
+  resource_type: string | null;
+  resource_id: string | null;
+  risk_level: ComplianceRiskLevel | null;
+  risk_types: ComplianceRiskType[];
+  risk_score: number | null;
+  reason: string;
+  requires_human_review: boolean;
+  context: string;
+  overridden: boolean;
+  override_reason: string | null;
+  created_at: string | null;
+}
+
+export interface ComplianceAuditResponse {
+  items: ComplianceAuditItem[];
+  /** Total matching the filter (independent of limit/offset). */
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface ComplianceAuditFilters {
+  risk_level?: ComplianceRiskLevel | "";
+  risk_type?: ComplianceRiskType | "";
+  resource_type?: string;
+  since?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface ComplianceOverrideResponse {
+  ok: boolean;
+  original_audit_log_id: number;
+  override_audit_log_id: number;
+}
+
+// ---------------------------------------------------------------------------
 // Phase 22 — admin Activation / Subscription / Source CRUD types
 // ---------------------------------------------------------------------------
 export type ActivationStatusValue =

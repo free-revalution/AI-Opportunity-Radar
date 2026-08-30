@@ -79,6 +79,12 @@ class IngestionService:
 
         Connectors run sequentially — Phase 3 keeps it simple; Phase 4
         will wrap this in a worker queue.
+
+        Phase 24 — a pre-fetch compliance gate consults the Source row's
+        ``compliance_level`` (via ``ComplianceService.check_source``)
+        before any network call. Sources at level D/E or with a recent
+        ``source_block_reason`` are short-circuited with a recorded
+        block_reason — no HTTP request is made.
         """
         report = IngestionReport()
         slugs = self._resolve_slugs()
@@ -92,12 +98,35 @@ class IngestionService:
                 report.errors.append(f"{slug}: build failed: {exc}")
                 continue
 
+            # Phase 24 — pre-fetch gate. Look up the Source row (if
+            # any) and consult the compliance engine.
+            pre_fetch_block = await self._check_source_pre_fetch(slug)
+            if pre_fetch_block is not None:
+                report.sources_skipped += 1
+                report.per_source[slug] = {
+                    "items": 0,
+                    "inserted": 0,
+                    "block_reason": pre_fetch_block,
+                }
+                logger.info(
+                    "source_pre_fetch_blocked",
+                    source=slug,
+                    block_reason=pre_fetch_block,
+                )
+                continue
+
             try:
                 result = await connector.fetch()
             except Exception as exc:  # noqa: BLE001
                 report.sources_failed += 1
                 report.errors.append(f"{slug}: fetch crashed: {exc}")
                 continue
+
+            # Phase 24 — if the connector surfaced a block reason
+            # (HTTP 403/429, captcha, paywall, etc.) record it on the
+            # Source row + bump last_compliance_check.
+            if result.was_blocked:
+                await self._record_block_reason(slug, result)
 
             if result.was_skipped:
                 report.sources_skipped += 1
@@ -132,6 +161,92 @@ class IngestionService:
                 logger.exception("ingestion_persist_failed", source=slug)
 
         return report
+
+    # ------------------------- Phase 24 helpers -------------------------
+    async def _check_source_pre_fetch(self, slug: str) -> str | None:
+        """Run ``ComplianceService.check_source`` for `slug`.
+
+        Returns the block_reason string when the verdict is BLOCKED,
+        otherwise ``None``. Looks up the Source row by name (the slug
+        is the canonical key in `sources.name`).
+        """
+        try:
+            source_row = await self._get_source_row(slug)
+        except Exception:
+            # If we can't even look up the Source row we can't evaluate
+            # compliance posture. Fall open — the connector's own
+            # errors will surface via the existing path.
+            logger.warning(
+                "source_pre_fetch_lookup_failed", source=slug, exc_info=True
+            )
+            return None
+        if source_row is None:
+            return None  # no row yet — connector will upsert one
+
+        try:
+            from app.services.compliance import default_service
+            from app.services.compliance.source_policy import SourcePolicyRecord
+
+            record = SourcePolicyRecord(
+                source_id=source_row.id,
+                name=source_row.name,
+                compliance_level=source_row.compliance_level or "E",
+                commercial_use_status=source_row.commercial_use_status or "unknown",
+                access_method=source_row.access_method or "unknown",
+                rate_limit=source_row.rate_limit,
+                last_compliance_check=source_row.last_compliance_check,
+                retention_policy=source_row.retention_policy or "session",
+                robots_url=source_row.robots_url,
+                terms_url=source_row.terms_url,
+                enabled=source_row.enabled,
+                last_block_reason=source_row.source_block_reason,
+            )
+            verdict = default_service().check_source(record, context=f"fetch:{slug}")
+        except Exception:
+            logger.warning(
+                "source_pre_fetch_evaluation_failed",
+                source=slug,
+                exc_info=True,
+            )
+            return None
+
+        # Setting disables the gate entirely (operator kill switch).
+        if not getattr(self.settings, "compliance_source_gate_enabled", True):
+            return None
+
+        if not verdict.allowed:
+            return source_row.source_block_reason or "policy_block"
+        return None
+
+    async def _record_block_reason(
+        self, slug: str, result: SourceConnectorResult
+    ) -> None:
+        """Persist ``result.block_reason`` on the Source row.
+
+        Idempotent — safe to call on every connector run; only writes
+        when the row exists.
+        """
+        source_row = await self._get_source_row(slug)
+        if source_row is None:
+            return
+        from datetime import datetime, timezone
+
+        source_row.source_block_reason = result.block_reason
+        source_row.last_compliance_check = datetime.now(timezone.utc)
+        if result.http_status is not None:
+            source_row.last_error_at = datetime.now(timezone.utc)
+        await self.session.flush()
+
+    async def _get_source_row(self, slug: str) -> Any:
+        """Return the Source row whose ``name == slug`` (case-insensitive),
+        or ``None`` if no row has been upserted yet.
+        """
+        from sqlalchemy import select
+
+        from app.models import Source
+
+        stmt = select(Source).where(Source.name.ilike(slug))
+        return (await self.session.execute(stmt)).scalar_one_or_none()
 
     # ------------------------- helpers -------------------------
     def _resolve_slugs(self) -> list[str]:

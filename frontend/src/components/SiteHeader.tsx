@@ -94,6 +94,13 @@ export async function SiteHeader() {
             Messages
           </Link>
           <Link
+            href="/admin/compliance"
+            className="hover:text-accent"
+            data-testid="nav-admin-compliance"
+          >
+            Compliance
+          </Link>
+          <Link
             href="/admin/activation"
             className="hover:text-accent"
             data-testid="nav-admin-activation"

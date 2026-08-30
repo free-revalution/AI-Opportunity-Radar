@@ -66,6 +66,8 @@ class _MockFeishuAppClient:
         msg_type: str,
         content: dict[str, Any],
         receive_id_type: str = "chat_id",
+        session: Any | None = None,  # Phase 24 — pre-send gate
+        compliance_context: str = "feishu_outbound",  # Phase 24
     ) -> dict[str, Any]:
         if self.raise_error:
             from app.services.feishu.app_client import FeishuAppError

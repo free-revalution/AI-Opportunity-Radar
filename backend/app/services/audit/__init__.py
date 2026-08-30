@@ -186,6 +186,76 @@ class AuditService:
             metadata={"reason": reason, "risk_score": risk_score},
         )
 
+    # ----- Phase 24: Compliance Service on_decision hook ------------------
+    async def record_compliance_decision(
+        self,
+        session: Any,
+        verdict: Any,  # duck-typed ComplianceResult
+        *,
+        actor_id: str = "compliance_gate",
+        resource_type: str,
+        resource_id: str,
+        context: str | None = None,
+    ) -> "AuditEntry | None":
+        """Persist one compliance decision as an AuditLog row.
+
+        Maps the verdict's risk_level to ``AuditResult``:
+          LOW      → ``success``
+          MEDIUM   → ``partial``
+          HIGH     → ``failure``
+          BLOCKED  → ``blocked``
+
+        Skips LOW verdicts that flagged no risk_types — a clean pass-through
+        is not interesting to the audit trail. Everything else (any
+        non-empty risk_types OR MEDIUM+) writes one row.
+
+        Returns the persisted AuditEntry, or ``None`` if the verdict was a
+        clean pass-through (nothing to audit).
+        """
+        # Duck-typed — avoid importing app.services.compliance.models so
+        # this module stays free of cross-service imports.
+        level_value: str = verdict.risk_level.value
+        type_values: list[str] = [rt.value for rt in verdict.risk_types]
+        requires_review: bool = bool(verdict.requires_human_review)
+
+        # Clean pass-throughs skip the row to avoid noise.
+        if level_value == "low" and not type_values and not requires_review:
+            return None
+
+        level_to_result = {
+            "low": AuditResult.SUCCESS,
+            "medium": AuditResult.PARTIAL,
+            "high": AuditResult.FAILURE,
+            "blocked": AuditResult.BLOCKED,
+        }
+        result_value = level_to_result[level_value].value
+
+        metadata: dict[str, Any] = {
+            "risk_level": level_value,
+            "risk_types": type_values,
+            "risk_score": float(verdict.risk_score),
+            "reason": verdict.reason,
+            "requires_human_review": requires_review,
+        }
+        if context is not None:
+            metadata["context"] = context
+        # Detectors can stash JSON-safe scalars in metadata — surface them.
+        verdict_metadata = getattr(verdict, "metadata", None)
+        if isinstance(verdict_metadata, dict) and verdict_metadata:
+            metadata["detectors"] = verdict_metadata
+
+        return await self.record_db(
+            session,
+            actor_type=ActorType.SYSTEM.value,
+            action=AuditAction.COMPLIANCE_BLOCK.value,
+            actor_id=actor_id,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            result=result_value,
+            metadata=metadata,
+            commit=True,
+        )
+
     def recent(self, n: int = 50, *, action: str | None = None) -> list[AuditEntry]:
         """Return up to ``n`` most-recent entries (optionally filtered)."""
         out: list[AuditEntry] = []

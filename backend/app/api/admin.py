@@ -270,6 +270,8 @@ async def _send_activation_code_im(
                 receive_id_type="open_id",
                 msg_type=card["msg_type"],
                 content=card["card"],
+                session=session,
+                compliance_context="activation_code_issue",
             )
             data = response.get("data") or {}
             message_id = data.get("message_id")
@@ -349,6 +351,8 @@ async def _send_renewal_reminder_im(
                 receive_id_type="open_id",
                 msg_type=card["msg_type"],
                 content=card["card"],
+                session=session,
+                compliance_context="renewal_reminder",
             )
             data = response.get("data") or {}
             message_id = data.get("message_id")
@@ -659,6 +663,8 @@ async def resend_activation_code(
                 receive_id_type="open_id",
                 msg_type=card["msg_type"],
                 content=card["card"],
+                session=session,
+                compliance_context="activation_code_resend",
             )
             data = response.get("data") or {}
             message_id = data.get("message_id")
@@ -1038,6 +1044,183 @@ async def list_audit_logs_v2(
         "limit": limit,
         "offset": offset,
     }
+
+
+# ---------------------------------------------------------------------------
+# Compliance audit endpoint — Phase 24
+# ---------------------------------------------------------------------------
+_VALID_RISK_LEVELS = {"low", "medium", "high", "blocked"}
+
+
+@router.get(
+    "/compliance",
+    summary="List compliance_block audit rows (admin)",
+)
+async def list_compliance_audits(
+    risk_level: Optional[str] = Query(default=None, description="low|medium|high|blocked"),
+    risk_type: Optional[str] = Query(default=None, description="pii|prompt_injection|content_safety|copyright|source_policy"),
+    resource_type: Optional[str] = Query(default=None),
+    since: Optional[datetime] = Query(default=None, description="ISO-8601 lower bound"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    session: AsyncSession = Depends(get_session),
+    _actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    """Paginated list of ``AuditLog`` rows where ``action="compliance_block"``.
+
+    The frontend mirrors this shape in ``CompliancePanel.tsx``. The
+    ``risk_level`` / ``risk_type`` filters inspect the row's
+    ``metadata_json`` blob (compliance verdicts live there); the other
+    filters are exact-match on the row's typed columns.
+
+    Risk-level filter accepts a single value; risk_type accepts a
+    single value too — the chip group is OR-by-value but we're keeping
+    the API simple (combinatorial filters would explode the URL).
+    """
+    if risk_level and risk_level not in _VALID_RISK_LEVELS:
+        raise HTTPException(422, f"invalid risk_level: {risk_level!r}")
+
+    filters = [AuditLog.action == "compliance_block"]
+    if resource_type:
+        filters.append(AuditLog.resource_type == resource_type)
+    if since:
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        filters.append(AuditLog.created_at >= since)
+
+    count_stmt = select(func.count()).select_from(AuditLog)
+    items_stmt = (
+        select(AuditLog)
+        .order_by(AuditLog.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    for f in filters:
+        count_stmt = count_stmt.where(f)
+        items_stmt = items_stmt.where(f)
+
+    total = (await session.execute(count_stmt)).scalar_one()
+    rows = list((await session.execute(items_stmt)).scalars().all())
+
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        meta = r.metadata_json or {}
+        row_level = (meta.get("risk_level") or "").lower()
+        row_types = meta.get("risk_types") or []
+        # risk_level / risk_type live inside ``metadata_json`` (a JSON
+        # column) so we filter in Python after fetch. SQLite has no
+        # usable JSON index, so this is no worse than pushing the
+        # predicate down. When these filters are present we slice
+        # ``items`` for pagination — ``total`` then reflects the
+        # FILTERED count, not the raw SQL count.
+        if risk_level and row_level != risk_level:
+            continue
+        if risk_type and risk_type not in row_types:
+            continue
+        items.append(
+            {
+                "id": r.id,
+                "actor_id": r.actor_id,
+                "resource_type": r.resource_type,
+                "resource_id": r.resource_id,
+                "risk_level": row_level or None,
+                "risk_types": row_types,
+                "risk_score": meta.get("risk_score"),
+                "reason": meta.get("reason") or "",
+                "requires_human_review": bool(meta.get("requires_human_review")),
+                "context": meta.get("context") or r.actor_id,
+                "overridden": bool(meta.get("overridden")),
+                "override_reason": meta.get("override_reason"),
+                "created_at": _to_utc_iso(r.created_at),
+            }
+        )
+
+    # When the JSON-based filters narrowed the result, slice for
+    # pagination on top of the filtered list and update total.
+    if risk_level is not None or risk_type is not None:
+        total = len(items)
+        items = items[offset : offset + limit]
+
+    return {
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@router.post(
+    "/compliance/{audit_log_id}/override",
+    summary="Override a compliance_block decision (admin)",
+)
+async def override_compliance_decision(
+    audit_log_id: int,
+    payload: dict[str, Any] = ...,
+    session: AsyncSession = Depends(get_session),
+    actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    """Mark a ``compliance_block`` row as operator-overridden.
+
+    Writes a new ``AuditLog(action="compliance_override")`` row
+    carrying the override reason + the original audit log id, and
+    flips ``metadata_json.overridden=True`` + ``override_reason`` on
+    the source row so future listings can dim/hide it.
+    """
+    reason = (payload or {}).get("reason") or ""
+    reason = reason.strip()
+    if len(reason) < 10:
+        raise HTTPException(
+            422,
+            "override reason must be at least 10 characters (operator "
+            "audit trail)",
+        )
+
+    source_row = await session.get(AuditLog, audit_log_id)
+    if source_row is None:
+        raise HTTPException(404, f"audit log {audit_log_id} not found")
+    if source_row.action != "compliance_block":
+        raise HTTPException(
+            422,
+            f"audit log {audit_log_id} is action={source_row.action!r}; "
+            "override only applies to compliance_block rows",
+        )
+
+    source_meta = dict(source_row.metadata_json or {})
+    source_meta["overridden"] = True
+    source_meta["override_reason"] = reason
+    source_meta["overridden_by"] = actor
+    source_meta["overridden_at"] = _now_iso()
+    source_row.metadata_json = source_meta
+
+    override_entry = AuditLog(
+        actor_type="admin",
+        actor_id=actor,
+        action="compliance_override",
+        resource_type=source_row.resource_type,
+        resource_id=source_row.resource_id,
+        result="success",
+        metadata_json={
+            "reason": reason,
+            "original_audit_log_id": source_row.id,
+            "original_risk_level": (source_meta.get("risk_level") or "").lower(),
+            "original_risk_types": source_meta.get("risk_types") or [],
+        },
+    )
+    session.add(override_entry)
+    await session.commit()
+
+    return {
+        "ok": True,
+        "original_audit_log_id": source_row.id,
+        "override_audit_log_id": override_entry.id,
+    }
+
+
+def _now_iso() -> str:
+    """Return current UTC time as ISO-8601 string with explicit offset."""
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ---------------------------------------------------------------------------

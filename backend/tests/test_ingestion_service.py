@@ -37,12 +37,25 @@ async def test_ingestion_persists_all_items_in_mock_mode(sqlite_session):
 
 async def test_ingestion_is_idempotent(sqlite_session):
     """Running ingestion twice must NOT create duplicate RawItem rows."""
+    # Phase 24 — first ingestion creates the Source row with the default
+    # compliance_level="E" (block), which would trip the pre-fetch gate
+    # on the second run. Whitelist it explicitly so this test exercises
+    # only the dedup path, not the compliance path.
+    from sqlalchemy import select as _select
+
     service = IngestionService(
         sqlite_session,
         source_slugs=["github"],
         mock=True,
     )
     first = await service.run_once()
+    src = (
+        await sqlite_session.execute(
+            _select(Source).where(Source.name.ilike("github"))
+        )
+    ).scalar_one()
+    src.compliance_level = "A"
+    await sqlite_session.flush()
     second = await service.run_once()
 
     assert first.items_inserted > 0

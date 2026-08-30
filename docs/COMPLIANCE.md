@@ -190,3 +190,65 @@ Publisher.publish(piece)                              ← Phase 11
 ```
 
 合规检查贯穿整条管道,任何阶段失败都阻断发布。
+
+## 16. Admin Surface (Phase 24)
+
+合规不再只是引擎内部事件 — operator 必须能在 `/admin/compliance` 页面看到每一条阻断、做 override。三块新组件:
+
+* **`GET /api/admin/compliance`** — 列出所有 `AuditLog` 行 where `action="compliance_block"`,
+  支持 `risk_level / risk_type / resource_type / since` 过滤 + 分页。
+  `risk_level` 与 `risk_type` 字段存于 `metadata_json`,过滤在 Python 里做
+  (SQLite 无可用 JSON 索引;若打开 JSON 过滤,`total` 反映过滤后数量,
+  分页 slice 在过滤后的列表上)。
+* **`POST /api/admin/compliance/{audit_log_id}/override`** — 把 source row
+  的 `metadata_json.overridden = true` + 写一条新的 `AuditLog(action="compliance_override")`
+  关联回去。Override reason 强制 ≥ 10 字符(操作员审计追溯要求)。
+  非 `compliance_block` 行的 override 调用会被 422 拒绝。
+* **`/admin/compliance` 页面 + `<CompliancePanel/>`** — 镜像
+  `AuditLogsPanel` 的 URL-sync 模式:risk_level chip + risk_type chip + since 文本框 +
+  分页。每行可点 Override 弹出 modal,提交后立即重 fetch 列表,
+  行被标记为 `overridden` chip。
+
+页面上 risk_level chip 配色:
+* `low` → emerald / `medium` → amber / `high` → orange / `blocked` → red。
+`risk_type` chip 翻译成中文 (提示注入 / PII / 内容安全 / 版权 / 源策略)。
+
+## 17. Pre-Send Gate (Phase 24)
+
+任何用户可见的外发都过 `compliance/gate.py` 中的统一 helper:
+
+```
+FeishuAppClient.send_message(...)  ← pre-send gate (HIGH/BLOCKED 抛 ComplianceBlockedError)
+NotificationService._dispatch(...) ← pre-send gate (HIGH/BLOCKED 写 Notification 行,不 provider.send)
+ContentGeneratorService.run_for_opportunity(...) ← per-channel gate (BLOCKED 不写 Notification, op 不更新)
+IngestionService.run_once(...)     ← pre-fetch gate (D/E 级 source 不发 HTTP)
+```
+
+`gate_outbound` helper 调用 `ComplianceService.check_content` + 写一条
+`AuditLog(action="compliance_block")`。`enforce_gate_outbound` 是高阶版本,
+HIGH/BLOCKED 时抛 `ComplianceBlockedError` — 由 caller 自己决定是 ack 200
+(Feishu inbound bot reply,避免 Feishu 重试)还是 short-circuit(用户发送)。
+
+Setting `compliance_pre_send_gate_enabled` 默认 `True`,
+operator 可一键关掉(紧急 bypass);生产环境部署时建议先跑一次 dry-run 看 audit
+行数量,再开 `True`。
+
+## 18. Audit Hook (Phase 24)
+
+Phase 12E 留了 `ComplianceService.on_decision` 回调接口但从未填过。
+Phase 24A 接通 `AuditService.record_compliance_decision` — 任何 verdict
+都会触发,按 risk_level 映射到 `AuditLog.result`:
+
+| risk_level | AuditResult |
+|---|---|
+| LOW (no risk_types) | 跳过 (clean pass-through) |
+| LOW (with risk_types) | success |
+| MEDIUM | partial |
+| HIGH | failure |
+| BLOCKED | blocked |
+
+每条 audit 行的 `metadata_json` 携带 `risk_level / risk_types / risk_score / reason / requires_human_review / context`,
+这就是 24E admin surface 直接消费的数据源。
+
+operator 还可以反向写 — `compliance_override` 行用相同的 `metadata_json` 格式,
+方便审计追溯"原因为什么被放过"。

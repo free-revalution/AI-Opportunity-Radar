@@ -414,6 +414,67 @@ class NotificationService:
         text: str,
         payload: dict[str, Any],
     ) -> NotificationOutcome:
+        # Phase 24 — pre-send compliance gate. The provider.send() is
+        # skipped on HIGH/BLOCKED verdicts; LOW/MEDIUM pass through
+        # with an AuditLog row recorded. Operator can disable via
+        # `compliance_pre_send_gate_enabled=False`.
+        if self.settings.compliance_pre_send_gate_enabled:
+            from app.services.compliance.gate import (
+                ComplianceBlockedError,
+                gate_outbound,
+            )
+
+            outcome = await gate_outbound(
+                text or "",
+                channel=self.channel,
+                resource_type="notification",
+                resource_id=str(chat_id),
+                session=self.session,
+                context=str(payload.get("kind") or "notification_dispatch"),
+            )
+            risk_level = getattr(outcome.verdict, "risk_level", None)
+            level_value = getattr(risk_level, "value", None)
+            if level_value in {"high", "blocked"}:
+                # Persist a Notification row tagged with the failure so
+                # /admin/messages surfaces the block, then short-circuit.
+                blocked_notification = Notification(
+                    channel=self.channel,
+                    payload={
+                        **payload,
+                        "chat_id": chat_id,
+                        "text_chars": len(text or ""),
+                        "delivered_by": "compliance_gate",
+                        "compliance_blocked": True,
+                        "compliance_risk_level": level_value,
+                        "compliance_reason": outcome.verdict.reason,
+                    },
+                    delivered_at=None,
+                    error=f"compliance_blocked[{level_value}]: "
+                    f"{outcome.verdict.reason}"[:2000],
+                )
+                self.session.add(blocked_notification)
+                await self.session.commit()
+                logger.warning(
+                    "notification_compliance_blocked",
+                    chat_id=chat_id,
+                    channel=self.channel,
+                    risk_level=level_value,
+                    reason=outcome.verdict.reason,
+                    kind=payload.get("kind"),
+                )
+                return NotificationOutcome(
+                    notification_id=blocked_notification.id,
+                    channel=self.channel,
+                    chat_id=chat_id,
+                    delivered=False,
+                    text_chars=len(text or ""),
+                    provider="compliance_gate",
+                    message_id=None,
+                    error=f"compliance_blocked[{level_value}]: "
+                    f"{outcome.verdict.reason}",
+                    delivered_by="compliance_gate",
+                )
+
         result: BotSendResult = await self.provider.send(
             target=chat_id,
             message=BotMessage(text=text, parse_mode="MarkdownV2"),

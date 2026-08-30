@@ -43,13 +43,28 @@ from .models import (
 )
 from .service import ComplianceService, default_service
 
+# Phase 24 — pre-send gate glue (ComplianceBlockedError + gate_outbound).
+# Imported lazily here so the existing import surface stays backwards-
+# compatible; tests + Feishu/Telegram chokepoints import from the
+# `gate` submodule directly.
+from .gate import (  # noqa: E402  (re-export for convenience)
+    ComplianceBlockedError,
+    GateOutcome,
+    enforce_gate_outbound,
+    gate_outbound,
+)
+
 __all__ = [
+    "ComplianceBlockedError",
     "ComplianceLevel",
     "ComplianceResult",
     "ComplianceService",
+    "GateOutcome",
     "RiskLevel",
     "RiskType",
     "content_safe_to_publish",
     "default_service",
+    "enforce_gate_outbound",
+    "gate_outbound",
     "risk_level_for_score",
 ]

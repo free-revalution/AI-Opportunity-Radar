@@ -54,6 +54,18 @@ from app.utils import (
 logger = get_logger(__name__)
 
 
+def _stringify(body: Any) -> str:
+    """Render a `GeneratedContent.content` field for compliance scan.
+
+    GeneratedContent.content is either a Markdown string (most channels)
+    or a `dict[str, Any]` (the Xianyu listing shape). The compliance
+    detectors all want plain text, so we serialise dicts to JSON.
+    """
+    if isinstance(body, str):
+        return body
+    return json.dumps(body, ensure_ascii=False)
+
+
 # ---------------------------------------------------------------------------
 # Public DTOs
 # ---------------------------------------------------------------------------
@@ -212,6 +224,33 @@ class ContentGeneratorService:
                 )
                 continue
             produced.append(content)
+            # Phase 24 — gate the generated copy before persisting as a
+            # Notification. Blocked verdicts drop the content (no
+            # notification row, opportunity.content_status unchanged).
+            # The full verdict is captured in the AuditLog row the gate
+            # writes — the operator surface (Phase 24E) reads that row,
+            # not any field on the Opportunity itself.
+            from app.services.compliance.gate import gate_outbound
+
+            gate_text = f"{content.title}\n{_stringify(content.content)}"
+            gate_outcome = await gate_outbound(
+                gate_text,
+                channel=content.channel or "content_pipeline",
+                resource_type="content_opportunity",
+                resource_id=str(content.opportunity_id),
+                session=self.session,
+                context=f"content_generate:{content.generator}",
+            )
+            if not gate_outcome.verdict.allowed:
+                produced.pop()  # do not count this as delivered
+                logger.warning(
+                    "content_compliance_blocked",
+                    opportunity_id=opportunity.id,
+                    generator=content.generator,
+                    risk_level=gate_outcome.verdict.risk_level.value,
+                    reason=gate_outcome.verdict.reason,
+                )
+                continue
             await self._persist_notification(content)
 
         if produced:
