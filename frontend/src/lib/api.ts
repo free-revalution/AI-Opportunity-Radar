@@ -698,5 +698,151 @@ export async function fetchAuditLogs(
   );
 }
 
+// ---------------------------------------------------------------------------
+// Phase 22 — admin Activation / Subscription / Source CRUD
+// ---------------------------------------------------------------------------
+import type {
+  ActivationCode,
+  ActivationIssueRequest,
+  ActivationIssueResponse,
+  ActivationListResponse,
+  Source,
+  SourceComplianceUpdateRequest,
+  SourceListResponse,
+  Subscription,
+  SubscriptionExtendRequest,
+  SubscriptionListResponse,
+} from "@/types";
+
+export interface ActivationListParams {
+  status?: string;
+  plan?: string;
+  limit?: number;
+}
+
+/** Phase 22 — list activation codes (webhook-auth admin endpoint). */
+export async function fetchActivationCodes(
+  params: ActivationListParams = {},
+): Promise<ActivationListResponse> {
+  const search = new URLSearchParams();
+  if (params.status) search.set("status", params.status);
+  if (params.plan) search.set("plan", params.plan);
+  if (typeof params.limit === "number") search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return jsonFetchWithSecret<ActivationListResponse>(
+    `/api/admin/activation${qs ? `?${qs}` : ""}`,
+  );
+}
+
+/** Phase 22 — issue a new code. Returns plaintext + record. The plaintext
+ *  is only present in this response — never re-fetchable. */
+export async function issueActivationCode(
+  body: ActivationIssueRequest,
+): Promise<ActivationIssueResponse> {
+  return jsonFetchWithSecret<ActivationIssueResponse>(
+    "/api/admin/activation/issue",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+/** Phase 22 — revoke an existing code (idempotent-style; writes audit
+ *  row even on repeat). */
+export async function revokeActivationCode(
+  codeId: number,
+): Promise<ActivationCode> {
+  return jsonFetchWithSecret<ActivationCode>(
+    `/api/admin/activation/${codeId}/revoke`,
+    { method: "POST" },
+  );
+}
+
+export interface SubscriptionListParams {
+  status?: string;
+  plan?: string;
+  limit?: number;
+}
+
+/** Phase 22 — list subscriptions (admin). */
+export async function fetchSubscriptions(
+  params: SubscriptionListParams = {},
+): Promise<SubscriptionListResponse> {
+  const search = new URLSearchParams();
+  if (params.status) search.set("status", params.status);
+  if (params.plan) search.set("plan", params.plan);
+  if (typeof params.limit === "number") search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return jsonFetchWithSecret<SubscriptionListResponse>(
+    `/api/admin/subscriptions${qs ? `?${qs}` : ""}`,
+  );
+}
+
+/** Phase 22 — single subscription (admin). */
+export async function fetchSubscription(id: number): Promise<Subscription> {
+  return jsonFetchWithSecret<Subscription>(
+    `/api/admin/subscriptions/${id}`,
+  );
+}
+
+/** Phase 22 — push subscription expiry forward by `days` from the
+ *  later of (now, current expiry). Sets status="active". */
+export async function extendSubscription(
+  id: number,
+  body: SubscriptionExtendRequest,
+): Promise<Subscription> {
+  return jsonFetchWithSecret<Subscription>(
+    `/api/admin/subscriptions/${id}/extend`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+/** Phase 22 — cancel a subscription (sets status="cancelled"). */
+export async function cancelSubscription(id: number): Promise<Subscription> {
+  return jsonFetchWithSecret<Subscription>(
+    `/api/admin/subscriptions/${id}/cancel`,
+    { method: "POST" },
+  );
+}
+
+export interface SourceListParams {
+  compliance_level?: string;
+  limit?: number;
+}
+
+/** Phase 22 — list sources with current compliance posture. */
+export async function fetchSources(
+  params: SourceListParams = {},
+): Promise<SourceListResponse> {
+  const search = new URLSearchParams();
+  if (params.compliance_level) search.set("compliance_level", params.compliance_level);
+  if (typeof params.limit === "number") search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return jsonFetchWithSecret<SourceListResponse>(
+    `/api/admin/sources${qs ? `?${qs}` : ""}`,
+  );
+}
+
+/** Phase 22 — update one source's compliance level + retention policy. */
+export async function updateSourceCompliance(
+  id: number,
+  body: SourceComplianceUpdateRequest,
+): Promise<Source> {
+  return jsonFetchWithSecret<Source>(
+    `/api/admin/sources/${id}/compliance`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+}
+
 // Re-export the new types so consumers can import them from `@/lib/api`.
 export type { Signal, ContentOpportunity, DashboardResponse };

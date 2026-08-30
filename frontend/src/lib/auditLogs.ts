@@ -86,7 +86,28 @@ export function resourceLink(
       label: `#${resourceId}`,
     };
   }
-  // activation_code / subscription / source / etc. — no dedicated viewer page.
+  // Phase 22 — activation_code supports per-id filter on the list page.
+  if (resourceType === "activation_code") {
+    return {
+      href: `/admin/activation?id=${encodeURIComponent(resourceId)}`,
+      label: `activation#${resourceId}`,
+    };
+  }
+  // subscription / source — list pages exist; deep-link to the list so
+  // the operator can pivot from audit history to the entity list.
+  if (resourceType === "subscription") {
+    return {
+      href: "/admin/subscriptions",
+      label: `subscription#${resourceId}`,
+    };
+  }
+  if (resourceType === "source") {
+    return {
+      href: "/admin/sources",
+      label: `source#${resourceId}`,
+    };
+  }
+  // Anything else — keep the free-form label.
   return { href: null, label: `${resourceType}#${resourceId}` };
 }
 

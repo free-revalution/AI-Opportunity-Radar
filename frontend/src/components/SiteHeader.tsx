@@ -86,6 +86,27 @@ export async function SiteHeader() {
           >
             Audit Log
           </Link>
+          <Link
+            href="/admin/activation"
+            className="hover:text-accent"
+            data-testid="nav-admin-activation"
+          >
+            Activation
+          </Link>
+          <Link
+            href="/admin/subscriptions"
+            className="hover:text-accent"
+            data-testid="nav-admin-subscriptions"
+          >
+            Subscriptions
+          </Link>
+          <Link
+            href="/admin/sources"
+            className="hover:text-accent"
+            data-testid="nav-admin-sources"
+          >
+            Sources
+          </Link>
           <Link href="/settings" className="hover:text-accent">
             Settings
           </Link>

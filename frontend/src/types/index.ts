@@ -661,3 +661,94 @@ export interface AuditLogFilters {
   limit?: number;
   offset?: number;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 22 — admin Activation / Subscription / Source CRUD types
+// ---------------------------------------------------------------------------
+export type ActivationStatusValue =
+  | "unused"
+  | "active"
+  | "expired"
+  | "revoked";
+
+export interface ActivationCode {
+  id: number;
+  plan: string;
+  status: ActivationStatusValue;
+  expires_at: string | null;
+  bound_feishu_open_id: string | null;
+  bound_at: string | null;
+  created_at: string | null;
+  used_at: string | null;
+}
+
+export interface ActivationListResponse {
+  count: number;
+  items: ActivationCode[];
+}
+
+export interface ActivationIssueRequest {
+  plan: string;
+  ttl_days?: number;
+}
+
+export interface ActivationIssueResponse extends ActivationCode {
+  /** Plaintext code — returned ONCE by the backend. Caller must display
+   * it to the operator immediately; never re-fetchable. */
+  code: string;
+}
+
+export type SubscriptionStatusValue =
+  | "active"
+  | "expired"
+  | "suspended"
+  | "cancelled";
+
+export interface Subscription {
+  id: number;
+  user_id: number | null;
+  feishu_open_id: string | null;
+  plan: string;
+  status: SubscriptionStatusValue;
+  source_channel: string | null;
+  starts_at: string | null;
+  expires_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface SubscriptionListResponse {
+  count: number;
+  items: Subscription[];
+}
+
+export interface SubscriptionExtendRequest {
+  days: number;
+}
+
+export type ComplianceLevelValue = "A" | "B" | "C" | "D" | "E";
+
+export interface Source {
+  id: number;
+  name: string;
+  type: string;
+  url: string | null;
+  enabled: boolean;
+  compliance_level: ComplianceLevelValue;
+  commercial_use_status: string | null;
+  access_method: string | null;
+  retention_policy: string | null;
+  source_block_reason: string | null;
+  last_compliance_check: string | null;
+}
+
+export interface SourceListResponse {
+  count: number;
+  items: Source[];
+}
+
+export interface SourceComplianceUpdateRequest {
+  compliance_level: ComplianceLevelValue;
+  retention_policy?: string | null;
+  source_block_reason?: string | null;
+}

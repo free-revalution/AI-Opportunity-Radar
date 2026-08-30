@@ -134,12 +134,15 @@ describe("AuditLogsPanel", () => {
       "draft → approved",
     );
 
-    // Row 2: activation_code — no detail page, shows raw label.
+    // Row 2: activation_code — Phase 22 deep-links to /admin/activation?id=7.
     expect(screen.getByTestId("audit-row-2")).toBeInTheDocument();
     expect(screen.getByTestId("audit-actor-2")).toHaveTextContent("user");
     expect(screen.getByTestId("audit-result-2")).toHaveTextContent("blocked");
+    expect(screen.getByTestId("audit-target-2").getAttribute("href")).toBe(
+      "/admin/activation?id=7",
+    );
     expect(screen.getByTestId("audit-row-2")).toHaveTextContent(
-      "activation_code#7",
+      "activation#7",
     );
     expect(screen.getByTestId("audit-row-2")).toHaveTextContent("plan=pro");
   });
