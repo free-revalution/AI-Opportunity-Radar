@@ -500,3 +500,85 @@ export interface OnDemandDetailResponse {
   seed_topic?: string | null;
   report: ResearchReportData | null;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 18 — admin Content Center (mirrors backend `_serialize_content_opportunity`)
+// ---------------------------------------------------------------------------
+export type ContentOpportunityStatus =
+  | "draft"
+  | "approved"
+  | "published"
+  | "rejected"
+  | "archived";
+
+export interface ContentOpportunity {
+  id: number;
+  signal_id: number;
+  platform: string;
+  audience?: string | null;
+  niche?: string | null;
+  tone?: string | null;
+  content_angle?: string | null;
+  hook?: string | null;
+  title_candidates?: string[] | null;
+  material_ideas?: string[] | null;
+  script_outline?: string | null;
+  recommended_length?: number | null;
+  cta?: string | null;
+  risk_warning?: string | null;
+  content_score: number;
+  status: ContentOpportunityStatus;
+  // Compliance verdict projected from `metadata_json` by the backend.
+  compliance_blocked: boolean;
+  compliance_risk_score: number;
+  compliance_risk_types: string[];
+  metadata: Record<string, unknown>;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface ContentOpportunityListResponse {
+  items: ContentOpportunity[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface ContentOpportunityRejectRequest {
+  reason?: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 18 — admin Signal browser (mirrors backend `/api/signals`)
+// ---------------------------------------------------------------------------
+export type SignalLifecycleStatus =
+  | "discovered"
+  | "validating"
+  | "verified"
+  | "analyzing"
+  | "published"
+  | "expired"
+  | "rejected";
+
+export interface Signal {
+  id: number;
+  raw_item_id: number;
+  signal_type?: string | null;
+  keyword?: string | null;
+  category?: string | null;
+  title?: string | null;
+  summary?: string | null;
+  signal_score: number;
+  confidence_score: number;
+  status: SignalLifecycleStatus;
+  compliance_status?: string | null;
+  risk_score: number;
+  created_at: string | null;
+}
+
+export interface SignalListResponse {
+  items: Signal[];
+  total: number;
+  limit: number;
+  offset: number;
+}

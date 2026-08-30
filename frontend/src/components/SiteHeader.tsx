@@ -60,6 +60,25 @@ export async function SiteHeader() {
           <Link href="/on-demand" className="hover:text-accent">
             On-demand
           </Link>
+          <span
+            aria-hidden
+            className="mx-1 h-4 w-px bg-border"
+            title="admin"
+          />
+          <Link
+            href="/admin/content-opportunities"
+            className="hover:text-accent"
+            data-testid="nav-admin-content-opportunities"
+          >
+            Content Center (Admin)
+          </Link>
+          <Link
+            href="/admin/signals"
+            className="hover:text-accent"
+            data-testid="nav-admin-signals"
+          >
+            Signals (Admin)
+          </Link>
           <Link href="/settings" className="hover:text-accent">
             Settings
           </Link>

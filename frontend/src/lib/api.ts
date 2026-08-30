@@ -82,14 +82,26 @@ import type {
   ContentRegenerateResponse,
 } from "@/types";
 
-/** Header value for internal API auth. Browser-side we read it from
- * `NEXT_PUBLIC_RADAR_WEBHOOK_SECRET` (falling back to the literal the
- * dev `.env.example` ships). If unset, the request still goes through —
- * the backend short-circuits auth when no secret is configured. */
-const WEBHOOK_SECRET: string | undefined =
-  process.env.NEXT_PUBLIC_RADAR_WEBHOOK_SECRET ||
-  process.env.NEXT_PUBLIC_APP_SECRET_KEY ||
-  undefined;
+/** Header value for internal API auth. Read from sessionStorage (set by
+ * the admin login page) — falls back to the build-time env vars so the
+ * existing operator pages keep working. If neither source is set, the
+ * request still goes through — the backend short-circuits auth when no
+ * secret is configured. */
+function webhookSecret(): string | undefined {
+  if (typeof window !== "undefined") {
+    try {
+      const fromStorage = window.sessionStorage.getItem("radar.webhookSecret");
+      if (fromStorage && fromStorage.length > 0) return fromStorage;
+    } catch {
+      // sessionStorage may be unavailable (privacy mode) — fall through.
+    }
+  }
+  return (
+    process.env.NEXT_PUBLIC_RADAR_WEBHOOK_SECRET ||
+    process.env.NEXT_PUBLIC_APP_SECRET_KEY ||
+    undefined
+  );
+}
 
 async function jsonFetchWithSecret<T>(
   path: string,
@@ -100,8 +112,8 @@ async function jsonFetchWithSecret<T>(
     Accept: "application/json",
     ...(init?.headers as Record<string, string> | undefined),
   };
-  if (WEBHOOK_SECRET) {
-    headers["X-Radar-Webhook"] = WEBHOOK_SECRET;
+  if (webhookSecret()) {
+    headers["X-Radar-Webhook"] = webhookSecret() as string;
   }
   const res = await fetch(url, {
     ...init,
@@ -212,7 +224,8 @@ export async function exportContent(
     // CSV response is text/csv — bypass jsonFetchWithSecret and stream bytes.
     const url = `${API_BASE_URL}/api/internal/content/export`;
     const headers: Record<string, string> = { Accept: "text/csv" };
-    if (WEBHOOK_SECRET) headers["X-Radar-Webhook"] = WEBHOOK_SECRET;
+    const ws = webhookSecret();
+    if (ws) headers["X-Radar-Webhook"] = ws;
     const res = await fetch(url, {
       method: "POST",
       headers: { ...headers, "Content-Type": "application/json" },
@@ -542,3 +555,116 @@ export async function batchPublishNotifications(
     },
   );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 18 — admin Content Center (HTTP endpoints added by Phase 17)
+// ---------------------------------------------------------------------------
+import type {
+  ContentOpportunity,
+  ContentOpportunityListResponse,
+  ContentOpportunityRejectRequest,
+  Signal,
+  SignalListResponse,
+} from "@/types";
+
+export interface ContentOpportunityListParams {
+  status?: string;
+  compliance_blocked?: boolean;
+  signal_id?: number;
+  limit?: number;
+  offset?: number;
+}
+
+/** Phase 18 — list content opportunities (admin queue). */
+export async function fetchContentOpportunities(
+  params: ContentOpportunityListParams = {},
+): Promise<ContentOpportunityListResponse> {
+  const search = new URLSearchParams();
+  if (params.status) search.set("status", params.status);
+  if (typeof params.compliance_blocked === "boolean") {
+    search.set("compliance_blocked", String(params.compliance_blocked));
+  }
+  if (typeof params.signal_id === "number") {
+    search.set("signal_id", String(params.signal_id));
+  }
+  search.set("limit", String(params.limit ?? 20));
+  search.set("offset", String(params.offset ?? 0));
+  const qs = search.toString();
+  return jsonFetchWithSecret<ContentOpportunityListResponse>(
+    `/api/admin/content_opportunities${qs ? `?${qs}` : ""}`,
+  );
+}
+
+/** Phase 18 — single content opportunity detail. */
+export async function fetchContentOpportunity(
+  id: number,
+): Promise<ContentOpportunity> {
+  return jsonFetchWithSecret<ContentOpportunity>(
+    `/api/admin/content_opportunities/${id}`,
+  );
+}
+
+/** Phase 18 — state machine: draft → approved. */
+export async function approveContentOpportunity(
+  id: number,
+): Promise<ContentOpportunity> {
+  return jsonFetchWithSecret<ContentOpportunity>(
+    `/api/admin/content_opportunities/${id}/approve`,
+    { method: "POST" },
+  );
+}
+
+/** Phase 18 — state machine: any → rejected (with optional reason). */
+export async function rejectContentOpportunity(
+  id: number,
+  body: ContentOpportunityRejectRequest = {},
+): Promise<ContentOpportunity> {
+  return jsonFetchWithSecret<ContentOpportunity>(
+    `/api/admin/content_opportunities/${id}/reject`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+/** Phase 18 — state machine: approved → published. */
+export async function publishContentOpportunity(
+  id: number,
+): Promise<ContentOpportunity> {
+  return jsonFetchWithSecret<ContentOpportunity>(
+    `/api/admin/content_opportunities/${id}/publish`,
+    { method: "POST" },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 18 — admin Signal browser (`/api/signals`, X-Radar-Webhook auth)
+// ---------------------------------------------------------------------------
+export interface SignalListParams {
+  status?: string;
+  min_signal_score?: number;
+  limit?: number;
+  offset?: number;
+}
+
+/** Phase 18 — list recent signals with optional score floor. */
+export async function fetchSignals(
+  params: SignalListParams = {},
+): Promise<SignalListResponse> {
+  const search = new URLSearchParams();
+  if (params.status) search.set("status", params.status);
+  if (typeof params.min_signal_score === "number") {
+    search.set("min_signal_score", String(params.min_signal_score));
+  }
+  search.set("limit", String(params.limit ?? 50));
+  search.set("offset", String(params.offset ?? 0));
+  const qs = search.toString();
+  return jsonFetchWithSecret<SignalListResponse>(
+    `/api/signals${qs ? `?${qs}` : ""}`,
+  );
+}
+
+// Re-export the new types so consumers can import them from `@/lib/api`.
+export type { Signal, ContentOpportunity };
