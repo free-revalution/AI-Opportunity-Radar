@@ -87,7 +87,81 @@ def test_parse_command_mvp_commands(text: str, expected_kind: str):
 # ---------------------------------------------------------------------------
 # /run dispatcher
 # ---------------------------------------------------------------------------
-async def test_router_run_posts_to_pipeline_run_endpoint():
+async def test_router_run_submits_async_pipeline_task():
+    """Phase 25 v2.1 — `/run` now returns a `task_id` immediately.
+
+    The synchronous ``POST /api/internal/pipeline/run`` call is
+    delegated to ``task_runner`` which schedules an asyncio
+    background task. The router only returns a `task_id` to the
+    bot caller — the full pipeline result is posted back to the
+    originating chat once the task finishes.
+    """
+    from app.services.feishu import task_runner
+
+    seen: dict[str, str] = {}
+
+    async def _fake_submit(*, chat_id, sender_open_id, command_kind, **kwargs):
+        seen["chat_id"] = chat_id
+        seen["sender_open_id"] = sender_open_id
+        seen["command_kind"] = command_kind
+        # Return a fake running record — no HTTP work happens here.
+        return task_runner.TaskRecord(
+            task_id="test-task-id",
+            submitted_at=0.0,
+            chat_id=chat_id,
+            sender_open_id=sender_open_id,
+            command_kind=command_kind,
+            receive_id_type="chat_id",
+        )
+
+    from app.services.feishu import task_runner
+
+    real_submit = task_runner.submit_pipeline_run
+    # — Patch the symbol on the task_runner module so the inbound
+    # router's lazy ``from app.services.feishu.task_runner import
+    # submit_pipeline_run`` resolves to our stub.
+    task_runner.submit_pipeline_run = _fake_submit  # type: ignore[assignment]
+    try:
+        router = _make_router(lambda _request: httpx.Response(404))
+        # — /run needs chat_id for the async reply path.
+        router._chat_id = "oc_chat"
+        router._sender_open_id = "ou_user"
+        reply = await router.route(BotCommand(kind="run"))
+    finally:
+        task_runner.submit_pipeline_run = real_submit  # type: ignore[assignment]
+
+    assert reply.metadata.get("command") == "run"
+    assert reply.metadata.get("task_id") == "test-task-id"
+    assert "已提交" in reply.text
+    assert "task_id=test-task-id" in reply.text
+    assert seen["chat_id"] == "oc_chat"
+    assert seen["sender_open_id"] == "ou_user"
+
+
+async def test_router_run_falls_back_to_sync_when_task_runner_rejects():
+    """If task_runner can't submit (e.g. concurrency cap hit), the
+    router falls through to the legacy synchronous path so the user
+    still gets a useful reply.
+    """
+
+    from app.services.feishu import task_runner
+
+    async def _rejected(**_kwargs):
+        return task_runner.TaskRecord(
+            task_id="rej",
+            submitted_at=0.0,
+            chat_id="oc_chat",
+            sender_open_id="ou_user",
+            command_kind="run",
+            receive_id_type="chat_id",
+            status="failed",
+            finished_at=0.0,
+            error="too many concurrent runs",
+        )
+
+    real_submit = task_runner.submit_pipeline_run
+    task_runner.submit_pipeline_run = _rejected  # type: ignore[assignment]
+
     captured: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -109,21 +183,42 @@ async def test_router_run_posts_to_pipeline_run_endpoint():
             )
         return httpx.Response(404, json={"detail": "not found"})
 
-    router = _make_router(handler)
-    reply = await router.route(BotCommand(kind="run"))
+    try:
+        router = _make_router(handler)
+        router._chat_id = "oc_chat"
+        router._sender_open_id = "ou_user"
+        reply = await router.route(BotCommand(kind="run"))
+    finally:
+        task_runner.submit_pipeline_run = real_submit  # type: ignore[assignment]
 
     assert len(captured) == 1
     assert captured[0].method == "POST"
     assert captured[0].url.path == "/api/internal/pipeline/run"
     assert "run_id=7" in reply.text
     assert "采集:128" in reply.text
-    assert "新增:47" in reply.text
-    assert "信号:12" in reply.text
-    assert "日报已发送:是" in reply.text
-    assert reply.metadata.get("command") == "run"
 
 
-async def test_router_run_handles_error_response():
+async def test_router_run_sync_fallback_handles_error_response():
+    """The sync fallback path renders the error reply correctly."""
+
+    from app.services.feishu import task_runner
+
+    async def _rejected(**_kwargs):
+        return task_runner.TaskRecord(
+            task_id="rej",
+            submitted_at=0.0,
+            chat_id="oc_chat",
+            sender_open_id="ou_user",
+            command_kind="run",
+            receive_id_type="chat_id",
+            status="failed",
+            finished_at=0.0,
+            error="rejected",
+        )
+
+    real_submit = task_runner.submit_pipeline_run
+    task_runner.submit_pipeline_run = _rejected  # type: ignore[assignment]
+
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/internal/pipeline/run":
             return _ok_json(
@@ -140,8 +235,14 @@ async def test_router_run_handles_error_response():
             )
         return httpx.Response(404)
 
-    router = _make_router(handler)
-    reply = await router.route(BotCommand(kind="run"))
+    try:
+        router = _make_router(handler)
+        router._chat_id = "oc_chat"
+        router._sender_open_id = "ou_user"
+        reply = await router.route(BotCommand(kind="run"))
+    finally:
+        task_runner.submit_pipeline_run = real_submit  # type: ignore[assignment]
+
     assert "任务执行失败" in reply.text
     assert "LLM timeout" in reply.text
     assert reply.metadata.get("error") is True

@@ -794,12 +794,51 @@ class FeishuCommandRouter:
         return True
 
     async def _run(self) -> CommandReply:
-        """/run — kick off a full collection → AI → Feishu pipeline.
+        """/run — submit a full pipeline run asynchronously.
 
-        MVP keeps the pipeline synchronous so the reply is honest about
-        completion. If a real run takes too long for Feishu's 30s IM
-        timeout, the next iteration moves this to a background task.
+        Phase 25 v2.1 — moved from synchronous to async because the
+        full MVP pipeline (discovery → clustering → scoring →
+        screening → research → digest) regularly exceeds Feishu's
+        30 s per-event reply window. The handler now schedules a
+        background task via :mod:`app.services.feishu.task_runner`,
+        returns a `task_id` immediately, and the task posts the
+        result summary back to the originating chat when it
+        finishes (success or failure).
+
+        For legacy callers / tests that need a synchronous answer
+        (``/run` should still answer something on the IM thread`),
+        we keep the synchronous code path as a fallback that the
+        bot uses when ``task_runner.submit_pipeline_run`` raises.
         """
+        try:
+            from app.services.feishu.task_runner import submit_pipeline_run
+
+            record = await submit_pipeline_run(
+                chat_id=getattr(self, "_chat_id", "")
+                or "",
+                sender_open_id=getattr(self, "_sender_open_id", "") or "",
+                command_kind="run",
+            )
+        except Exception as exc:  # noqa: BLE001 — log + fall back to synchronous path
+            logger.warning(
+                "feishu_async_run_submit_failed",
+                error=str(exc),
+                exc_info=True,
+            )
+            record = None
+
+        if record is not None and record.status == "running":
+            return CommandReply(
+                text=(
+                    f"🚀 流水线已提交（task_id={record.task_id}）。\n"
+                    "完成后会自动回推到本对话，无需等待。"
+                ),
+                metadata={"command": "run", "task_id": record.task_id},
+            )
+
+        # — fallback: either task_runner was disabled OR the request
+        # was rejected (too many concurrent runs). Fall through to the
+        # synchronous path so the user still gets a useful reply.
         result = await self._post(
             "/api/internal/pipeline/run",
             {"source_slugs": None, "send_digest": True},

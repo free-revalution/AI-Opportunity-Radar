@@ -29,6 +29,12 @@ import time
 from typing import Any, Optional
 
 import httpx
+from tenacity import (
+    AsyncRetrying,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from app.config import Settings, get_settings
 from app.utils import get_logger
@@ -39,6 +45,16 @@ _BASE_URL = "https://open.feishu.cn/open-apis"
 _TOKEN_PATH = "/auth/v3/tenant_access_token/internal"
 _MESSAGE_PATH = "/im/v1/messages"
 _TOKEN_REFRESH_BUFFER_SEC = 300  # refresh 5 min before expiry
+
+# — Phase 25 v2.1 — retry policy for outbound IM sends.
+# Re-tries are bounded to 2 attempts after the original (3 total) so
+# Feishu's ~3s IM timeout still leaves the bot reply path free within
+# Feishu's per-event 30s reply window. Only transient errors retry —
+# business `code != 0` rejections (e.g. 230xxx permission errors) do
+# not — they would just bounce the same way.
+_IM_RETRY_ATTEMPTS = 3
+_IM_RETRY_INITIAL_WAIT = 1.0
+_IM_RETRY_MAX_WAIT = 3.0
 
 
 class FeishuAppError(RuntimeError):
@@ -231,39 +247,13 @@ class FeishuAppClient:
 
         import json
 
-        token = await self._get_token()
-        url = f"{self.base_url}{_MESSAGE_PATH}?receive_id_type={receive_id_type}"
-        body = {
-            "receive_id": receive_id,
-            "msg_type": msg_type,
-            "content": json.dumps(content, ensure_ascii=False),
-        }
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json; charset=utf-8",
-        }
-        try:
-            response = await self._http.post(url, json=body, headers=headers)
-        except httpx.HTTPError as exc:
-            raise FeishuAppError(f"im/v1/messages request failed: {exc}") from exc
-        if response.status_code != 200:
-            raise FeishuAppError(
-                f"im/v1/messages HTTP {response.status_code}: {response.text[:200]}"
-            )
-        data = response.json()
-        if data.get("code") != 0:
-            # — token might have just expired; force-refresh once and retry.
-            if data.get("code") in (99991663, 99991664):  # token expired/invalid
-                self._token = None
-                token = await self._get_token()
-                headers["Authorization"] = f"Bearer {token}"
-                response = await self._http.post(url, json=body, headers=headers)
-                data = response.json()
-            if data.get("code") != 0:
-                raise FeishuAppError(
-                    f"im/v1/messages rejected: code={data.get('code')} "
-                    f"msg={data.get('msg')}"
-                )
+        body = self._build_message_body(
+            receive_id=receive_id,
+            msg_type=msg_type,
+            content=content,
+            receive_id_type=receive_id_type,
+        )
+        data = await self._send_message_with_retry(body, receive_id_type)
         logger.info(
             "feishu_app_message_sent",
             receive_id_type=receive_id_type,
@@ -272,6 +262,155 @@ class FeishuAppClient:
             message_id=(data.get("data") or {}).get("message_id"),
         )
         return data
+
+    # ------------------------------------------------------------------
+    # Phase 25 v2.1 — retry helper + webhook fallback
+    # ------------------------------------------------------------------
+    def _build_message_body(
+        self,
+        *,
+        receive_id: str,
+        msg_type: str,
+        content: dict[str, Any],
+        receive_id_type: str,
+    ) -> dict[str, Any]:
+        """Construct the JSON body POSTed to /im/v1/messages."""
+        import json
+
+        return {
+            "receive_id": receive_id,
+            "msg_type": msg_type,
+            "content": json.dumps(content, ensure_ascii=False),
+        }
+
+    async def _send_message_with_retry(
+        self, body: dict[str, Any], receive_id_type: str
+    ) -> dict[str, Any]:
+        """POST `/im/v1/messages` with tenacity-driven retry.
+
+        Retries on:
+          * `httpx.HTTPError` (network / timeout / connection reset).
+          * HTTP 5xx response (server-side transient failure).
+
+        Does **not** retry on a Feishu `code != 0` rejection — those are
+        business-logic errors that would just bounce the same way. The
+        existing single-shot token-expired (99991663 / 99991664) refresh
+        path is preserved inside `_post_im_once`.
+
+        Bounded to ``_IM_RETRY_ATTEMPTS`` total tries (initial + 2
+        retries) so a stuck Feishu API never blocks Feishu's 30s
+        per-event reply window.
+        """
+        try:
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(_IM_RETRY_ATTEMPTS),
+                wait=wait_exponential(
+                    multiplier=_IM_RETRY_INITIAL_WAIT, max=_IM_RETRY_MAX_WAIT
+                ),
+                retry=retry_if_exception_type(httpx.HTTPError),
+                reraise=True,
+            ):
+                with attempt:
+                    return await self._post_im_once(body, receive_id_type)
+        except _RetryableIMHTTPError as exc:
+            # tenacity exhausted — translate the marker exception into
+            # the public :class:`FeishuAppError` so callers see one
+            # error type for all send failures.
+            raise FeishuAppError(
+                f"im/v1/messages retries exhausted (last status {exc.status_code})"
+            ) from exc
+        except httpx.HTTPError as exc:
+            # Network errors (timeouts, connection resets, DNS) reach
+            # here only after every retry has been spent. Wrap them
+            # into the public FeishuAppError surface.
+            raise FeishuAppError(
+                f"im/v1/messages retries exhausted (network: {exc})"
+            ) from exc
+        # Defensive raise — AsyncRetrying either returns or reraises.
+        raise FeishuAppError("im/v1/messages retries exhausted (no error captured)")
+
+    async def _post_im_once(
+        self, body: dict[str, Any], receive_id_type: str
+    ) -> dict[str, Any]:
+        """Single HTTP attempt — translates non-retryable errors into FeishuAppError.
+
+        Retryable signals (network errors and 5xx responses) are
+        surfaced as :class:`httpx.HTTPError` subclasses so tenacity
+        picks them up via ``retry_if_exception_type(httpx.HTTPError)``.
+        4xx and Feishu business `code != 0` become :class:`FeishuAppError`
+        and are *not* retried.
+        """
+        token = await self._get_token()
+        url = f"{self.base_url}{_MESSAGE_PATH}?receive_id_type={receive_id_type}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        try:
+            response = await self._http.post(url, json=body, headers=headers)
+        except httpx.HTTPError:
+            # Re-raise network errors unwrapped so tenacity retries
+            # them. The retry exhaustion path in
+            # ``_send_message_with_retry`` wraps into FeishuAppError.
+            raise
+        if response.status_code == 200:
+            return await self._parse_im_response(response, body, url, headers)
+        if 500 <= response.status_code < 600:
+            # Surface as a retryable signal — ``_RetryableIMHTTPError``
+            # subclasses httpx.HTTPError so the retry policy catches it.
+            raise _RetryableIMHTTPError(
+                f"im/v1/messages HTTP {response.status_code}",
+                status_code=response.status_code,
+            )
+        raise FeishuAppError(
+            f"im/v1/messages HTTP {response.status_code}: {response.text[:200]}"
+        )
+
+    async def _parse_im_response(
+        self,
+        response: httpx.Response,
+        body: dict[str, Any],
+        url: str,
+        headers: dict[str, str],
+    ) -> dict[str, Any]:
+        """Decode a 200 response, retry-once on token expiry."""
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise FeishuAppError(f"im/v1/messages non-JSON response: {exc}") from exc
+        if data.get("code") == 0:
+            return data
+        # — token might have just expired; force-refresh once and retry.
+        if data.get("code") in (99991663, 99991664):
+            self._token = None
+            token = await self._get_token()
+            headers["Authorization"] = f"Bearer {token}"
+            response = await self._http.post(url, json=body, headers=headers)
+            try:
+                data = response.json()
+            except ValueError as exc:
+                raise FeishuAppError(
+                    f"im/v1/messages non-JSON retry response: {exc}"
+                ) from exc
+        if data.get("code") != 0:
+            raise FeishuAppError(
+                f"im/v1/messages rejected: code={data.get('code')} "
+                f"msg={data.get('msg')}"
+            )
+        return data
+
+
+class _RetryableIMHTTPError(httpx.HTTPError):
+    """Marker exception — 5xx response we want tenacity to retry.
+
+    Subclasses :class:`httpx.HTTPError` so it satisfies the existing
+    ``retry_if_exception_type(httpx.HTTPError)`` predicate without
+    having to widen the retry policy.
+    """
+
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 __all__ = ["FeishuAppClient", "FeishuAppError"]

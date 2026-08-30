@@ -7,6 +7,7 @@ migrations generated from this metadata.
 
 from __future__ import annotations
 
+from datetime import date as Date  # Phase 25 v2.1 — daily_digest_docs PK
 from datetime import datetime
 from typing import Any, Optional
 
@@ -14,6 +15,7 @@ from sqlalchemy import (
     JSON,
     Boolean,
     DateTime,
+    Date as SqlaDate,
     Float,
     ForeignKey,
     Integer,
@@ -518,6 +520,38 @@ class Run(Base):
     new_count: Mapped[Optional[int]] = mapped_column(Integer)
     signal_count: Mapped[Optional[int]] = mapped_column(Integer)
     error: Mapped[Optional[str]] = mapped_column(Text)
+
+
+# ---------------------------------------------------------------------------
+# Phase 25 v2.1 — daily digest Docx index
+# ---------------------------------------------------------------------------
+class DailyDigestDoc(Base):
+    """Index row for the daily digest Docx written to 飞书云盘.
+
+    One row per calendar day (the ``date`` PK is the day the Docx
+    represents, not when the write happened — so a midnight-spanning
+    write still associates with the correct day). Used by:
+
+      * ``/api/internal/docs/daily?date=YYYY-MM-DD`` — read the
+        latest docx for a given day.
+      * The "📚 信息源" section of the drive org tree — to back-link
+        from a daily doc to its run id.
+    """
+
+    __tablename__ = "daily_digest_docs"
+
+    date: Mapped["Date"] = mapped_column(SqlaDate, primary_key=True)
+    doc_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    doc_url: Mapped[str] = mapped_column(String(512), nullable=False)
+    folder_token: Mapped[str] = mapped_column(String(64), nullable=False)
+    run_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("runs.id"), nullable=True, index=True
+    )
+    raw_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    signal_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
 
 
 # ---------------------------------------------------------------------------

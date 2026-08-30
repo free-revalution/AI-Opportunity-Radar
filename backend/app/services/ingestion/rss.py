@@ -17,13 +17,42 @@ from app.services.ingestion.base import SourceConnector, SourceConnectorResult
 from app.services.ingestion.raw_item import RawItem
 
 
-# Default feeds — AI official blogs + tech press.
-DEFAULT_FEEDS: tuple[tuple[str, str], ...] = (
-    ("OpenAI Blog", "https://openai.com/blog/rss.xml"),
-    ("Anthropic News", "https://www.anthropic.com/news/rss.xml"),
-    ("Google AI Blog", "https://blog.google/technology/ai/rss/"),
-    ("Hacker News Frontpage", "https://news.ycombinator.com/rss"),
-    ("Lobsters", "https://lobste.rs/rss"),
+# Default feeds — Phase 25 v2.1 expansion.
+#
+# Three tiers, in priority order:
+#   1. AI official blogs (OpenAI / Anthropic / Google) — the original
+#      MVP surface; kept verbatim for source-health continuity.
+#   2. Tech press (Hacker News / Lobsters) — dev community signal.
+#   3. Phase 25 v2.1 expansion — business / finance / e-commerce / hot
+#      topics. The user's brief was "any kind of hotspot, filter on
+#      the Feishu layer later", so we deliberately mix mainstream
+#      tech, Chinese financial press, e-commerce trade sites, and a
+#      few generalist international feeds.
+#
+# Each entry: (display_name, url, category). The category is a
+# free-form label propagated to ``RawItem.metadata["category"]`` so
+# downstream scoring / digest rendering can highlight (or filter)
+# by topic — Phase 25 v2.1 leaves the filtering on the Feishu side.
+DEFAULT_FEEDS: tuple[tuple[str, str, str], ...] = (
+    # --- original MVP surface ---
+    ("OpenAI Blog", "https://openai.com/blog/rss.xml", "tech/ai"),
+    ("Anthropic News", "https://www.anthropic.com/news/rss.xml", "tech/ai"),
+    ("Google AI Blog", "https://blog.google/technology/ai/rss/", "tech/ai"),
+    ("Hacker News Frontpage", "https://news.ycombinator.com/rss", "tech/community"),
+    ("Lobsters", "https://lobste.rs/rss", "tech/community"),
+    # --- Phase 25 v2.1 — Chinese financial / business press ---
+    ("财富中文网", "https://www.fortunechina.com/rss.xml", "finance/cn"),
+    ("华尔街见闻", "https://wallstreetcn.com/rss", "finance/cn"),
+    ("FT 中文网", "https://www.ftchinese.com/rss/feed", "finance/cn"),
+    # --- Phase 25 v2.1 — start-ups / e-commerce trade ---
+    ("36氪", "https://36kr.com/feed", "ecommerce/cn"),
+    ("虎嗅", "https://www.huxiu.com/rss/0.xml", "ecommerce/cn"),
+    ("亿邦动力", "https://www.ebrun.com/rss", "ecommerce/cn"),
+    ("投资界", "https://www.pedaily.cn/rss", "finance/cn"),
+    # --- Phase 25 v2.1 — international mainstream (operator proxy) ---
+    ("CNBC Top News", "https://www.cnbc.com/id/100003114/device/rss/rss.html", "finance/global"),
+    ("Reuters", "https://www.reutersagency.com/feed/?best-topics=top-news", "finance/global"),
+    ("The Verge", "https://www.theverge.com/rss/index.xml", "tech/global"),
 )
 
 
@@ -33,7 +62,7 @@ class RSSConnector(SourceConnector):
     def __init__(
         self,
         *,
-        feeds: tuple[tuple[str, str], ...] = DEFAULT_FEEDS,
+        feeds: tuple[tuple[str, str, str], ...] = DEFAULT_FEEDS,
         mock: bool = False,
         timeout: float = 15.0,
         client: httpx.AsyncClient | None = None,
@@ -57,14 +86,14 @@ class RSSConnector(SourceConnector):
 
         try:
             responses = await asyncio.gather(
-                *(client.get(url) for _, url in self.feeds),
+                *(client.get(url) for _, url, _ in self.feeds),
                 return_exceptions=True,
             )
         finally:
             if owns_client:
                 await client.aclose()
 
-        for (name, url), resp in zip(self.feeds, responses, strict=False):
+        for (name, url, category), resp in zip(self.feeds, responses, strict=False):
             if isinstance(resp, Exception):
                 errors.append(f"rss/{name}: {resp}")
                 continue
@@ -91,6 +120,7 @@ class RSSConnector(SourceConnector):
                         published_at=published_at,
                         metadata={
                             "feed": name,
+                            "category": category,
                             "tags": [t.get("term") for t in entry.get("tags", []) if t],
                         },
                     )
@@ -112,7 +142,11 @@ def _mock_rss() -> SourceConnectorResult:
                 author="openai",
                 content="Better caching, lower latency, $X/mo pricing.",
                 published_at=now,
-                metadata={"feed": "OpenAI Blog", "tags": ["api", "pricing"]},
+                metadata={
+                    "feed": "OpenAI Blog",
+                    "category": "tech/ai",
+                    "tags": ["api", "pricing"],
+                },
             ),
             RawItem(
                 source="rss",
@@ -122,7 +156,25 @@ def _mock_rss() -> SourceConnectorResult:
                 author="anthropic",
                 content="Long-context improvements, lower hallucination rate.",
                 published_at=now,
-                metadata={"feed": "Anthropic News", "tags": ["llm"]},
+                metadata={
+                    "feed": "Anthropic News",
+                    "category": "tech/ai",
+                    "tags": ["llm"],
+                },
+            ),
+            RawItem(
+                source="rss",
+                source_id="财富中文网:3",
+                url="https://www.fortunechina.com/example",
+                title="某科技公司 Q2 营收超预期",
+                author="fortunechina",
+                content="净利润同比增长 25%。",
+                published_at=now,
+                metadata={
+                    "feed": "财富中文网",
+                    "category": "finance/cn",
+                    "tags": ["财报"],
+                },
             ),
         ],
     )

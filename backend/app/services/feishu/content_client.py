@@ -196,9 +196,19 @@ class FeishuDriveClient(_TokenMixin):
         return (self.settings.feishu_drive_root_folder_token or "").strip()
 
     async def create_docx_from_markdown(
-        self, *, title: str, markdown: str
+        self,
+        *,
+        title: str,
+        markdown: str,
+        folder_token: Optional[str] = None,
     ) -> dict[str, Any]:
         """Submit a markdown import and poll until done.
+
+        ``folder_token`` overrides the configured root for this
+        call (Phase 25 v2.1 — :class:`DriveOrgService` uses it to
+        write per-date Docx into ``每日报告/YYYY-MM-DD/`` instead
+        of the root folder). When omitted, falls back to
+        :attr:`folder_token` (the configured root).
 
         Returns:
           `{"doc_id": "...", "url": "https://<tenant>.feishu.cn/docx/<id>"}`
@@ -217,10 +227,17 @@ class FeishuDriveClient(_TokenMixin):
         if not markdown.strip():
             raise FeishuContentError("create_docx_from_markdown: markdown is empty")
 
+        target_folder = (folder_token or self.folder_token or "").strip()
+        if not target_folder:
+            raise FeishuContentError(
+                "create_docx_from_markdown: no folder_token resolved "
+                "(set FEISHU_DRIVE_ROOT_FOLDER_TOKEN or pass folder_token)"
+            )
+
         encoded = base64.b64encode(markdown.encode("utf-8")).decode("ascii")
         body = {
             "file_name": title.strip()[:200],
-            "folder_token": self.folder_token,
+            "folder_token": target_folder,
             "type": "docx",
             "file": {"content": encoded, "mime_type": "text/markdown"},
         }
@@ -288,6 +305,142 @@ class FeishuDriveClient(_TokenMixin):
                 )
 
             await asyncio.sleep(self._poll_interval_sec)
+
+    # ------------------------------------------------------------------
+    # Phase 25 v2.1 — folder management (Drive Org surface)
+    # ------------------------------------------------------------------
+    async def create_folder(
+        self,
+        *,
+        name: str,
+        parent_token: Optional[str] = None,
+    ) -> str:
+        """Create a new folder under ``parent_token`` (or the root).
+
+        ``POST /open-apis/drive/v1/files?type=folder`` — body
+        ``{"folder_token": "<parent>", "name": "<name>"}``.
+
+        Returns the new folder's ``token``. The folder name is
+        idempotent at the API level (Feishu will create a duplicate
+        with a numeric suffix if the name already exists), so
+        production callers should use :meth:`ensure_folder_path` for
+        repeat-write safety.
+        """
+        if not name.strip():
+            raise FeishuContentError("create_folder: name is empty")
+        parent = (parent_token or self.folder_token or "").strip()
+        if not parent:
+            raise FeishuContentError(
+                "create_folder: parent_token missing "
+                "(set FEISHU_DRIVE_ROOT_FOLDER_TOKEN or pass parent_token)"
+            )
+        body = {"folder_token": parent, "name": name.strip()[:200]}
+        response = await self._request(
+            method="POST",
+            path="/drive/v1/files?type=folder",
+            json_body=body,
+        )
+        if response.get("code") != 0:
+            raise FeishuContentError(
+                f"drive/v1/files create_folder failed: "
+                f"code={response.get('code')} msg={response.get('msg')}"
+            )
+        token = (response.get("data") or {}).get("token") or ""
+        if not token:
+            raise FeishuContentError(
+                f"drive/v1/files create_folder returned no token: {response!r}"
+            )
+        logger.info(
+            "feishu_drive_folder_created",
+            name=name[:80],
+            parent=parent[:24],
+            token=token[:24],
+        )
+        return token
+
+    async def list_children(
+        self,
+        *,
+        folder_token: str,
+    ) -> list[dict[str, Any]]:
+        """List direct children of ``folder_token``.
+
+        ``GET /open-apis/drive/v1/files?folder_token=<token>``.
+        Returns the raw ``data.files`` list (each entry has
+        ``name``, ``token``, ``type``). Empty list on a 404 (treated
+        as "no children" — common when a folder was just deleted).
+        """
+        if not folder_token:
+            raise FeishuContentError("list_children: folder_token missing")
+        response = await self._request(
+            method="GET",
+            path=f"/drive/v1/files?folder_token={folder_token}",
+        )
+        if response.get("code") != 0:
+            raise FeishuContentError(
+                f"drive/v1/files list failed: "
+                f"code={response.get('code')} msg={response.get('msg')}"
+            )
+        return list((response.get("data") or {}).get("files") or [])
+
+    async def find_child_by_name(
+        self,
+        *,
+        folder_token: str,
+        name: str,
+    ) -> Optional[str]:
+        """Return the token of the first direct child whose name matches.
+
+        Used by :meth:`ensure_folder_path` for idempotent
+        nested-folder creation. Returns ``None`` when no match.
+        """
+        target = name.strip()
+        for child in await self.list_children(folder_token=folder_token):
+            if (child.get("name") or "").strip() == target:
+                tok = (child.get("token") or "").strip()
+                if tok:
+                    return tok
+        return None
+
+    async def ensure_folder_path(
+        self,
+        *,
+        parent_token: Optional[str],
+        path: list[str],
+    ) -> str:
+        """Ensure each segment of ``path`` exists under ``parent_token``.
+
+        Walks the path segment-by-segment — for each name, either
+        reuses an existing folder with that name or creates a new
+        one. Returns the token of the **last** segment. Idempotent:
+        running twice with the same path produces the same final
+        token and creates no extra folders.
+
+        Empty segments are skipped (so callers can build the path
+        conditionally without writing ``if x: path.append(x)``
+        everywhere).
+        """
+        if not path:
+            raise FeishuContentError("ensure_folder_path: path is empty")
+        root = (parent_token or self.folder_token or "").strip()
+        if not root:
+            raise FeishuContentError(
+                "ensure_folder_path: parent_token missing "
+                "(set FEISHU_DRIVE_ROOT_FOLDER_TOKEN or pass parent_token)"
+            )
+        current = root
+        for segment in path:
+            name = (segment or "").strip()
+            if not name:
+                continue
+            existing = await self.find_child_by_name(
+                folder_token=current, name=name
+            )
+            if existing:
+                current = existing
+                continue
+            current = await self.create_folder(parent_token=current, name=name)
+        return current
 
 
 # ---------------------------------------------------------------------------

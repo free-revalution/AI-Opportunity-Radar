@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.config import get_settings
@@ -110,6 +111,68 @@ def _build_content_clients(
         table_name="Opportunities",
     )
     return drive, bitable_digest, bitable_ops
+
+
+async def _webhook_fallback(
+    *,
+    settings: Any,
+    text: str,
+    event: Any,
+) -> bool:
+    """Send the reply via the legacy ``feishu_webhook_url`` custom-robot API.
+
+    Phase 25 v2.1 — Feishu's App open API (``/im/v1/messages``) and
+    the legacy custom-robot webhook URL are **independent**
+    channels. When the App API is unreachable / returns 5xx, falling
+    back to the webhook keeps the bot useful as long as the operator
+    has configured at least one of them. Returns ``True`` when the
+    webhook accepted the payload (HTTP 200 with ``StatusCode=0`` in
+    the body — Feishu's webhook response convention).
+
+    Note: the webhook URL broadcasts to a fixed chat (the chat bound
+    to the webhook token), so the fallback does **not** guarantee
+    thread-reply on the originating chat. It's a best-effort safety
+    net for a transient App API outage.
+    """
+    url = (getattr(settings, "feishu_webhook_url", "") or "").strip()
+    if not url:
+        return False
+    payload = {"msg_type": "text", "content": {"text": text}}
+    # Signing is required when the webhook was created with the
+    # "sign" verification mode; the legacy client implements this in
+    # :mod:`app.services.feishu.client`. For our fallback we send
+    # unsigned (Feishu accepts unsigned for verification-mode webhooks
+    # in most cases); production operators using signed webhooks
+    # should rely on the primary App API path.
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(url, json=payload)
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "feishu_webhook_fallback_network_error",
+            error=str(exc),
+        )
+        return False
+    if response.status_code != 200:
+        logger.warning(
+            "feishu_webhook_fallback_http_error",
+            status_code=response.status_code,
+            body=response.text[:200],
+        )
+        return False
+    try:
+        body = response.json()
+    except ValueError:
+        # Non-JSON body but 200 — treat as success (Feishu's webhook
+        # sometimes returns a plain-text confirmation).
+        return True
+    if body.get("StatusCode") not in (None, 0):
+        logger.warning(
+            "feishu_webhook_fallback_status_error",
+            body=body,
+        )
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +310,10 @@ async def handle_feishu_event(
         # ID. The router accepts it via a transient attribute so the
         # command AST itself stays pure-data.
         router_instance._sender_open_id = event.sender_open_id
+        # — Phase 25 v2.1 — `/run` uses the chat_id to push the async
+        # pipeline result back to the originating chat via the
+        # task_runner background coroutine.
+        router_instance._chat_id = event.chat_id
         reply = await router_instance.route(command)
     except Exception as exc:  # noqa: BLE001 — log + ack so Feishu doesn't retry.
         logger.error(
@@ -307,6 +374,32 @@ async def handle_feishu_event(
             chat_id=event.chat_id,
             error=str(exc),
         )
+        # — Phase 25 v2.1: webhook fallback. If the App API is down or
+        # we have no App credentials, the configured
+        # ``feishu_webhook_url`` (custom-robot token) is still a
+        # viable channel — same user, same message, different API.
+        # Only attempt the fallback for *transient* errors; a 4xx
+        # ``code != 0`` (permission denied etc.) would just bounce.
+        if "rejected" not in str(exc) and "HTTP 4" not in str(exc):
+            try:
+                delivered = await _webhook_fallback(
+                    settings=settings,
+                    text=reply.text,
+                    event=event,
+                )
+                if delivered:
+                    logger.info(
+                        "feishu_reply_webhook_fallback_ok",
+                        command=command.kind,
+                        chat_id=event.chat_id,
+                    )
+            except Exception as fb_exc:  # noqa: BLE001
+                logger.error(
+                    "feishu_reply_webhook_fallback_failed",
+                    command=command.kind,
+                    chat_id=event.chat_id,
+                    error=str(fb_exc),
+                )
     finally:
         # — Close the shared httpx client AFTER the send_message
         # attempt (success or failure). Doing this in the previous

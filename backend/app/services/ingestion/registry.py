@@ -11,13 +11,20 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.config import Settings
+from app.services.ingestion.amazon_best import AmazonBestSellersConnector
+from app.services.ingestion.arxiv import ArxivConnector
 from app.services.ingestion.base import SourceConnector
+from app.services.ingestion.douyin import DouyinConnector
 from app.services.ingestion.github import GitHubTrendingConnector
 from app.services.ingestion.hackernews import HackerNewsConnector
+from app.services.ingestion.huggingface import HuggingFaceConnector
 from app.services.ingestion.producthunt import ProductHuntConnector
 from app.services.ingestion.reddit import RedditConnector
 from app.services.ingestion.rss import RSSConnector
+from app.services.ingestion.wallstreetcn_hot import WallStreetCNHotConnector
+from app.services.ingestion.weibo import WeiboConnector
 from app.services.ingestion.youtube import YouTubeConnector
+from app.services.ingestion.zhihu import ZhihuConnector
 
 
 @dataclass(slots=True)
@@ -72,6 +79,56 @@ REGISTRY: dict[str, SourceSpec] = {
         description="AI tool / indie hacker channels.",
         default_interval_minutes=240,
     ),
+    # --- Phase 25 v2.1 expansion ---
+    "arxiv": SourceSpec(
+        slug="arxiv",
+        name="arXiv",
+        type="api",
+        description="New papers in cs.AI / cs.CL categories.",
+        default_interval_minutes=120,
+    ),
+    "huggingface": SourceSpec(
+        slug="huggingface",
+        name="Hugging Face",
+        type="api",
+        description="Top-downloaded model leaderboard — community signal.",
+        default_interval_minutes=120,
+    ),
+    "douyin": SourceSpec(
+        slug="douyin",
+        name="抖音热点",
+        type="api",
+        description="抖音热点榜（短视频热度信号）.",
+        default_interval_minutes=30,
+    ),
+    "weibo": SourceSpec(
+        slug="weibo",
+        name="微博热搜",
+        type="api",
+        description="微博热搜榜（需代理访问）.",
+        default_interval_minutes=30,
+    ),
+    "zhihu": SourceSpec(
+        slug="zhihu",
+        name="知乎热榜",
+        type="api",
+        description="知乎热榜（需代理访问）.",
+        default_interval_minutes=30,
+    ),
+    "amazon_best": SourceSpec(
+        slug="amazon_best",
+        name="Amazon Best Sellers",
+        type="rss",
+        description="Amazon 各分类 Best Sellers 榜单.",
+        default_interval_minutes=240,
+    ),
+    "wallstreetcn_hot": SourceSpec(
+        slug="wallstreetcn_hot",
+        name="华尔街见闻热门",
+        type="api",
+        description="华尔街见闻热门文章列表.",
+        default_interval_minutes=60,
+    ),
 }
 
 
@@ -103,6 +160,21 @@ def build_connector(slug: str, settings: Settings, *, mock: bool | None = None) 
             api_key=None,  # real key in Phase 3.1
             mock=force_mock,
         )
+    # --- Phase 25 v2.1 expansion ---
+    if slug == "arxiv":
+        return ArxivConnector(mock=force_mock)
+    if slug == "huggingface":
+        return HuggingFaceConnector(mock=force_mock)
+    if slug == "douyin":
+        return DouyinConnector(mock=force_mock)
+    if slug == "weibo":
+        return WeiboConnector(mock=force_mock)
+    if slug == "zhihu":
+        return ZhihuConnector(mock=force_mock)
+    if slug == "amazon_best":
+        return AmazonBestSellersConnector(mock=force_mock)
+    if slug == "wallstreetcn_hot":
+        return WallStreetCNHotConnector(mock=force_mock)
     raise KeyError(slug)
 
 

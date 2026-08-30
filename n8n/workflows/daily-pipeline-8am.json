@@ -1,0 +1,61 @@
+{
+  "name": "daily-pipeline-8am",
+  "active": true,
+  "description": "Phase 25 v2.1 — daily 08:00 Asia/Shanghai cron. Triggers the full pipeline + digest + 每日报告 Docx write. Heavy steps (deep research) only run here.",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 0 * * *"
+            }
+          ]
+        }
+      },
+      "id": "cron-trigger",
+      "name": "Cron (daily 00:00 UTC = 08:00 CST)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.API_BASE_URL_INTERNAL}}/api/internal/pipeline/run",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-Radar-Webhook", "value": "={{$env.RADAR_WEBHOOK_SECRET}}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"send_digest\": true, \"write_docx\": true}",
+        "options": {
+          "timeout": 1800000,
+          "retry": { "maxTries": 1, "waitBetweenTries": 15000 }
+        }
+      },
+      "id": "step-full-pipeline",
+      "name": "Full pipeline + digest + Docx",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [520, 300]
+    }
+  ],
+  "connections": {
+    "Cron (daily 00:00 UTC = 08:00 CST)": {
+      "main": [[{ "node": "Full pipeline + digest + Docx", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all",
+    "timezone": "Asia/Shanghai",
+    "errorWorkflow": ""
+  }
+}

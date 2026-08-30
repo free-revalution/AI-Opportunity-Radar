@@ -239,6 +239,7 @@ class _PipelineRunRequest(BaseModel):
 
     source_slugs: Optional[list[str]] = None
     send_digest: bool = False
+    write_docx: bool = False  # — Phase 25 v2.1: also write 每日报告 Docx
 
 
 @router.post(
@@ -287,14 +288,58 @@ async def run_pipeline(
             "research", research.run_once
         )
 
-        # 6. digest
+        # 6. digest (+ optional Docx write — Phase 25 v2.1)
         digest_sent = False
+        docx_ref: Optional[dict[str, Any]] = None
         if body.send_digest:
             from app.config import get_settings
 
             service = NotificationService(session, settings=get_settings())
             outcome = await service.send_digest()
             digest_sent = bool(outcome.get("delivered"))
+
+        # 7. docx — Phase 25 v2.1: write 每日报告 Docx (Feishu 4 段结构)
+        if body.write_docx:
+            from datetime import date as DateType
+
+            from app.config import get_settings
+            from app.services.feishu.content_client import FeishuDriveClient
+            from app.services.feishu.drive_org import DriveOrgService
+
+            settings = get_settings()
+            if settings.feishu_drive_root_folder_token:
+                drive = FeishuDriveClient(settings=settings)
+                docx_service = DriveOrgService(
+                    drive=drive, settings=settings, session=session
+                )
+                try:
+                    ref = await docx_service.write_daily_digest(
+                        day=DateType.today(),
+                        markdown=outcome.get("preview", "")
+                        if isinstance(outcome, dict)
+                        else "",
+                        run_id=run.id,
+                        raw_count=raw_count,
+                        signal_count=signal_count,
+                    )
+                    await session.commit()
+                    docx_ref = {
+                        "date": str(ref.date),
+                        "doc_id": ref.doc_id,
+                        "doc_url": ref.doc_url,
+                        "folder_token": ref.folder_token,
+                    }
+                except Exception as exc:  # noqa: BLE001 — record and continue
+                    logger.warning(
+                        "internal_pipeline_docx_write_failed",
+                        run_id=run.id,
+                        error=str(exc),
+                    )
+                    docx_ref = {"error": str(exc)[:200]}
+            else:
+                docx_ref = {
+                    "error": "FEISHU_DRIVE_ROOT_FOLDER_TOKEN not configured"
+                }
 
         # Extract per-stage counts from each report's ``as_dict()``
         # (different services use different field names).
@@ -336,6 +381,7 @@ async def run_pipeline(
             "new_count": new_count,
             "signal_count": signal_count,
             "digest_sent": digest_sent,
+            "docx": docx_ref,
             "error": None,
         }
     except Exception as exc:  # noqa: BLE001 — record and re-raise
@@ -357,11 +403,13 @@ async def get_status(
 
     sources = await _source_health_snapshot(session)
     total_signals = await _signal_total(session)
+    dedup = await _dedup_today_stats(session)
 
     return {
         "last_run": _serialize_run(latest) if latest else None,
         "sources": sources,
         "total_signals": total_signals,
+        "dedup_today": dedup,
         "now": datetime.now(tz=timezone.utc).isoformat(),
     }
 
@@ -376,6 +424,94 @@ async def get_sources_healthy(
 ) -> dict[str, Any]:
     snap = await _source_health_snapshot(session)
     return snap
+
+
+# ===========================================================================
+# Phase 25 v2.1 — 飞书云文档 4 段结构 endpoints
+# ===========================================================================
+@router.get(
+    "/docs/tree",
+    summary="Ensure + return the 4-section Feishu Drive tree",
+)
+async def get_docs_tree(
+    session: AsyncSession = Depends(get_session),
+    _actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    """Ensure the 4 段结构 (首页/今日/每日报告/信息源) exists and return its tokens.
+
+    Idempotent — calling repeatedly does not duplicate folders.
+    """
+    from app.config import get_settings
+    from app.services.feishu.content_client import FeishuDriveClient
+    from app.services.feishu.drive_org import DriveOrgService
+
+    settings = get_settings()
+    if not settings.feishu_drive_root_folder_token:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="FEISHU_DRIVE_ROOT_FOLDER_TOKEN not configured",
+        )
+    drive = FeishuDriveClient(settings=settings)
+    service = DriveOrgService(drive=drive, settings=settings, session=session)
+    try:
+        tokens = await service.ensure_root_tree()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("docs_tree_ensure_failed", error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"feishu drive: {exc}",
+        ) from exc
+    return {
+        "configured": True,
+        "sections": ["home", "today", "daily_reports", "sources"],
+        "tokens": tokens.as_dict(),
+    }
+
+
+@router.get(
+    "/docs/daily",
+    summary="Resolve a calendar day to its 每日报告 Docx (URL + token)",
+)
+async def get_daily_doc(
+    date: str,
+    session: AsyncSession = Depends(get_session),
+    _actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    """GET /api/internal/docs/daily?date=YYYY-MM-DD
+
+    Returns ``{"found": True, "doc_id": ..., "doc_url": ...}`` when
+    a Docx was written for the date; otherwise ``{"found": False}``.
+    """
+    from datetime import date as DateType, datetime
+
+    from app.models import DailyDigestDoc
+
+    try:
+        day = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"invalid date (expected YYYY-MM-DD): {date}",
+        ) from exc
+    if not isinstance(day, DateType):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"invalid date: {date}",
+        )
+    row = await session.get(DailyDigestDoc, day)
+    if row is None:
+        return {"found": False, "date": date}
+    return {
+        "found": True,
+        "date": str(row.date),
+        "doc_id": row.doc_id,
+        "doc_url": row.doc_url,
+        "folder_token": row.folder_token,
+        "run_id": row.run_id,
+        "raw_count": row.raw_count,
+        "signal_count": row.signal_count,
+        "created_at": row.created_at.isoformat(),
+    }
 
 
 # ===========================================================================
@@ -434,3 +570,59 @@ async def _signal_total(session: AsyncSession) -> int:
         await session.execute(select(func.count()).select_from(Signal))
     ).scalar_one()
     return int(total or 0)
+
+
+async def _dedup_today_stats(session: AsyncSession) -> dict[str, Any]:
+    """Phase 25 v2.1 — today-fetched RawItem dedup funnel.
+
+    Returns the three numbers the /status reply surfaces so the
+    operator can see how much the source collectors are gathering
+    versus how much survives URL-deduplication and clustering:
+
+      raw_items_collected     — total RawItems fetched since 00:00 UTC
+      unique_urls             — distinct URL count in the same window
+      opportunities_created   — Opportunities inserted since 00:00 UTC
+    """
+    from sqlalchemy import distinct, func, select
+
+    from app.models import Opportunity, RawItem
+
+    today_start = datetime.now(tz=timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    raw_total = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(RawItem)
+                .where(RawItem.fetched_at >= today_start)
+            )
+        ).scalar_one()
+        or 0
+    )
+    raw_unique_url = int(
+        (
+            await session.execute(
+                select(func.count(distinct(RawItem.url)))
+                .select_from(RawItem)
+                .where(RawItem.fetched_at >= today_start)
+            )
+        ).scalar_one()
+        or 0
+    )
+    opp_new = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(Opportunity)
+                .where(Opportunity.created_at >= today_start)
+            )
+        ).scalar_one()
+        or 0
+    )
+    return {
+        "raw_items_collected": raw_total,
+        "unique_urls": raw_unique_url,
+        "opportunities_created": opp_new,
+        "window_start": today_start.isoformat(),
+    }

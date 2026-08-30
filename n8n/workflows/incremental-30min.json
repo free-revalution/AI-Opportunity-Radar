@@ -1,0 +1,142 @@
+{
+  "name": "incremental-30min",
+  "active": true,
+  "description": "Phase 25 v2.1 — incremental 30-minute cron. Only runs the cheap 4 steps (discovery → clustering → scoring → screening). Deep research and digest are NOT triggered — those run in daily-pipeline-8am.",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/30 * * * *"
+            }
+          ]
+        }
+      },
+      "id": "cron-trigger",
+      "name": "Cron (every 30 min)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.API_BASE_URL_INTERNAL}}/api/internal/discovery/run",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-Radar-Webhook", "value": "={{$env.RADAR_WEBHOOK_SECRET}}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"sources\": [\"github\",\"reddit\",\"hackernews\",\"producthunt\",\"rss\",\"arxiv\",\"huggingface\",\"douyin\",\"weibo\",\"zhihu\",\"amazon_best\",\"wallstreetcn_hot\"]}",
+        "options": {
+          "timeout": 300000,
+          "retry": { "maxTries": 2, "waitBetweenTries": 5000 }
+        }
+      },
+      "id": "step-discovery",
+      "name": "1. Discovery (sources)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [520, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.API_BASE_URL_INTERNAL}}/api/internal/clustering/run",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-Radar-Webhook", "value": "={{$env.RADAR_WEBHOOK_SECRET}}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"raw_item_limit\": 300, \"threshold\": 0.82}",
+        "options": {
+          "timeout": 300000,
+          "retry": { "maxTries": 2, "waitBetweenTries": 5000 }
+        }
+      },
+      "id": "step-clustering",
+      "name": "2. Clustering",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [800, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.API_BASE_URL_INTERNAL}}/api/internal/scoring/run",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-Radar-Webhook", "value": "={{$env.RADAR_WEBHOOK_SECRET}}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"limit\": 100, \"trigger_threshold\": 70}",
+        "options": {
+          "timeout": 180000,
+          "retry": { "maxTries": 1, "waitBetweenTries": 8000 }
+        }
+      },
+      "id": "step-scoring",
+      "name": "3. Scoring",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1080, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.API_BASE_URL_INTERNAL}}/api/internal/screening/run",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-Radar-Webhook", "value": "={{$env.RADAR_WEBHOOK_SECRET}}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"limit\": 30}",
+        "options": {
+          "timeout": 180000,
+          "retry": { "maxTries": 1, "waitBetweenTries": 5000 }
+        }
+      },
+      "id": "step-screening",
+      "name": "4. Screening",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1360, 300]
+    }
+  ],
+  "connections": {
+    "Cron (every 30 min)": {
+      "main": [[{ "node": "1. Discovery (sources)", "type": "main", "index": 0 }]]
+    },
+    "1. Discovery (sources)": {
+      "main": [[{ "node": "2. Clustering", "type": "main", "index": 0 }]]
+    },
+    "2. Clustering": {
+      "main": [[{ "node": "3. Scoring", "type": "main", "index": 0 }]]
+    },
+    "3. Scoring": {
+      "main": [[{ "node": "4. Screening", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all",
+    "timezone": "Asia/Shanghai",
+    "errorWorkflow": ""
+  }
+}

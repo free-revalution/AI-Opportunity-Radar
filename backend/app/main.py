@@ -40,6 +40,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         version=__version__,
     )
 
+    # Phase 25 v2.1 — surface the Feishu App credentials state at boot
+    # so an operator notices a missing pair before the first event
+    # arrives (which would otherwise 401 silently). Dev / mock
+    # environments skip the warning so local boots stay quiet.
+    if settings.app_env in {"staging", "prod"}:
+        has_id = bool((settings.feishu_app_id or "").strip())
+        has_secret = bool((settings.feishu_app_secret or "").strip())
+        if not (has_id and has_secret):
+            logger.error(
+                "feishu_credentials_missing",
+                has_app_id=has_id,
+                has_app_secret=has_secret,
+                hint=(
+                    "set FEISHU_APP_ID and FEISHU_APP_SECRET so the bot "
+                    "can reply to inbound events; without them the bot "
+                    "will fall back to feishu_webhook_url only."
+                ),
+            )
+        elif not (settings.feishu_webhook_url or "").strip():
+            logger.warning(
+                "feishu_webhook_not_configured",
+                hint=(
+                    "no feishu_webhook_url — App API transient errors "
+                    "won't have a fallback channel."
+                ),
+            )
+
     # In `local` / `dev` we keep DB init optional — tests + tooling may not need
     # a running Postgres. Real environments call `alembic upgrade head` before
     # booting the service.

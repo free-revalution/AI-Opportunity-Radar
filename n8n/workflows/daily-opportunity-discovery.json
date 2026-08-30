@@ -1,24 +1,22 @@
 {
-  "name": "daily-opportunity-discovery",
+  "name": "full-pipeline-webhook",
   "active": true,
+  "description": "Phase 25 v2.1 — full 6-step pipeline triggered by external webhook. Replaces the old cron-bound daily-opportunity-discovery workflow. The 08:00 Asia/Shanghai schedule lives in daily-pipeline-8am.json.",
   "nodes": [
     {
       "parameters": {
-        "triggerTimes": {
-          "item": [
-            {
-              "mode": "cronExpression",
-              "expression": "0 0 * * *",
-              "timezone": "UTC"
-            }
-          ]
-        }
+        "httpMethod": "POST",
+        "path": "full-pipeline",
+        "responseMode": "onReceived",
+        "responseData": "allEntries",
+        "options": {}
       },
-      "id": "cron-trigger",
-      "name": "Cron (daily 02:00 UTC)",
-      "type": "n8n-nodes-base.scheduleTrigger",
-      "typeVersion": 1.2,
-      "position": [240, 300]
+      "id": "webhook-trigger",
+      "name": "Webhook (manual / external trigger)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "radar-full-pipeline"
     },
     {
       "parameters": {
@@ -33,7 +31,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "{\"sources\": [\"github\",\"reddit\",\"hackernews\",\"producthunt\",\"rss\"]}",
+        "jsonBody": "={{JSON.stringify($json.body && $json.body.sources ? { sources: $json.body.sources } : { sources: [\"github\",\"reddit\",\"hackernews\",\"producthunt\",\"rss\",\"arxiv\",\"huggingface\",\"douyin\",\"weibo\",\"zhihu\",\"amazon_best\",\"wallstreetcn_hot\"] })}}",
         "options": {
           "timeout": 600000,
           "retry": { "maxTries": 3, "waitBetweenTries": 5000 }
@@ -153,21 +151,21 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "{\"max_entries\": 5, \"per_entry_summary_chars\": 240, \"min_score\": 70.0}",
+        "jsonBody": "={{JSON.stringify($json.body && $json.body.max_entries ? { max_entries: $json.body.max_entries, per_entry_summary_chars: 240, min_score: 70.0 } : { max_entries: 5, per_entry_summary_chars: 240, min_score: 70.0 })}}",
         "options": {
           "timeout": 120000,
           "retry": { "maxTries": 2, "waitBetweenTries": 5000 }
         }
       },
       "id": "step-digest-send",
-      "name": "6. Digest -> Telegram",
+      "name": "6. Digest -> Feishu",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [1920, 300]
     }
   ],
   "connections": {
-    "Cron (daily 02:00 UTC)": {
+    "Webhook (manual / external trigger)": {
       "main": [[{ "node": "1. Discovery (sources)", "type": "main", "index": 0 }]]
     },
     "1. Discovery (sources)": {
@@ -183,14 +181,14 @@
       "main": [[{ "node": "5. Deep Research", "type": "main", "index": 0 }]]
     },
     "5. Deep Research": {
-      "main": [[{ "node": "6. Digest -> Telegram", "type": "main", "index": 0 }]]
+      "main": [[{ "node": "6. Digest -> Feishu", "type": "main", "index": 0 }]]
     }
   },
   "settings": {
     "executionOrder": "v1",
     "saveDataSuccessExecution": "all",
     "saveDataErrorExecution": "all",
-    "timezone": "UTC",
+    "timezone": "Asia/Shanghai",
     "errorWorkflow": ""
   }
 }
