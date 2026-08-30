@@ -105,10 +105,23 @@ class _TokenMixin:
         }
         for attempt in range(2):
             try:
-                if method.upper() == "GET":
+                method_upper = method.upper()
+                if method_upper == "GET":
                     response = await self.app_client._http.get(url, headers=headers)
-                elif method.upper() == "POST":
+                elif method_upper == "POST":
                     response = await self.app_client._http.post(
+                        url, json=json_body or {}, headers=headers
+                    )
+                elif method_upper == "PUT":
+                    response = await self.app_client._http.put(
+                        url, json=json_body or {}, headers=headers
+                    )
+                elif method_upper == "DELETE":
+                    response = await self.app_client._http.delete(
+                        url, headers=headers
+                    )
+                elif method_upper == "PATCH":
+                    response = await self.app_client._http.patch(
                         url, json=json_body or {}, headers=headers
                     )
                 else:  # pragma: no cover — defensive
@@ -181,6 +194,29 @@ class FeishuDriveClient(_TokenMixin):
         self.base_url = base_url.rstrip("/")
         self._poll_interval_sec = poll_interval_sec
         self._poll_timeout_sec = poll_timeout_sec
+
+    @classmethod
+    def create_default(
+        cls,
+        *,
+        settings: Optional[Settings] = None,
+    ) -> "FeishuDriveClient":
+        """Factory used by `/api/internal/*` endpoints that don't already
+        own a :class:`FeishuAppClient`.
+
+        Constructs a fresh :class:`FeishuAppClient` (with its own httpx
+        ``AsyncClient``) so the caller doesn't need to manage the token
+        cache lifecycle. The app_client is NOT ``aclose()``'d here — the
+        caller is responsible for that when the request finishes. Most
+        endpoint callers can simply let the ``AsyncClient`` be GC'd on
+        process exit; long-running FastAPI processes should switch to
+        reusing a singleton via :attr:`app.services.feishu.bot.client`.
+
+        Production paths that reuse a singleton should NOT go through
+        this factory.
+        """
+        app_client = FeishuAppClient(settings=settings)
+        return cls(app_client=app_client, settings=settings)
 
     @property
     def is_configured(self) -> bool:
@@ -441,6 +477,259 @@ class FeishuDriveClient(_TokenMixin):
                 continue
             current = await self.create_folder(parent_token=current, name=name)
         return current
+
+    # ------------------------------------------------------------------
+    # Phase 26 — full Drive CRUD (folder / file management surface)
+    # ------------------------------------------------------------------
+    async def list_children_paginated(
+        self,
+        *,
+        folder_token: str,
+        page_size: int = 200,
+        page_token: Optional[str] = None,
+    ) -> tuple[list[dict[str, Any]], Optional[str]]:
+        """Page-aware variant of :meth:`list_children`.
+
+        Returns ``(items, next_page_token)``. When ``next_page_token``
+        is ``None``, the caller has drained the folder. The base
+        implementation calls ``list_children`` (which doesn't
+        paginate) and synthesises a single page — callers that need
+        true pagination can override via httpx directly.
+        """
+        if not folder_token:
+            raise FeishuContentError("list_children_paginated: folder_token missing")
+        items = await self.list_children(folder_token=folder_token)
+        return items, None
+
+    async def delete_file(
+        self,
+        *,
+        file_token: str,
+        file_type: str = "folder",
+    ) -> dict[str, Any]:
+        """Delete a file/folder — returns the async task info.
+
+        Feishu Drive deletes are async: ``DELETE /drive/v1/files/{token}``
+        returns ``{"data": {"task_id": "..."}}`` and the operator must
+        poll ``GET /drive/v1/files/task_check?task_id=...`` to confirm
+        completion.
+
+        ``file_type`` is one of ``"folder"`` / ``"docx"`` / ``"file"`` —
+        the API parameter is required even though it feels redundant.
+
+        Returns ``{"task_id": "...", "file_token": "..."}``.
+        """
+        if not file_token:
+            raise FeishuContentError("delete_file: file_token missing")
+        if file_type not in {"folder", "docx", "file"}:
+            raise FeishuContentError(
+                f"delete_file: invalid file_type {file_type!r}"
+            )
+        response = await self._request(
+            method="DELETE",
+            path=f"/drive/v1/files/{file_token}?type={file_type}",
+        )
+        if response.get("code") != 0:
+            raise FeishuContentError(
+                f"drive/v1/files delete rejected: "
+                f"code={response.get('code')} msg={response.get('msg')}"
+            )
+        data = response.get("data") or {}
+        task_id = (data.get("task_id") or "").strip()
+        if not task_id:
+            raise FeishuContentError(
+                f"drive/v1/files delete returned no task_id: {response!r}"
+            )
+        logger.info(
+            "feishu_drive_delete_submitted",
+            file_token=file_token[:24],
+            file_type=file_type,
+            task_id=task_id,
+        )
+        return {"task_id": task_id, "file_token": file_token}
+
+    async def poll_delete_task(
+        self,
+        *,
+        task_id: str,
+        timeout_sec: float = 60.0,
+        interval_sec: float = 1.5,
+    ) -> dict[str, Any]:
+        """Poll `GET /drive/v1/files/task_check` until the delete finishes.
+
+        Returns the final ``{"status": "success"|"failed"|"pending", ...}``
+        payload. Times out after ``timeout_sec`` with the last observed
+        status; callers should treat timeout as "still running, check
+        later".
+        """
+        if not task_id:
+            raise FeishuContentError("poll_delete_task: task_id missing")
+        deadline = asyncio.get_event_loop().time() + timeout_sec
+        last: dict[str, Any] = {}
+        while True:
+            response = await self._request(
+                method="GET",
+                path=f"/drive/v1/files/task_check?task_id={task_id}",
+            )
+            if response.get("code") != 0:
+                raise FeishuContentError(
+                    f"drive/v1/files task_check rejected: "
+                    f"code={response.get('code')} msg={response.get('msg')}"
+                )
+            payload = (response.get("data") or {}).get("result") or {}
+            last = {
+                "status": payload.get("result") or "pending",
+                "raw": payload,
+            }
+            if last["status"] in {"success", "failed"}:
+                return last
+            if asyncio.get_event_loop().time() >= deadline:
+                last["status"] = "timeout"
+                last["timeout_sec"] = timeout_sec
+                return last
+            await asyncio.sleep(interval_sec)
+
+    async def move_file(
+        self,
+        *,
+        file_token: str,
+        target_folder_token: str,
+        file_type: str = "folder",
+    ) -> dict[str, Any]:
+        """Move a file/folder into ``target_folder_token``.
+
+        ``POST /drive/v1/files/{token}/move`` body
+        ``{"folder_token": "<target>", "type": "folder"|"docx"|"file"}``.
+
+        Returns ``{"file_token", "target_folder_token"}``.
+        """
+        if not file_token or not target_folder_token:
+            raise FeishuContentError(
+                "move_file: file_token and target_folder_token required"
+            )
+        response = await self._request(
+            method="POST",
+            path=f"/drive/v1/files/{file_token}/move",
+            json_body={
+                "folder_token": target_folder_token,
+                "type": file_type,
+            },
+        )
+        if response.get("code") != 0:
+            raise FeishuContentError(
+                f"drive/v1/files move rejected: "
+                f"code={response.get('code')} msg={response.get('msg')}"
+            )
+        logger.info(
+            "feishu_drive_file_moved",
+            file_token=file_token[:24],
+            target=target_folder_token[:24],
+        )
+        return {
+            "file_token": file_token,
+            "target_folder_token": target_folder_token,
+        }
+
+    async def rename_file(
+        self,
+        *,
+        file_token: str,
+        new_name: str,
+        file_type: str = "folder",
+    ) -> dict[str, Any]:
+        """Rename a file/folder in place.
+
+        ``POST /drive/v1/files/{token}/rename`` body
+        ``{"name": "...", "type": "folder"|"docx"|"file"}``.
+
+        Returns ``{"file_token", "name"}``.
+        """
+        name = (new_name or "").strip()
+        if not file_token or not name:
+            raise FeishuContentError(
+                "rename_file: file_token and new_name required"
+            )
+        response = await self._request(
+            method="POST",
+            path=f"/drive/v1/files/{file_token}/rename",
+            json_body={"name": name[:200], "type": file_type},
+        )
+        if response.get("code") != 0:
+            raise FeishuContentError(
+                f"drive/v1/files rename rejected: "
+                f"code={response.get('code')} msg={response.get('msg')}"
+            )
+        logger.info(
+            "feishu_drive_file_renamed",
+            file_token=file_token[:24],
+            name=name[:80],
+        )
+        return {"file_token": file_token, "name": name}
+
+    async def get_file_meta(
+        self,
+        *,
+        file_tokens: list[str],
+        file_type: str = "folder",
+    ) -> list[dict[str, Any]]:
+        """Batch-fetch metadata for several files/folders.
+
+        ``POST /drive/v1/metas/batch_query`` body
+        ``{"request_docs": [{"token": "...", "type": "..."}, ...]}``.
+
+        Returns the raw ``data.metas`` list (each item has ``token``,
+        ``name``, ``type``, ``owner_id``, ``created_time``, ``url``).
+        """
+        if not file_tokens:
+            return []
+        docs = [{"token": tok, "type": file_type} for tok in file_tokens]
+        response = await self._request(
+            method="POST",
+            path="/drive/v1/metas/batch_query",
+            json_body={"request_docs": docs},
+        )
+        if response.get("code") != 0:
+            raise FeishuContentError(
+                f"drive/v1/metas batch_query rejected: "
+                f"code={response.get('code')} msg={response.get('msg')}"
+            )
+        return list((response.get("data") or {}).get("metas") or [])
+
+    async def search_files(
+        self,
+        *,
+        folder_token: Optional[str] = None,
+        keyword: str = "",
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Search by name across one folder.
+
+        The Feishu Drive v1 API doesn't expose a server-side name
+        search; we use ``list_children`` and filter by case-insensitive
+        substring match. When ``folder_token`` is ``None``, the root
+        folder is used.
+
+        Returns a list of matching items, each with ``token``, ``name``,
+        ``type``. Empty list when no matches.
+        """
+        kw = (keyword or "").strip()
+        if not kw:
+            return []
+        target = folder_token or self.folder_token
+        if not target:
+            raise FeishuContentError(
+                "search_files: folder_token missing "
+                "(set FEISHU_DRIVE_ROOT_FOLDER_TOKEN or pass folder_token)"
+            )
+        children = await self.list_children(folder_token=target)
+        kw_lower = kw.lower()
+        out: list[dict[str, Any]] = []
+        for child in children:
+            if kw_lower in (child.get("name") or "").lower():
+                out.append(child)
+                if len(out) >= limit:
+                    break
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -703,6 +992,241 @@ class FeishuBitableClient(_TokenMixin):
         if not token:
             return ""
         return f"https://feishu.cn/base/{token}"
+
+    # ------------------------------------------------------------------
+    # Phase 26 — generic Bitable CRUD (used by /docs bitable:* commands)
+    # ------------------------------------------------------------------
+    async def list_tables(
+        self,
+        *,
+        app_token: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """List tables in a Bitable app.
+
+        ``GET /bitable/v1/apps/{app_token}/tables``. When ``app_token``
+        is omitted, uses the configured/cached one.
+        """
+        token = (app_token or "").strip() or await self.ensure_app()
+        response = await self._request(
+            method="GET",
+            path=f"/bitable/v1/apps/{token}/tables",
+        )
+        if response.get("code") != 0:
+            raise FeishuContentError(
+                f"bitable list_tables rejected: "
+                f"code={response.get('code')} msg={response.get('msg')}"
+            )
+        return list((response.get("data") or {}).get("items") or [])
+
+    async def list_records(
+        self,
+        *,
+        app_token: Optional[str] = None,
+        table_id: Optional[str] = None,
+        page_size: int = 20,
+        page_token: Optional[str] = None,
+        filter_: Optional[dict[str, Any]] = None,
+    ) -> tuple[list[dict[str, Any]], Optional[str]]:
+        """Page through records in a Bitable table.
+
+        Returns ``(records, next_page_token)``. ``records`` is the raw
+        ``data.items`` list (each item is ``{"record_id": "...", "fields": {...}}``).
+        """
+        token = (app_token or "").strip() or await self.ensure_app()
+        tid = (table_id or "").strip()
+        if not tid:
+            raise FeishuContentError("list_records: table_id required")
+        params: list[str] = [f"page_size={int(page_size)}"]
+        if page_token:
+            params.append(f"page_token={page_token}")
+        if filter_:
+            import json as _json
+
+            params.append(f"filter={_json.dumps(filter_, ensure_ascii=False)}")
+        path = f"/bitable/v1/apps/{token}/tables/{tid}/records?" + "&".join(params)
+        response = await self._request(method="GET", path=path)
+        if response.get("code") != 0:
+            raise FeishuContentError(
+                f"bitable list_records rejected: "
+                f"code={response.get('code')} msg={response.get('msg')}"
+            )
+        data = response.get("data") or {}
+        return list(data.get("items") or []), data.get("page_token") or None
+
+    async def create_record(
+        self,
+        *,
+        app_token: Optional[str] = None,
+        table_id: str,
+        fields: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Create one record.
+
+        ``POST /bitable/v1/apps/{app_token}/tables/{table_id}/records``
+        body ``{"fields": {...}}``.
+
+        Returns ``{"record_id": "..."}``.
+        """
+        if not table_id or not fields:
+            raise FeishuContentError(
+                "create_record: table_id and fields required"
+            )
+        token = (app_token or "").strip() or await self.ensure_app()
+        response = await self._request(
+            method="POST",
+            path=f"/bitable/v1/apps/{token}/tables/{table_id}/records",
+            json_body={"fields": fields},
+        )
+        if response.get("code") != 0:
+            raise FeishuContentError(
+                f"bitable create_record rejected: "
+                f"code={response.get('code')} msg={response.get('msg')}"
+            )
+        record = (response.get("data") or {}).get("record") or {}
+        return {
+            "record_id": (record.get("record_id") or "").strip(),
+            "fields": record.get("fields") or fields,
+        }
+
+    async def update_record(
+        self,
+        *,
+        app_token: Optional[str] = None,
+        table_id: str,
+        record_id: str,
+        fields: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Update one record (partial overwrite of ``fields``).
+
+        ``PUT /bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}``
+        body ``{"fields": {...}}``.
+        """
+        if not table_id or not record_id:
+            raise FeishuContentError(
+                "update_record: table_id and record_id required"
+            )
+        token = (app_token or "").strip() or await self.ensure_app()
+        response = await self._request(
+            method="PUT",
+            path=(
+                f"/bitable/v1/apps/{token}/tables/{table_id}"
+                f"/records/{record_id}"
+            ),
+            json_body={"fields": fields},
+        )
+        if response.get("code") != 0:
+            raise FeishuContentError(
+                f"bitable update_record rejected: "
+                f"code={response.get('code')} msg={response.get('msg')}"
+            )
+        record = (response.get("data") or {}).get("record") or {}
+        return {
+            "record_id": (record.get("record_id") or record_id).strip(),
+            "fields": record.get("fields") or fields,
+        }
+
+    async def delete_record(
+        self,
+        *,
+        app_token: Optional[str] = None,
+        table_id: str,
+        record_id: str,
+    ) -> dict[str, Any]:
+        """Delete one record.
+
+        ``DELETE /bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}``.
+        """
+        if not table_id or not record_id:
+            raise FeishuContentError(
+                "delete_record: table_id and record_id required"
+            )
+        token = (app_token or "").strip() or await self.ensure_app()
+        response = await self._request(
+            method="DELETE",
+            path=(
+                f"/bitable/v1/apps/{token}/tables/{table_id}"
+                f"/records/{record_id}"
+            ),
+        )
+        if response.get("code") != 0:
+            raise FeishuContentError(
+                f"bitable delete_record rejected: "
+                f"code={response.get('code')} msg={response.get('msg')}"
+            )
+        return {"record_id": record_id, "deleted": True}
+
+    async def batch_create_records(
+        self,
+        *,
+        app_token: Optional[str] = None,
+        table_id: str,
+        records: list[dict[str, Any]],
+        chunk_size: int = _BITABLE_BATCH_SIZE,
+    ) -> int:
+        """Batch-create records (chunks of ``chunk_size``).
+
+        Each ``records`` element is a ``{"fields": {...}}`` dict.
+        Returns the total number of records inserted.
+        """
+        if not records:
+            return 0
+        if not table_id:
+            raise FeishuContentError("batch_create_records: table_id required")
+        token = (app_token or "").strip() or await self.ensure_app()
+        total = 0
+        for start in range(0, len(records), chunk_size):
+            chunk = records[start : start + chunk_size]
+            response = await self._request(
+                method="POST",
+                path=(
+                    f"/bitable/v1/apps/{token}/tables/{table_id}"
+                    f"/records/batch_create"
+                ),
+                json_body={"records": chunk},
+            )
+            if response.get("code") != 0:
+                raise FeishuContentError(
+                    f"bitable batch_create rejected: "
+                    f"code={response.get('code')} msg={response.get('msg')}"
+                )
+            total += len(chunk)
+        return total
+
+    async def batch_delete_records(
+        self,
+        *,
+        app_token: Optional[str] = None,
+        table_id: str,
+        record_ids: list[str],
+        chunk_size: int = _BITABLE_BATCH_SIZE,
+    ) -> int:
+        """Batch-delete records (chunks of ``chunk_size``).
+
+        Returns the total number of records deleted.
+        """
+        if not record_ids:
+            return 0
+        if not table_id:
+            raise FeishuContentError("batch_delete_records: table_id required")
+        token = (app_token or "").strip() or await self.ensure_app()
+        total = 0
+        for start in range(0, len(record_ids), chunk_size):
+            chunk = record_ids[start : start + chunk_size]
+            response = await self._request(
+                method="POST",
+                path=(
+                    f"/bitable/v1/apps/{token}/tables/{table_id}"
+                    f"/records/batch_delete"
+                ),
+                json_body={"records": [{"record_id": rid} for rid in chunk]},
+            )
+            if response.get("code") != 0:
+                raise FeishuContentError(
+                    f"bitable batch_delete rejected: "
+                    f"code={response.get('code')} msg={response.get('msg')}"
+                )
+            total += len(chunk)
+        return total
 
 
 def _opp_to_bitable_fields(

@@ -146,9 +146,76 @@ MVP 默认开启 12 个源(`.env` 的 `ENABLED_SOURCES`):
 | `/status`| `/状态`  | Last run + per-source health snapshot |
 | `/sources`| `/源`   | Per-source health, identical to `/status sources` |
 | `/help`  | `/帮助`  | List the commands |
+| `/docs`  | `/文档`  | Manage cloud docs + Bitable (admin only — see below) |
 
-All five are dispatched by [`backend/app/services/feishu/inbound.py`](backend/app/services/feishu/inbound.py)
+All six are dispatched by [`backend/app/services/feishu/inbound.py`](backend/app/services/feishu/inbound.py)
 and routed to internal endpoints under `/api/internal/*`.
+
+### 飞书机器人管理云文档 (`/docs`)
+
+The `/docs` family lets operators manage the 4-section cloud-doc tree
+(`📌 首页` / `📅 今日` / `📁 每日报告` / `📚 信息源`) and the Bitable
+opportunities table directly from the Feishu chat.
+
+**RBAC:** only senders whose `open_id` is in `ADMIN_OPEN_IDS` can call
+these sub-commands. Non-admins get a deny reply.
+
+**Two-step confirmation:** `rm` and `bitable:rm` are *staged* — they
+return a one-shot `action_id` token (60-second TTL, stored in Redis).
+The operator must reply `/docs confirm <action_id>` within 60s to
+actually run the delete. The token is consumed atomically via
+`GETDEL`, so replays return "expired or not found".
+
+| Sub-command | Alias | What it does |
+|-------------|-------|--------------|
+| `/docs` | — | Show menu + 4-section sizes |
+| `/docs tree` | — | Background walk of the 4 sections; result is pushed back as a multi-card reply when done (long-running) |
+| `/docs ls <section>` | — | List children of one section (default `📅 今日`) |
+| `/docs find <kw>` | — | Substring search across all 4 sections |
+| `/docs daily <YYYY-MM-DD>` | — | Look up the docx written on that date |
+| `/docs info <path>` | — | File metadata for a path inside the tree |
+| `/docs create <name> [section]` | — | Create a child folder |
+| `/docs mkdir <a/b/c>` | — | Recursively create a nested folder path |
+| `/docs mv <path> <target_section>` | — | Move a file/folder to another section |
+| `/docs rename <path> <new_name>` | — | Rename in place |
+| `/docs rm <path>` | — | **Stage** a delete — returns a `confirm` token (60 s TTL) |
+| `/docs confirm <token>` | — | Actually run a staged delete (drive or bitable) |
+| `/docs bitable ls` | — | List Bitable tables |
+| `/docs bitable find <kw> [table]` | — | Substring search across Bitable records |
+| `/docs bitable add <table> k=v;k2=v2` | — | Add a record (semicolon-separated `k=v` pairs) |
+| `/docs bitable rm <record_id> [table]` | — | **Stage** a Bitable delete |
+
+All 16 sub-commands are mirrored as HTTP endpoints under
+`/api/internal/docs/*` for curl-driven operation:
+
+```
+GET  /api/internal/docs/ls?section=📅 今日
+GET  /api/internal/docs/find?keyword=AI
+GET  /api/internal/docs/info?path=📅 今日/foo
+POST /api/internal/docs/mkdir         {"path": "📁 每日报告/2026-08-30"}
+POST /api/internal/docs/create        {"section": "📚 信息源", "name": "News"}
+POST /api/internal/docs/mv            {"path": "...", "target_section": "📚 信息源"}
+POST /api/internal/docs/rename        {"path": "...", "new_name": "..."}
+POST /api/internal/docs/rm            {"path": "..."}             → stage
+POST /api/internal/docs/confirm       {"action_id": "..."}        → execute
+GET  /api/internal/docs/bitable/ls
+GET  /api/internal/docs/bitable/find?keyword=AI&table=Opportunities
+POST /api/internal/docs/bitable/add   {"table": "...", "fields": {...}}
+POST /api/internal/docs/bitable/rm    {"record_id": "..."}       → stage
+```
+
+Both surfaces are guarded by `require_admin` (Feishu `X-Feishu-Open-Id`
+header, admin secret, or webhook secret, in precedence order).
+
+**Security notes:**
+
+- Anti-traversal: paths must start with one of the 4 known section
+  names — `..` and `/etc/...` are rejected at the `resolve_path` layer.
+- The Redis-backed `ConfirmStore` uses `GETDEL` (atomic read+delete)
+  so a confirm token cannot be replayed.
+- All destructive ops route through `DriveManager.within_root`
+  (BFS walk from the configured root token) before any Feishu API
+  call goes out.
 
 ---
 

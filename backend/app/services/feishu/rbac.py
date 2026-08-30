@@ -49,6 +49,27 @@ _ADMIN_COMMANDS: FrozenSet[str] = frozenset(
         "refresh",
         "score",
         "daily",
+        # Phase 26 — /docs sub-commands. Per product decision (simplify
+        # §10 v2.0) ALL /docs operations are admin-only: read-only
+        # commands (ls/find/info/tree/daily) and destructive ones
+        # (rm/mv/rename/create/mkdir) share the same gate so the
+        # bot surface is uniform — no surprise privilege differences
+        # between read and write.
+        "docs_tree",
+        "docs_ls",
+        "docs_find",
+        "docs_info",
+        "docs_daily",
+        "docs_create",
+        "docs_mkdir",
+        "docs_mv",
+        "docs_rename",
+        "docs_rm",
+        "docs_confirm",
+        "docs_bitable_ls",
+        "docs_bitable_find",
+        "docs_bitable_add",
+        "docs_bitable_rm",
     }
 )
 
@@ -182,6 +203,41 @@ def user_facing_deny_message(command_kind: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Phase 26 — DocsCommandAuthorizer
+# ---------------------------------------------------------------------------
+class DocsCommandAuthorizer:
+    """Thin wrapper that decides whether a sender can run a ``/docs`` sub-command.
+
+    The Phase 26 ``/docs`` family is admin-only across the board (per
+    product decision — see ``_ADMIN_COMMANDS`` above). This wrapper
+    centralises the call so :mod:`app.services.feishu.inbound` doesn't
+    reach into :func:`authorize` directly. It also accepts the
+    :class:`Settings` so the caller doesn't need to know about the
+    ``admin_open_ids`` storage location (settings vs DB lookup).
+
+    Constructed once per ``/docs`` invocation; the underlying
+    :func:`authorize` call is O(len(admin_open_ids)) — a few entries,
+    so trivial.
+    """
+
+    def __init__(self, *, admin_open_ids: Optional[Iterable[str]] = None) -> None:
+        self._admin_open_ids = list(admin_open_ids or ())
+
+    def check(
+        self,
+        *,
+        command_kind: str,
+        sender_open_id: Optional[str],
+    ) -> AuthVerdict:
+        """Return the :class:`AuthVerdict` for ``sender_open_id`` vs ``command_kind``."""
+        return authorize(
+            command_kind,
+            sender_open_id,
+            admin_open_ids=self._admin_open_ids,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Activation flow (per docs §51-52)
 # ---------------------------------------------------------------------------
 @dataclass(slots=True)
@@ -203,6 +259,7 @@ __all__ = [
     "AuthVerdict",
     "ActivationAttempt",
     "CommandRole",
+    "DocsCommandAuthorizer",
     "USER_TOOL_ALLOWLIST",
     "authorize",
     "is_activation_command",

@@ -308,7 +308,7 @@ async def run_pipeline(
 
             settings = get_settings()
             if settings.feishu_drive_root_folder_token:
-                drive = FeishuDriveClient(settings=settings)
+                drive = FeishuDriveClient.create_default(settings=settings)
                 docx_service = DriveOrgService(
                     drive=drive, settings=settings, session=session
                 )
@@ -451,7 +451,7 @@ async def get_docs_tree(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="FEISHU_DRIVE_ROOT_FOLDER_TOKEN not configured",
         )
-    drive = FeishuDriveClient(settings=settings)
+    drive = FeishuDriveClient.create_default(settings=settings)
     service = DriveOrgService(drive=drive, settings=settings, session=session)
     try:
         tokens = await service.ensure_root_tree()
@@ -511,6 +511,543 @@ async def get_daily_doc(
         "raw_count": row.raw_count,
         "signal_count": row.signal_count,
         "created_at": row.created_at.isoformat(),
+    }
+
+
+# ===========================================================================
+# Phase 26 — /docs sub-command HTTP surface
+#
+# Mirrors the bot's ``/docs`` family so operators can drive Drive
+# management via curl without opening Feishu. Same RBAC gate
+# (require_admin) as the bot path. Same ConfirmStore — destructive
+# operations still require a 60-second two-step flow.
+# ===========================================================================
+async def _build_docs_services(
+    *,
+    settings: Any,
+    session: Any,
+):
+    """Construct a :class:`DriveManager` + :class:`BitableManager` + ConfirmStore.
+
+    Returns ``(drive_manager, bitable_manager)``. Raises HTTPException
+    503 if Drive isn't configured (the API mirrors the bot path).
+    """
+    from app.services.feishu.app_client import FeishuAppClient
+    from app.services.feishu.bitable_manager import BitableManager
+    from app.services.feishu.confirm_store import get_confirm_store
+    from app.services.feishu.content_client import (
+        FeishuBitableClient,
+        FeishuDriveClient,
+    )
+    from app.services.feishu.drive_manager import DriveManager
+
+    if not settings.feishu_drive_root_folder_token:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="FEISHU_DRIVE_ROOT_FOLDER_TOKEN not configured",
+        )
+
+    drive = FeishuDriveClient.create_default(settings=settings)
+    drive_manager = DriveManager(drive=drive, settings=settings)
+
+    bitable_client: Any = None
+    try:
+        app_client = FeishuAppClient(settings=settings)
+        bitable_client = FeishuBitableClient(
+            app_client=app_client,
+            settings=settings,
+            token_setting="feishu_bitable_opportunities_app_token",
+        )
+    except Exception:  # noqa: BLE001
+        bitable_client = None
+
+    bitable_manager = BitableManager(
+        client=bitable_client or _NullBitableClient(),
+        settings=settings,
+        confirm_store=None,  # wired below if Redis up
+    )
+
+    # — ConfirmStore is optional — destructive paths raise a clear
+    # error when it's None (see ConfirmStoreUnavailable path).
+    confirm_store = None
+    try:
+        from app.services.redis_client import get_redis
+
+        redis_client = await get_redis()
+        if redis_client is not None:
+            confirm_store = get_confirm_store(redis_client)
+    except Exception:  # noqa: BLE001
+        confirm_store = None
+
+    drive_manager_with_cs = DriveManager(
+        drive=drive, settings=settings, confirm_store=confirm_store
+    )
+    bitable_manager_with_cs = BitableManager(
+        client=bitable_client or _NullBitableClient(),
+        settings=settings,
+        confirm_store=confirm_store,
+    )
+    return drive_manager_with_cs, bitable_manager_with_cs
+
+
+class _NullBitableClient:
+    """Stand-in when Bitable isn't configured — surfaces a clean 503."""
+
+    async def list_tables(self) -> list:  # type: ignore[override]
+        from app.services.feishu.content_client import FeishuContentError
+
+        raise FeishuContentError("bitable not configured")
+
+    async def find_records(self, **_kw):  # type: ignore[override]
+        from app.services.feishu.content_client import FeishuContentError
+
+        raise FeishuContentError("bitable not configured")
+
+    async def create_record(self, **_kw):  # type: ignore[override]
+        from app.services.feishu.content_client import FeishuContentError
+
+        raise FeishuContentError("bitable not configured")
+
+    async def update_record(self, **_kw):  # type: ignore[override]
+        from app.services.feishu.content_client import FeishuContentError
+
+        raise FeishuContentError("bitable not configured")
+
+    async def delete_record(self, **_kw):  # type: ignore[override]
+        from app.services.feishu.content_client import FeishuContentError
+
+        raise FeishuContentError("bitable not configured")
+
+
+@router.get(
+    "/docs/ls",
+    summary="Phase 26 — list children of a top-level Drive section",
+)
+async def docs_ls(
+    section: str = "📅 今日",
+    limit: int = 30,
+    _actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    from app.config import get_settings
+
+    from app.services.feishu.content_client import FeishuContentError
+
+    settings = get_settings()
+    drive_manager, _ = await _build_docs_services(settings=settings, session=None)
+    try:
+        items = await drive_manager.list_section(section=section, limit=limit)
+    except FeishuContentError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    return {"section": section, "count": len(items), "items": items}
+
+
+@router.get(
+    "/docs/find",
+    summary="Phase 26 — substring search across the 4 Drive sections",
+)
+async def docs_find(
+    keyword: str,
+    scope: str = "all",
+    limit: int = 20,
+    _actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    from app.config import get_settings
+
+    settings = get_settings()
+    drive_manager, _ = await _build_docs_services(settings=settings, session=None)
+    items = await drive_manager.find_files(
+        keyword=keyword, scope=scope, limit=limit
+    )
+    return {"keyword": keyword, "scope": scope, "count": len(items), "items": items}
+
+
+@router.get(
+    "/docs/info",
+    summary="Phase 26 — metadata for a Drive path",
+)
+async def docs_info(
+    path: str,
+    _actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    from app.config import get_settings
+
+    settings = get_settings()
+    drive_manager, _ = await _build_docs_services(settings=settings, session=None)
+    node = await drive_manager.resolve(path=path)
+    if node is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"path not found: {path}"
+        )
+    metas = await drive_manager.drive.get_file_meta(
+        file_tokens=[node.token], file_type=node.type or "folder"
+    )
+    return {
+        "path": node.path,
+        "type": node.type,
+        "token": node.token,
+        "metas": metas,
+    }
+
+
+@router.post(
+    "/docs/mkdir",
+    summary="Phase 26 — recursively create a folder path",
+)
+async def docs_mkdir(
+    body: dict[str, Any],
+    _actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    from app.config import get_settings
+
+    from app.services.feishu.content_client import FeishuContentError
+
+    settings = get_settings()
+    drive_manager, _ = await _build_docs_services(settings=settings, session=None)
+    path = (body.get("path") or "").strip()
+    if not path:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="path is required"
+        )
+    try:
+        result = await drive_manager.mkdir_path(path=path)
+    except FeishuContentError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    return result
+
+
+@router.post(
+    "/docs/create",
+    summary="Phase 26 — create a child folder inside a section",
+)
+async def docs_create(
+    body: dict[str, Any],
+    _actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    from app.config import get_settings
+
+    from app.services.feishu.content_client import FeishuContentError
+
+    settings = get_settings()
+    drive_manager, _ = await _build_docs_services(settings=settings, session=None)
+    name = (body.get("name") or "").strip()
+    section = (body.get("section") or "📅 今日").strip()
+    if not name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="name is required"
+        )
+    try:
+        result = await drive_manager.create_child_folder(
+            section=section, name=name
+        )
+    except FeishuContentError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    return result
+
+
+@router.post(
+    "/docs/mv",
+    summary="Phase 26 — move a Drive file/folder to a section",
+)
+async def docs_mv(
+    body: dict[str, Any],
+    _actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    from app.config import get_settings
+
+    from app.services.feishu.content_client import FeishuContentError
+
+    settings = get_settings()
+    drive_manager, _ = await _build_docs_services(settings=settings, session=None)
+    path = (body.get("path") or "").strip()
+    target = (body.get("target_section") or "").strip()
+    if not path or not target:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="path and target_section required",
+        )
+    node = await drive_manager.resolve(path=path)
+    if node is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"path not found: {path}"
+        )
+    try:
+        result = await drive_manager.move_to_section(
+            file_token=node.token,
+            file_type=node.type,
+            target_section=target,
+        )
+    except FeishuContentError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    return {"path": path, **result}
+
+
+@router.post(
+    "/docs/rename",
+    summary="Phase 26 — rename a Drive file/folder",
+)
+async def docs_rename(
+    body: dict[str, Any],
+    _actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    from app.config import get_settings
+
+    from app.services.feishu.content_client import FeishuContentError
+
+    settings = get_settings()
+    drive_manager, _ = await _build_docs_services(settings=settings, session=None)
+    path = (body.get("path") or "").strip()
+    new_name = (body.get("new_name") or "").strip()
+    if not path or not new_name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="path and new_name required",
+        )
+    node = await drive_manager.resolve(path=path)
+    if node is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"path not found: {path}"
+        )
+    try:
+        result = await drive_manager.rename(
+            file_token=node.token,
+            file_type=node.type,
+            new_name=new_name,
+        )
+    except FeishuContentError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    return {"old_path": path, **result}
+
+
+@router.post(
+    "/docs/rm",
+    summary="Phase 26 — STAGE a Drive delete (returns a 60s token)",
+)
+async def docs_rm(
+    body: dict[str, Any],
+    _actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    from app.config import get_settings
+
+    from app.services.feishu.confirm_store import ConfirmStoreUnavailable
+    from app.services.feishu.content_client import FeishuContentError
+
+    settings = get_settings()
+    drive_manager, _ = await _build_docs_services(settings=settings, session=None)
+    path = (body.get("path") or "").strip()
+    if not path:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="path is required"
+        )
+    try:
+        action = await drive_manager.request_delete(path=path)
+    except FeishuContentError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except ConfirmStoreUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+    return {
+        "stage": "pending",
+        "action_id": action.action_id,
+        "kind": action.kind,
+        "expires_at": action.expires_at,
+        "path": action.payload.get("path"),
+    }
+
+
+@router.post(
+    "/docs/confirm",
+    summary="Phase 26 — execute a previously staged delete",
+)
+async def docs_confirm(
+    body: dict[str, Any],
+    _actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    from app.config import get_settings
+
+    from app.services.feishu.confirm_store import ConfirmStoreUnavailable
+    from app.services.feishu.content_client import FeishuContentError
+
+    settings = get_settings()
+    drive_manager, bitable_manager = await _build_docs_services(
+        settings=settings, session=None
+    )
+    action_id = (body.get("action_id") or "").strip()
+    if not action_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="action_id is required"
+        )
+    store = (
+        drive_manager.confirm_store or bitable_manager.confirm_store
+    )
+    if store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="ConfirmStore unavailable (Redis not configured)",
+        )
+    action = await store.consume(action_id)
+    if action is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"action_id not found or expired: {action_id}",
+        )
+    try:
+        if action.kind == "drive_delete":
+            outcome = await drive_manager.execute_delete(action=action)
+        elif action.kind == "bitable_rm":
+            outcome = await bitable_manager.execute_delete(action=action)
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"unknown action kind: {action.kind}",
+            )
+    except FeishuContentError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)
+        ) from exc
+    return {"action_id": action_id, "kind": action.kind, "outcome": outcome}
+
+
+@router.get(
+    "/docs/bitable/ls",
+    summary="Phase 26 — list Bitable tables",
+)
+async def docs_bitable_ls(
+    _actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    from app.config import get_settings
+
+    from app.services.feishu.content_client import FeishuContentError
+
+    settings = get_settings()
+    _drive_manager, bitable_manager = await _build_docs_services(
+        settings=settings, session=None
+    )
+    try:
+        tables = await bitable_manager.list_tables()
+    except FeishuContentError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+    return {"count": len(tables), "items": tables}
+
+
+@router.get(
+    "/docs/bitable/find",
+    summary="Phase 26 — find Bitable records by keyword",
+)
+async def docs_bitable_find(
+    keyword: str,
+    table: Optional[str] = None,
+    limit: int = 10,
+    _actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    from app.config import get_settings
+
+    from app.services.feishu.content_client import FeishuContentError
+
+    settings = get_settings()
+    _drive_manager, bitable_manager = await _build_docs_services(
+        settings=settings, session=None
+    )
+    try:
+        items = await bitable_manager.find_records(
+            table_name=table, keyword=keyword, limit=limit
+        )
+    except FeishuContentError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    return {"keyword": keyword, "table": table, "count": len(items), "items": items}
+
+
+@router.post(
+    "/docs/bitable/add",
+    summary="Phase 26 — add a Bitable record",
+)
+async def docs_bitable_add(
+    body: dict[str, Any],
+    _actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    from app.config import get_settings
+
+    from app.services.feishu.content_client import FeishuContentError
+
+    settings = get_settings()
+    _drive_manager, bitable_manager = await _build_docs_services(
+        settings=settings, session=None
+    )
+    table = (body.get("table") or "").strip() or None
+    fields = body.get("fields") or {}
+    if not isinstance(fields, dict) or not fields:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="fields (dict) is required",
+        )
+    try:
+        rec = await bitable_manager.add_record(
+            table_name=table, fields=fields
+        )
+    except FeishuContentError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    return {"table": table, **rec}
+
+
+@router.post(
+    "/docs/bitable/rm",
+    summary="Phase 26 — STAGE a Bitable delete (returns a 60s token)",
+)
+async def docs_bitable_rm(
+    body: dict[str, Any],
+    _actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    from app.config import get_settings
+
+    from app.services.feishu.confirm_store import ConfirmStoreUnavailable
+    from app.services.feishu.content_client import FeishuContentError
+
+    settings = get_settings()
+    _drive_manager, bitable_manager = await _build_docs_services(
+        settings=settings, session=None
+    )
+    record_id = (body.get("record_id") or "").strip()
+    table = (body.get("table") or "").strip() or None
+    if not record_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="record_id is required"
+        )
+    try:
+        action = await bitable_manager.request_delete(
+            record_id=record_id, table_name=table
+        )
+    except FeishuContentError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    except ConfirmStoreUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+    return {
+        "stage": "pending",
+        "action_id": action.action_id,
+        "kind": action.kind,
+        "expires_at": action.expires_at,
+        "record_id": record_id,
     }
 
 

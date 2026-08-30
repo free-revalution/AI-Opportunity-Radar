@@ -393,6 +393,7 @@ class BotCommand:
         "search",
         "content",
         "preferences",
+        "docs",
         "unknown",
     ]
     args: str = ""
@@ -410,6 +411,10 @@ _COMMAND_ALK: dict[str, str] = {
     "/状态": "status",
     "/sources": "sources",
     "/源": "sources",
+    # Phase 26 — /docs family for cloud-drive management. Aliases
+    # in both English and Chinese.
+    "/docs": "docs",
+    "/文档": "docs",
 }
 
 
@@ -685,6 +690,8 @@ class FeishuCommandRouter:
             reply = await self._status()
         elif command.kind == "sources":
             reply = await self._sources()
+        elif command.kind == "docs":
+            reply = await self._docs(command.args)
         else:
             reply = _unknown_reply(command.args)
 
@@ -933,6 +940,162 @@ class FeishuCommandRouter:
             metadata={"command": "sources", "count": len(items)},
         )
 
+    async def _docs(self, args: str) -> CommandReply:
+        """`/docs <sub> <args>` — Phase 26 飞书云盘管理命令族.
+
+        RBAC: 所有 ``/docs`` 子命令仅 admin 可用(见
+        :data:`app.services.feishu.rbac._ADMIN_COMMANDS`)。Bot 先用
+        :class:`DocsCommandAuthorizer` 检查发送者;如果未通过,返
+        :func:`user_facing_deny_message`。
+
+        通过后构造 :class:`DocsContext` 并 dispatch 到
+        :func:`app.services.feishu.docs_commands.run_docs_subcommand`。
+        """
+        from app.services.feishu.docs_commands import (
+            DocsContext,
+            parse_docs_subcommand,
+            run_docs_subcommand,
+        )
+        from app.services.feishu.rbac import DocsCommandAuthorizer
+
+        # — RBAC: 先解析子命令拿到命令名(即便 reply 失败也能给出
+        # 准确 denial 文案)。
+        sub, _rest = parse_docs_subcommand(args)
+        # — 兼容旧 inline RBAC: 当子命令无法识别时,使用 "docs" 作
+        # 为 kind 仍可拒绝(且拒绝时 kind 是一致的)。
+        command_kind = f"docs_{sub.value}" if sub else "docs"
+        authorizer = DocsCommandAuthorizer(
+            admin_open_ids=self.settings.admin_open_ids or []
+        )
+        verdict = authorizer.check(
+            command_kind=command_kind,
+            sender_open_id=getattr(self, "_sender_open_id", None),
+        )
+        if not verdict.allowed:
+            return CommandReply(
+                text=user_facing_deny_message(command_kind),
+                metadata={
+                    "command": "docs",
+                    "subcommand": sub.value if sub else None,
+                    "denied": True,
+                    "required_role": verdict.required_role.value,
+                    "actor_role": verdict.actor_role.value,
+                },
+            )
+
+        # — Build DocsContext. DriveManager / BitableManager / ConfirmStore
+        # 各自有可注入构造器;这里直接从 router 已有的 client 复用。
+        ctx = await self._build_docs_context()
+        if isinstance(ctx, CommandReply):
+            return ctx  # — configuration error already formatted.
+
+        return await run_docs_subcommand(args=args, ctx=ctx)
+
+    async def _build_docs_context(self):
+        """Build a :class:`DocsContext` from the router's existing clients.
+
+        Returns a :class:`CommandReply` when the bot isn't configured
+        for ``/docs`` (Drive or Bitable clients missing).
+        """
+        from app.services.feishu.bitable_manager import BitableManager
+        from app.services.feishu.confirm_store import get_confirm_store
+        from app.services.feishu.docs_commands import DocsContext
+        from app.services.feishu.drive_manager import DriveManager
+
+        # — Drive client — router holds ``self._drive`` (optional). If
+        # None, fall back to building one through ``create_default`` so
+        # the production ``/docs`` path doesn't require the bot
+        # bootstrap code to wire it.
+        drive = self._drive
+        if drive is None:
+            try:
+                from app.services.feishu.content_client import (
+                    FeishuDriveClient,
+                )
+
+                drive = FeishuDriveClient.create_default(settings=self.settings)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "feishu_docs_drive_client_unavailable",
+                    error=str(exc)[:200],
+                )
+                return CommandReply(
+                    text=(
+                        "⚠️ 飞书云盘未配置,无法执行 /docs 命令。"
+                        "请设置 FEISHU_DRIVE_ROOT_FOLDER_TOKEN 并重启服务。"
+                    ),
+                    metadata={"command": "docs", "error": True},
+                )
+
+        # — Bitable clients — router holds ``self._bitable_ops``
+        # (Opportunities table) — the bot uses the same one for
+        # ``/docs bitable:*``. Fall back to digest client if the
+        # opportunities one isn't wired.
+        bitable_client = self._bitable_ops or self._bitable_digest
+        if bitable_client is None:
+            try:
+                from app.services.feishu.app_client import FeishuAppClient
+                from app.services.feishu.content_client import (
+                    FeishuBitableClient,
+                )
+
+                app_client = FeishuAppClient(settings=self.settings)
+                bitable_client = FeishuBitableClient(
+                    app_client=app_client,
+                    settings=self.settings,
+                    token_setting="feishu_bitable_opportunities_app_token",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "feishu_docs_bitable_client_unavailable",
+                    error=str(exc)[:200],
+                )
+                return CommandReply(
+                    text=(
+                        "⚠️ 飞书多维表格未配置,无法执行 /docs bitable:* 命令。"
+                        "请设置 FEISHU_BITABLE_OPPORTUNITIES_APP_TOKEN。"
+                    ),
+                    metadata={"command": "docs", "error": True},
+                )
+
+        # — Confirm store — share one between drive + bitable. The
+        # singleton is per-Redis-client, so a single ``get_redis()``
+        # lookup gives us the canonical instance.
+        confirm_store = None
+        try:
+            from app.services.redis_client import get_redis
+
+            redis_client = await get_redis()
+            if redis_client is not None:
+                confirm_store = get_confirm_store(redis_client)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "feishu_docs_confirm_store_init_failed",
+                error=str(exc)[:200],
+            )
+            # — fail-open: destructive commands will get a "Redis 未
+            # 就绪" reply at execution time, but read-only commands
+            # still work.
+
+        drive_manager = DriveManager(
+            drive=drive,
+            settings=self.settings,
+            confirm_store=confirm_store,
+        )
+        bitable_manager = BitableManager(
+            client=bitable_client,
+            settings=self.settings,
+            confirm_store=confirm_store,
+        )
+
+        return DocsContext(
+            drive_manager=drive_manager,
+            bitable_manager=bitable_manager,
+            settings=self.settings,
+            sender_open_id=getattr(self, "_sender_open_id", None),
+            chat_id=getattr(self, "_chat_id", None),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Reply builders for static commands
@@ -952,6 +1115,7 @@ def _help_reply() -> CommandReply:
         "/run     — 手动触发完整流水线（采集→研究→飞书摘要）",
         "/status  — 上次运行摘要 + 信息源健康度",
         "/sources — 每个信息源的上次采集时间",
+        "/docs    — 飞书云盘管理（管理员，二次确认）",
         "",
         "每日 08:00 CST 自动运行一次完整流水线并推送飞书摘要。",
     ]

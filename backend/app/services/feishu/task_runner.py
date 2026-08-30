@@ -211,6 +211,285 @@ async def list_recent(*, limit: int = 5) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Phase 26 — /docs tree async task
+# ---------------------------------------------------------------------------
+async def submit_docs_tree_task(
+    *,
+    chat_id: str,
+    sender_open_id: str,
+    ctx: Any,  # DocsContext (avoid import cycle)
+    receive_id_type: str = "chat_id",
+    settings: Optional[Settings] = None,
+) -> TaskRecord:
+    """Schedule a background tree-walk for ``/docs tree``.
+
+    Reuses the same ``_TASKS`` dict / asyncio.Task pattern as
+    :func:`submit_pipeline_run` so ``/status`` can surface the
+    in-flight task. Walks the 4-section Drive Org tree + a Bitable
+    table snapshot, then posts a multi-card reply (split at 3 500
+    chars each) back to ``chat_id``.
+
+    The background task constructs its own :class:`FeishuAppClient`
+    so the request-scoped httpx client (which was aclose()'d in the
+    inbound event handler's finally) does NOT leak in here.
+    """
+    settings = settings or get_settings()
+    task_id = uuid.uuid4().hex[:12]
+    record = TaskRecord(
+        task_id=task_id,
+        submitted_at=_now(),
+        chat_id=chat_id,
+        sender_open_id=sender_open_id,
+        command_kind="docs_tree",
+        receive_id_type=receive_id_type,
+    )
+
+    running = await _count_running()
+    if running >= _MAX_CONCURRENT_TASKS:
+        record.status = "failed"
+        record.finished_at = _now()
+        record.error = (
+            f"too many concurrent background tasks "
+            f"({running}/{_MAX_CONCURRENT_TASKS})"
+        )
+        async with _TASKS_LOCK:
+            _TASKS[task_id] = record
+        logger.warning(
+            "feishu_docs_tree_rejected",
+            chat_id=chat_id,
+            running=running,
+        )
+        return record
+
+    async with _TASKS_LOCK:
+        _TASKS[task_id] = record
+
+    record._asyncio_task = asyncio.create_task(
+        _execute_docs_tree(record=record, ctx=ctx, settings=settings),
+        name=f"feishu-docs-tree-{task_id}",
+    )
+    record._asyncio_task.add_done_callback(_log_task_done)
+    asyncio.create_task(_gc_old_tasks())
+    logger.info(
+        "feishu_docs_tree_submitted",
+        task_id=task_id,
+        chat_id=chat_id,
+        sender=sender_open_id,
+    )
+    return record
+
+
+async def _execute_docs_tree(
+    *,
+    record: TaskRecord,
+    ctx: Any,
+    settings: Settings,
+) -> None:
+    """Run walk_tree + Bitable scan, then push a multi-card reply."""
+    from app.services.feishu.app_client import FeishuAppClient
+
+    summary: dict[str, Any] = {}
+    error_text: Optional[str] = None
+    cards: list[str] = []
+
+    try:
+        tree = await ctx.drive_manager.walk(max_depth=3)
+        cards.append(_render_tree_card(tree))
+
+        bitable_summary = await _bitable_snapshot(bitable_manager=ctx.bitable_manager)
+        cards.append(_render_bitable_card(bitable_summary))
+
+        summary = {
+            "tree": _summarise_tree(tree),
+            "bitable": bitable_summary,
+        }
+    except Exception as exc:  # noqa: BLE001 — log + surface as friendly reply
+        error_text = str(exc)
+        logger.error(
+            "feishu_docs_tree_execute_failed",
+            task_id=record.task_id,
+            error=str(exc),
+            exc_info=True,
+        )
+
+    record.finished_at = _now()
+    if error_text is None:
+        record.status = "success"
+        record.result_summary = summary
+    else:
+        record.status = "failed"
+        record.error = error_text
+        record.result_summary = summary
+
+    try:
+        await _post_docs_tree_reply(
+            record=record,
+            settings=settings,
+            cards=cards,
+            error_text=error_text,
+        )
+    except Exception as exc:  # noqa: BLE001 — never let the reply blow up the task
+        logger.error(
+            "feishu_docs_tree_reply_failed",
+            task_id=record.task_id,
+            error=str(exc),
+            exc_info=True,
+        )
+
+
+async def _post_docs_tree_reply(
+    *,
+    record: TaskRecord,
+    settings: Settings,
+    cards: list[str],
+    error_text: Optional[str],
+) -> None:
+    """Push the rendered tree cards back to the originating chat.
+
+    Builds a Feishu ``interactive`` message per card so a long
+    tree is delivered as a stacked thread instead of one
+    truncated message.
+    """
+    from app.services.feishu.app_client import FeishuAppClient
+
+    client = FeishuAppClient(settings=settings)
+    try:
+        if error_text is not None:
+            await client.send_message(
+                receive_id=record.chat_id,
+                receive_id_type=record.receive_id_type,
+                msg_type="text",
+                content={
+                    "text": (
+                        f"⚠️ /docs tree 失败\n"
+                        f"task_id: {record.task_id}\n"
+                        f"错误: {error_text[:240]}"
+                    )
+                },
+                compliance_context="feishu_docs_tree_failure",
+            )
+            return
+        if not cards:
+            await client.send_message(
+                receive_id=record.chat_id,
+                receive_id_type=record.receive_id_type,
+                msg_type="text",
+                content={"text": "🌳 树状结构为空。"},
+                compliance_context="feishu_docs_tree_empty",
+            )
+            return
+        for idx, body in enumerate(cards, start=1):
+            await client.send_message(
+                receive_id=record.chat_id,
+                receive_id_type=record.receive_id_type,
+                msg_type="interactive",
+                content={
+                    "config": {"wide_screen_mode": True},
+                    "elements": [
+                        {
+                            "tag": "div",
+                            "text": {"tag": "lark_md", "content": body},
+                        }
+                    ],
+                    "header": {
+                        "title": {
+                            "tag": "plain_text",
+                            "content": (
+                                f"🌳 /docs tree ({idx}/{len(cards)})"
+                            ),
+                        },
+                        "template": "blue",
+                    },
+                },
+                compliance_context="feishu_docs_tree_success",
+            )
+    finally:
+        await client.aclose()
+
+
+def _render_tree_card(tree: dict[str, Any]) -> str:
+    """Render the walk_tree() result as a Feishu lark_md card body."""
+    lines: list[str] = ["**📁 飞书云盘 4 段结构**", ""]
+
+    def _walk(node: dict[str, Any], depth: int = 0) -> None:
+        indent = "  " * depth
+        name = node.get("name") or "(未命名)"
+        kind = node.get("type") or "folder"
+        icon = "📁" if kind == "folder" else "📄"
+        children = node.get("children") or []
+        if depth == 0:
+            lines.append(f"{icon} **{name}** ({len(children)} 段)")
+        else:
+            lines.append(f"{indent}{icon} {name}  ({len(children)} 项)")
+        for child in children[:20]:
+            _walk(child, depth + 1)
+        if len(children) > 20:
+            lines.append(f"{indent}  …还有 {len(children) - 20} 项")
+
+    _walk(tree, depth=0)
+    return "\n".join(lines)[:3500]
+
+
+def _render_bitable_card(snapshot: dict[str, Any]) -> str:
+    """Render a Bitable snapshot as a single card body."""
+    tables = snapshot.get("tables") or []
+    if not tables:
+        return "**📋 Bitable 暂无表格**（请设置 `FEISHU_BITABLE_OPPORTUNITIES_APP_TOKEN`）"
+    lines: list[str] = [f"**📋 Bitable ({len(tables)} 个表格)**", ""]
+    for t in tables[:20]:
+        name = t.get("name") or "(未命名)"
+        tid = t.get("table_id") or ""
+        rows = t.get("sample_rows")
+        lines.append(f"📄 **{name}**  `table_id={tid[:12]}…`")
+        if rows:
+            lines.append(f"  示例行: {rows}")
+    return "\n".join(lines)[:3500]
+
+
+def _summarise_tree(tree: dict[str, Any]) -> dict[str, Any]:
+    """Compact summary used for the in-memory ``result_summary``."""
+    def _count(node: dict[str, Any]) -> int:
+        children = node.get("children") or []
+        return 1 + sum(_count(c) for c in children)
+
+    return {
+        "root_name": tree.get("name"),
+        "total_nodes": _count(tree),
+        "top_level": [
+            c.get("name") for c in (tree.get("children") or [])
+        ],
+    }
+
+
+async def _bitable_snapshot(*, bitable_manager: Any) -> dict[str, Any]:
+    """Best-effort snapshot of the configured Bitable app."""
+    try:
+        tables = await bitable_manager.list_tables()
+    except Exception as exc:  # noqa: BLE001 — degrade gracefully
+        logger.warning(
+            "feishu_docs_tree_bitable_snapshot_failed",
+            error=str(exc)[:200],
+        )
+        return {"tables": [], "error": str(exc)[:200]}
+    out: list[dict[str, Any]] = []
+    for t in tables:
+        item = {
+            "table_id": t.get("table_id") or "",
+            "name": t.get("name") or "(未命名)",
+        }
+        try:
+            rows = await bitable_manager.find_records(
+                table_id=item["table_id"], keyword="", limit=1
+            )
+            if rows:
+                item["sample_rows"] = rows[0].get("record_id")
+        except Exception:  # noqa: BLE001 — sample is optional
+            pass
+        out.append(item)
+    return {"tables": out}
+
+
+# ---------------------------------------------------------------------------
 # Internal — the actual pipeline execution + reply posting
 # ---------------------------------------------------------------------------
 async def _execute_pipeline(*, record: TaskRecord, settings: Settings) -> None:
