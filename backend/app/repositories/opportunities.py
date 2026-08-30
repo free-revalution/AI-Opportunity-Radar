@@ -30,8 +30,23 @@ class OpportunityRepository:
         category: str | None = None,
         status: str | None = None,
         min_total_score: float | None = None,
+        q: str | None = None,
+        sort: str = "total_score",
     ) -> tuple[Sequence[Opportunity], int]:
-        """Return (rows, total_count)."""
+        """Return (rows, total_count).
+
+        Phase 16D — ``q`` is a case-insensitive LIKE filter across
+        ``title / summary / category / target_user``. SQLAlchemy
+        ``.contains()`` maps to ILIKE on Postgres and LIKE on SQLite
+        so the same code works against both backends used in tests.
+
+        Phase 17D — ``sort`` accepts ``total_score`` (default, classic
+        LLM-weighted blend) or ``signal_score`` (averaged across the
+        opportunity's underlying Signal rows via
+        ``signals.raw_item_id → opportunity_sources.raw_item_id``).
+        Any other value is silently ignored — caller-side ``Query``
+        validation should reject bad values before this fires.
+        """
         base = select(Opportunity)
         count_q = select(func.count()).select_from(Opportunity)
 
@@ -44,8 +59,44 @@ class OpportunityRepository:
         if min_total_score is not None:
             base = base.where(Opportunity.total_score >= min_total_score)
             count_q = count_q.where(Opportunity.total_score >= min_total_score)
+        if q:
+            # SQLAlchemy `.contains()` is dialect-aware: Postgres emits
+            # ILIKE, SQLite emits LIKE. We OR across 4 columns and let
+            # the planner pick the cheapest index. `autoescape=True`
+            # escapes `%` / `_` in user input so the query is safe.
+            pattern = q.strip()
+            if pattern:
+                kw = f"%{pattern}%"
+                cond = (
+                    Opportunity.title.contains(kw, autoescape=True)
+                    | Opportunity.summary.contains(kw, autoescape=True)
+                    | Opportunity.category.contains(kw, autoescape=True)
+                    | Opportunity.target_user.contains(kw, autoescape=True)
+                )
+                base = base.where(cond)
+                count_q = count_q.where(cond)
 
-        base = base.order_by(Opportunity.total_score.desc(), Opportunity.id.desc())
+        if sort == "signal_score":
+            # — Aggregate AVG(Signal.signal_score) per opportunity via
+            # ``signals.raw_item_id → opportunity_sources.raw_item_id``.
+            # ``nullslast()`` keeps opportunities with zero signals at
+            # the bottom rather than scattering them.
+            from app.models import OpportunitySource, Signal
+
+            sig_avg = (
+                select(func.avg(Signal.signal_score).label("avg_sig"))
+                .select_from(Signal)
+                .join(
+                    OpportunitySource,
+                    OpportunitySource.raw_item_id == Signal.raw_item_id,
+                )
+                .where(OpportunitySource.opportunity_id == Opportunity.id)
+                .scalar_subquery()
+            )
+            base = base.order_by(sig_avg.desc().nullslast(), Opportunity.id.desc())
+        else:
+            # — Default: classic total_score (Phase 1–16 behaviour).
+            base = base.order_by(Opportunity.total_score.desc(), Opportunity.id.desc())
         base = base.limit(limit).offset(offset)
 
         result = await self.session.execute(base)

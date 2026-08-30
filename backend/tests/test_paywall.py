@@ -76,11 +76,11 @@ class TestFreeTier:
     async def test_second_today_denied(self, client, fake_redis):
         from app.services.subscriptions.paywall import (
             check_access,
-            record_consumption,
+            record_view_top_signals,
         )
 
-        # Burn the free quota
-        await record_consumption(fake_redis, "ou_free", "view_top_signals")
+        # Burn the free quota with one distinct signal ID
+        await record_view_top_signals(fake_redis, "ou_free", [101])
         async with client.sessionmaker() as session:  # type: ignore[attr-defined]
             v = await check_access(
                 session, "ou_free", "today", redis_client=fake_redis
@@ -116,7 +116,7 @@ class TestPaidTiers:
     async def test_basic_over_quota_denied(self, client, fake_redis):
         from app.services.subscriptions.paywall import (
             check_access,
-            record_consumption,
+            record_view_top_signals,
         )
 
         await _seed_subscription(
@@ -124,8 +124,10 @@ class TestPaidTiers:
             feishu_open_id="ou_b",
             plan="basic",
         )
-        for _ in range(5):
-            await record_consumption(fake_redis, "ou_b", "view_top_signals")
+        # 5 distinct signal IDs (basic plan daily_signals = 5)
+        await record_view_top_signals(
+            fake_redis, "ou_b", [101, 102, 103, 104, 105]
+        )
         async with client.sessionmaker() as session:  # type: ignore[attr-defined]
             v = await check_access(
                 session, "ou_b", "today", redis_client=fake_redis
@@ -138,7 +140,7 @@ class TestPaidTiers:
     async def test_pro_within_quota(self, client, fake_redis):
         from app.services.subscriptions.paywall import (
             check_access,
-            record_consumption,
+            record_view_top_signals,
         )
 
         await _seed_subscription(
@@ -146,8 +148,7 @@ class TestPaidTiers:
             feishu_open_id="ou_p",
             plan="pro",
         )
-        for _ in range(19):
-            await record_consumption(fake_redis, "ou_p", "view_top_signals")
+        await record_view_top_signals(fake_redis, "ou_p", list(range(1, 20)))
         async with client.sessionmaker() as session:  # type: ignore[attr-defined]
             v = await check_access(
                 session, "ou_p", "today", redis_client=fake_redis
@@ -158,7 +159,7 @@ class TestPaidTiers:
     async def test_pro_over_quota_denied(self, client, fake_redis):
         from app.services.subscriptions.paywall import (
             check_access,
-            record_consumption,
+            record_view_top_signals,
         )
 
         await _seed_subscription(
@@ -166,8 +167,7 @@ class TestPaidTiers:
             feishu_open_id="ou_p",
             plan="pro",
         )
-        for _ in range(20):
-            await record_consumption(fake_redis, "ou_p", "view_top_signals")
+        await record_view_top_signals(fake_redis, "ou_p", list(range(1, 21)))
         async with client.sessionmaker() as session:  # type: ignore[attr-defined]
             v = await check_access(
                 session, "ou_p", "today", redis_client=fake_redis
@@ -180,7 +180,7 @@ class TestPaidTiers:
         """Creator tier is essentially unlimited — 10**9."""
         from app.services.subscriptions.paywall import (
             check_access,
-            record_consumption,
+            record_view_top_signals,
         )
 
         await _seed_subscription(
@@ -188,8 +188,7 @@ class TestPaidTiers:
             feishu_open_id="ou_c",
             plan="creator",
         )
-        for _ in range(1000):
-            await record_consumption(fake_redis, "ou_c", "view_top_signals")
+        await record_view_top_signals(fake_redis, "ou_c", list(range(1, 1001)))
         async with client.sessionmaker() as session:  # type: ignore[attr-defined]
             v = await check_access(
                 session, "ou_c", "today", redis_client=fake_redis
@@ -206,7 +205,7 @@ class TestEdgeCases:
     async def test_expired_subscription_falls_back_to_free(self, client, fake_redis):
         from app.services.subscriptions.paywall import (
             check_access,
-            record_consumption,
+            record_view_top_signals,
         )
 
         # Expired pro subscription
@@ -217,7 +216,7 @@ class TestEdgeCases:
             status="active",  # status says active, but expires_at < now
             expires_at=datetime.now(tz=timezone.utc) - timedelta(days=1),
         )
-        await record_consumption(fake_redis, "ou_expired", "view_top_signals")
+        await record_view_top_signals(fake_redis, "ou_expired", [999])
         async with client.sessionmaker() as session:  # type: ignore[attr-defined]
             v = await check_access(
                 session,
@@ -318,7 +317,7 @@ class TestQuotaBuckets:
         """A user burning their /today quota must NOT lock out /research."""
         from app.services.subscriptions.paywall import (
             check_access,
-            record_consumption,
+            record_view_top_signals,
         )
 
         await _seed_subscription(
@@ -326,9 +325,10 @@ class TestQuotaBuckets:
             feishu_open_id="ou_mix",
             plan="basic",
         )
-        # Burn /today
-        for _ in range(5):
-            await record_consumption(fake_redis, "ou_mix", "view_top_signals")
+        # Burn /today with 5 distinct IDs
+        await record_view_top_signals(
+            fake_redis, "ou_mix", [11, 22, 33, 44, 55]
+        )
         # /research still allowed (basic has 1/day, not yet used)
         async with client.sessionmaker() as session:  # type: ignore[attr-defined]
             r = await check_access(
@@ -357,10 +357,147 @@ class TestRecordConsumption:
         assert fake_redis.snapshot() == {}
 
     async def test_record_consumption_increments_correct_key(self, fake_redis):
+        """`research` (and `content_full`) still go through the legacy
+        INCR path — Phase 16 only moved ``view_top_signals`` to SADD."""
         from app.services.subscriptions.paywall import record_consumption
 
-        await record_consumption(fake_redis, "ou_k", "view_top_signals")
-        await record_consumption(fake_redis, "ou_k", "view_top_signals")
+        await record_consumption(fake_redis, "ou_k", "research")
+        await record_consumption(fake_redis, "ou_k", "research")
         snap = fake_redis.snapshot()
         assert len(snap) == 1
         assert int(next(iter(snap.values()))) == 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 16 — distinct-signal quota (SADD-based)
+# ---------------------------------------------------------------------------
+class TestDistinctQuota:
+    """doc §47 — Free 每天 1 个公开 Signal / Basic 5 / Pro 10~20.
+
+    Phase 16 implements this with SADD distinct-IDs instead of INCR
+    command-counting. Free user `/today` 第二次必须返 deny,而不是依然
+    返 Top 10 但 INCR=2.
+    """
+
+    async def test_view_top_signals_distinct_ids(self, fake_redis):
+        """SADD 5 distinct IDs → SCARD == 5."""
+        from app.services.subscriptions.paywall import (
+            peek_view_top_signals_count,
+            record_view_top_signals,
+        )
+
+        await record_view_top_signals(fake_redis, "ou_d", [1, 2, 3, 4, 5])
+        used = await peek_view_top_signals_count(fake_redis, "ou_d")
+        assert used == 5
+
+    async def test_view_top_signals_idempotent_sadd(self, fake_redis):
+        """SADD same ID twice → SCARD still 1 (no double-charge)."""
+        from app.services.subscriptions.paywall import (
+            peek_view_top_signals_count,
+            record_view_top_signals,
+        )
+
+        await record_view_top_signals(fake_redis, "ou_d", [42])
+        await record_view_top_signals(fake_redis, "ou_d", [42])
+        await record_view_top_signals(fake_redis, "ou_d", [42, 42])
+        used = await peek_view_top_signals_count(fake_redis, "ou_d")
+        assert used == 1
+
+    async def test_view_top_signals_ignores_unknown_ids(self, fake_redis):
+        """Empty ID list is a no-op (returns 0, no Redis write)."""
+        from app.services.subscriptions.paywall import record_view_top_signals
+
+        added = await record_view_top_signals(fake_redis, "ou_d", [])
+        assert added == 0
+        assert fake_redis.snapshot_sets() == {}
+
+    async def test_view_top_signals_returns_zero_when_missing(self, fake_redis):
+        """First-time peek on a brand-new open_id → 0 (not 1, not raise)."""
+        from app.services.subscriptions.paywall import peek_view_top_signals_count
+
+        used = await peek_view_top_signals_count(fake_redis, "ou_brand_new")
+        assert used == 0
+
+    async def test_view_top_signals_returns_zero_when_redis_none(self):
+        """Redis client missing → fail-open (0)."""
+        from app.services.subscriptions.paywall import (
+            peek_view_top_signals_count,
+            record_view_top_signals,
+        )
+
+        assert await peek_view_top_signals_count(None, "ou_x") == 0
+        assert await record_view_top_signals(None, "ou_x", [1, 2]) == 0
+
+    async def test_view_top_signals_record_returns_post_add_count(self, fake_redis):
+        """`record_view_top_signals` returns the post-add SCARD so
+        callers can show "used N / limit M" without a second round-trip."""
+        from app.services.subscriptions.paywall import record_view_top_signals
+
+        n1 = await record_view_top_signals(fake_redis, "ou_d", [1])
+        assert n1 == 1
+        n2 = await record_view_top_signals(fake_redis, "ou_d", [1, 2, 3])
+        assert n2 == 3
+
+    async def test_view_top_signals_truncate_to_remaining_in_check_access(
+        self, client, fake_redis
+    ):
+        """Free user + 1 already-seen distinct ID → 2nd /today is denied."""
+        from app.services.subscriptions.paywall import (
+            check_access,
+            record_view_top_signals,
+        )
+
+        await record_view_top_signals(fake_redis, "ou_d", [101])
+        async with client.sessionmaker() as session:  # type: ignore[attr-defined]
+            v = await check_access(
+                session, "ou_d", "today", redis_client=fake_redis
+            )
+        assert v.allowed is False
+        assert v.plan == "free"
+        assert v.quota_used == 1
+        assert v.quota_limit == 1
+        assert v.deny_reason == "quota_exceeded"
+
+    async def test_view_top_signals_research_still_uses_incr(
+        self, client, fake_redis
+    ):
+        """`research` quota is a command-call count, not distinct IDs —
+        the INCR path must remain unchanged after the Phase 16 split."""
+        from app.services.subscriptions.paywall import (
+            check_access,
+            record_consumption,
+        )
+
+        await _seed_subscription(
+            client.sessionmaker,  # type: ignore[attr-defined]
+            feishu_open_id="ou_dual",
+            plan="basic",
+        )
+        await record_consumption(fake_redis, "ou_dual", "research")
+        async with client.sessionmaker() as session:  # type: ignore[attr-defined]
+            v = await check_access(
+                session, "ou_dual", "research", redis_client=fake_redis
+            )
+        # Basic plan has research_requests=1/day; 1 used → quota full.
+        assert v.quota_type == "research"
+        assert v.quota_used == 1
+        assert v.quota_limit == 1
+
+    async def test_view_top_signals_writes_to_set_bucket_not_string(
+        self, fake_redis
+    ):
+        """The SCARD/INCR families must not collide — Phase 16 keeps
+        `view_top_signals` keys as Redis SETs while `research` and
+        `content_full` stay as STRING/INCR."""
+        from app.services.subscriptions.paywall import record_view_top_signals
+
+        await record_view_top_signals(fake_redis, "ou_kinds", [1, 2, 3])
+        sets = fake_redis.snapshot_sets()
+        strings = fake_redis.snapshot()
+        # SET bucket holds the distinct-IDs record
+        assert sets and any(
+            k.endswith(":ou_kinds:20260829") or "ou_kinds" in k for k in sets
+        )
+        # STRING bucket is untouched by record_view_top_signals
+        assert strings == {}
+

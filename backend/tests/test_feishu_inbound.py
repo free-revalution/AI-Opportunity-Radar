@@ -638,3 +638,101 @@ def test_feishu_endpoint_rejects_invalid_json(feishu_client):
         headers={"Content-Type": "application/json"},
     )
     assert response.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Phase 16E — distinct-signal SADD behaviour for /today / /top
+# ---------------------------------------------------------------------------
+async def test_router_today_sadds_distinct_ids(fake_redis):
+    """`/today` writes the shown signal IDs into a per-day Redis SET
+    so a second `/today` (or `/top`) does not re-bill the same signal."""
+    router = _make_router(_opportunities_handler)
+    router._sender_open_id = "ou_today_sadd"
+    router._redis = fake_redis
+    reply = await router.route(BotCommand(kind="today", args=""))
+    assert reply.metadata["view_top_signals_recorded"] is True
+
+    from app.services.subscriptions.paywall import (
+        peek_view_top_signals_count,
+    )
+    used = await peek_view_top_signals_count(fake_redis, "ou_today_sadd")
+    assert used == 2  # _opportunities_handler returns 2 items
+
+
+async def test_router_top_sadds_distinct_ids(fake_redis):
+    router = _make_router(_opportunities_handler)
+    router._sender_open_id = "ou_top_sadd"
+    router._redis = fake_redis
+    reply = await router.route(BotCommand(kind="top", args=""))
+    assert reply.metadata["view_top_signals_recorded"] is True
+
+    from app.services.subscriptions.paywall import (
+        peek_view_top_signals_count,
+    )
+    used = await peek_view_top_signals_count(fake_redis, "ou_top_sadd")
+    assert used == 2
+
+
+async def test_router_today_today_dedupes_across_calls(fake_redis):
+    """Same `/today` called twice → SCARD stays at 2 (not 4) because
+    SADD is idempotent for already-present IDs."""
+    router = _make_router(_opportunities_handler)
+    router._sender_open_id = "ou_dedup"
+    router._redis = fake_redis
+    await router.route(BotCommand(kind="today", args=""))
+    await router.route(BotCommand(kind="today", args=""))
+
+    from app.services.subscriptions.paywall import (
+        peek_view_top_signals_count,
+    )
+    used = await peek_view_top_signals_count(fake_redis, "ou_dedup")
+    assert used == 2
+
+
+async def test_router_today_quota_exhausted_returns_deny(monkeypatch):
+    """`/today` peeks the residual quota from `_last_verdict`. When
+    `quota_used == quota_limit`, the handler short-circuits with a
+    denial message."""
+    from app.services.feishu import inbound as inbound_module
+    from app.services.subscriptions.paywall import PaywallVerdict
+
+    async def _free_used_up(*, command, redis_client, sender_open_id):
+        return PaywallVerdict(
+            allowed=True,  # paywall passes — the *handler* denies
+            plan="free",
+            quota_type="view_top_signals",
+            quota_limit=1,
+            quota_used=1,
+        )
+
+    monkeypatch.setattr(
+        inbound_module, "_paywall_check", _free_used_up
+    )
+    router = _make_router(_opportunities_handler)
+    reply = await router.route(BotCommand(kind="today", args=""))
+    assert "额度已用完" in reply.text
+    assert reply.metadata.get("denied") is True
+
+
+async def test_router_search_alias_recognised():
+    """Phase 16E — ALK has `/搜索` as a `/search` alias."""
+    from app.services.feishu.inbound import parse_command
+
+    assert parse_command("/search AI").kind == "search"
+    assert parse_command("/搜索 AI").kind == "search"
+
+
+async def test_router_content_alias_recognised():
+    from app.services.feishu.inbound import parse_command
+
+    assert parse_command("/content 42").kind == "content"
+    assert parse_command("/内容 42").kind == "content"
+
+
+async def test_router_help_includes_content():
+    router = _make_router(_opportunities_handler)
+    reply = await router.route(BotCommand(kind="help"))
+    assert "/content" in reply.text
+    assert "/search" in reply.text
+    # The "Phase 16 上线" placeholder must be gone.
+    assert "Phase 16" not in reply.text

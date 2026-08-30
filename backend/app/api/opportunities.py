@@ -98,11 +98,19 @@ def _demo_to_response(d: dict[str, Any]) -> OpportunityResponse:
 
 
 async def _list_from_db(
-    session: AsyncSession, *, limit: int, offset: int, category: str | None
+    session: AsyncSession,
+    *,
+    limit: int,
+    offset: int,
+    category: str | None,
+    q: str | None,
+    sort: str,
 ) -> tuple[list[OpportunityResponse], int] | None:
     repo = OpportunityRepository(session)
     try:
-        rows, total = await repo.list_paginated(limit=limit, offset=offset, category=category)
+        rows, total = await repo.list_paginated(
+            limit=limit, offset=offset, category=category, q=q, sort=sort,
+        )
     except Exception:
         return None
     if not rows and total == 0 and offset == 0:
@@ -135,10 +143,31 @@ async def _list_from_db(
     return items, total
 
 
-async def _list_from_demo(*, limit: int, offset: int, category: str | None) -> tuple[list[OpportunityResponse], int]:
+async def _list_from_demo(
+    *,
+    limit: int,
+    offset: int,
+    category: str | None,
+    q: str | None,
+    sort: str,
+) -> tuple[list[OpportunityResponse], int]:
+    # Phase 17 — demo entries have no Signal rows so the
+    # signal_score subquery is always NULL for them; the demo path
+    # sorts by total_score regardless of the requested sort key. Real
+    # DB queries get the proper subquery ordering.
     items = _DEMO_OPPORTUNITIES
     if category:
         items = [o for o in items if (o.get("category") or "").lower() == category.lower()]
+    if q:
+        pattern = q.strip().lower()
+        if pattern:
+            items = [
+                o for o in items
+                if any(
+                    pattern in (o.get(field) or "").lower()
+                    for field in ("title", "summary", "category", "target_user")
+                )
+            ]
     page = items[offset : offset + limit]
     return [_demo_to_response(o) for o in page], len(items)
 
@@ -148,11 +177,34 @@ async def list_opportunities(
     limit: int = Query(20, ge=1, le=200),
     offset: int = Query(0, ge=0),
     category: str | None = Query(None, description="Filter by category"),
+    q: str | None = Query(
+        None,
+        description="Phase 16D — keyword filter (title / summary / category / target_user)",
+    ),
+    sort: str = Query(
+        "total_score",
+        pattern="^(total_score|signal_score)$",
+        description=(
+            "Phase 17D — sort key. "
+            "'total_score' = classic LLM blend (default). "
+            "'signal_score' = AVG(signal.signal_score) across "
+            "all signals linked to the opportunity."
+        ),
+    ),
     session: AsyncSession = Depends(get_session),
 ) -> OpportunityListResponse:
-    db_result = await _list_from_db(session, limit=limit, offset=offset, category=category)
+    db_result = await _list_from_db(
+        session,
+        limit=limit,
+        offset=offset,
+        category=category,
+        q=q,
+        sort=sort,
+    )
     if db_result is None:
-        items, total = await _list_from_demo(limit=limit, offset=offset, category=category)
+        items, total = await _list_from_demo(
+            limit=limit, offset=offset, category=category, q=q, sort=sort,
+        )
     else:
         items, total = db_result
 

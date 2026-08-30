@@ -18,6 +18,7 @@ from app.api.notifications import router as notifications_router
 from app.api.opportunities import router as opportunities_router
 from app.api.readiness import router as readiness_router
 from app.api.research import router as research_router
+from app.api.signals import router as signals_router
 from app.api.sources import router as sources_router
 from app.api.trends import router as trends_router
 from app.config import get_settings
@@ -87,6 +88,8 @@ def create_app() -> FastAPI:
     app.include_router(opportunities_router, prefix="/api", tags=["opportunities"])
     app.include_router(research_router, prefix="/api", tags=["research"])
     app.include_router(notifications_router, prefix="/api", tags=["notifications"])
+    # Phase 17 — admin Content Center browses signals via webhook auth.
+    app.include_router(signals_router, prefix="/api", tags=["signals"])
     app.include_router(sources_router, prefix="/api", tags=["sources"])
     app.include_router(trends_router, prefix="/api", tags=["trends"])
     app.include_router(metrics_router, prefix="/api", tags=["metrics"])

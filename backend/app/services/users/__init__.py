@@ -294,9 +294,46 @@ __all__ = [
     "ALLOWED_KEYS",
     "PREFERENCE_KEY_TO_COLUMN",
     "apply_preference",
+    "build_vertical_context_for_open_id",
     "get_or_create_user_by_feishu",
     "render_preferences_zh",
     "reset_preferences",
     "update_subscription_mirror",
     "validate_preference",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Phase 16C — vertical context bridge
+# ---------------------------------------------------------------------------
+async def build_vertical_context_for_open_id(
+    session: AsyncSession,
+    feishu_open_id: str,
+) -> Any:
+    """Look up (or auto-create) the User row for ``feishu_open_id`` and
+    build a :class:`VerticalContext` from its preference columns.
+
+    Phase 16 wires the ContentRadarAgent into the Feishu handlers
+    (``/today``, ``/search``, ``/content``), which means each handler
+    needs a `VerticalContext` for the sender. Lazy-upserting a User
+    row is the right default — a brand-new Feishu user who runs
+    ``/content 42`` before ever running ``/preferences`` still gets a
+    well-formed context (with the defaults from `agents/base.py`).
+
+    The upsert is committed at the end so the row is durable — the
+    caller doesn't have to worry about it. Pass an explicit
+    ``commit=False`` only if you're composing this with a larger
+    transaction.
+
+    Note: the return type is intentionally `Any` because we import
+    `VerticalContext` lazily to avoid a circular import
+    (`agents.context` → `User` → `services.users`).
+    """
+    user = await get_or_create_user_by_feishu(
+        session, feishu_open_id, commit=True
+    )
+    # Lazy import — `agents.context` imports `User`, which would
+    # cycle through `services.users` if pulled at module load.
+    from app.services.agents.context import build_vertical_context
+
+    return build_vertical_context(user, sender_open_id=feishu_open_id)

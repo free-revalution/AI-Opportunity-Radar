@@ -257,6 +257,7 @@ class BotCommand:
         "table",
         "activate",
         "search",
+        "content",
         "preferences",
         "unknown",
     ]
@@ -290,6 +291,9 @@ _COMMAND_ALK: dict[str, str] = {
     "/搜索": "search",
     "/preferences": "preferences",
     "/偏好": "preferences",
+    # — Phase 16 — content brief generator (ContentRadarAgent V2)
+    "/content": "content",
+    "/内容": "content",
 }
 
 
@@ -399,14 +403,22 @@ class FeishuCommandRouter:
     Reuses every existing endpoint — zero business-logic duplication:
 
       `/today`    → GET /api/opportunities (?window_hours=24)
+                    + SADD distinct IDs (Phase 16 — view_top_signals).
       `/top`      → GET /api/opportunities
+                    + SADD distinct IDs (Phase 16 — view_top_signals).
+      `/search`   → GET /api/opportunities?q=<kw>
+                    + SADD distinct IDs (Phase 16 — view_top_signals).
       `/research` → POST /api/internal/research/on_demand
+                    + INCR research counter (legacy Phase 15 path).
       `/refresh`  → POST /api/internal/discovery/run
       `/score`    → POST /api/internal/scoring/run
       `/daily`    → POST /api/internal/notifications/digest/send
       `/report`   → GET /api/internal/research/on_demand/{id}
                     + Drive Docx import (Phase 7)
       `/table`    → GET /api/opportunities + Bitable bulk insert (Phase 7)
+      `/content`  → GET /api/opportunities/{id}
+                    + ContentRadarAgent.analyze() (Phase 16)
+                    + INCR content_full counter (legacy Phase 15 path).
 
     The webhook secret is read from `APP_SECRET_KEY` / `RADAR_WEBHOOK_SECRET`
     — the same one used by n8n cron workflows.
@@ -504,10 +516,20 @@ class FeishuCommandRouter:
         finally:
             if owns_client:
                 await client.aclose()
+        # Phase 16 — always include ``_status`` in the returned dict so
+        # downstream handlers can detect 4xx / 5xx without re-issuing
+        # the request. For non-JSON bodies we fall back to a textual
+        # envelope.
+        if not response.content:
+            return {"_status": response.status_code}
         try:
-            return response.json() if response.content else {}
+            payload = response.json()
         except ValueError:
             return {"_status": response.status_code, "_text": response.text}
+        if not isinstance(payload, dict):
+            return {"_status": response.status_code, "_value": payload}
+        payload.setdefault("_status", response.status_code)
+        return payload
 
     async def route(self, command: BotCommand) -> CommandReply:
         """Dispatch a parsed command and return the reply.
@@ -518,6 +540,15 @@ class FeishuCommandRouter:
         ``COMMAND_TO_FEATURE`` (``help`` / ``activate`` / ``preferences``
         / ``refresh`` / ``score``) bypass paywall — they're either free
         metadata commands or admin-style operations.
+
+        Phase 16 — ``view_top_signals`` quota is SADD-distinct, so the
+        paywall's INCR-based ``record_consumption`` doesn't fit. We
+        stash the verdict on ``self._last_verdict`` for the handler to
+        read the *residual quota*, and let the handler call
+        ``record_view_top_signals(redis, open_id, [id1, id2, ...])``
+        with the *actual* IDs we ended up showing. ``research`` and
+        ``content_full`` keep the legacy INCR path because they count
+        "1 piece per call", not distinct IDs.
         """
         # — Static / metadata commands bypass paywall entirely.
         if command.kind == "help":
@@ -525,6 +556,7 @@ class FeishuCommandRouter:
 
         # — Phase 15C v2.0: paywall gate for quota-gated commands.
         quota_type = _command_quota_type(command.kind)
+        verdict = None
         if quota_type is not None:
             verdict = await _paywall_check(
                 command=command,
@@ -533,6 +565,8 @@ class FeishuCommandRouter:
             )
             if not verdict.allowed:
                 return _paywall_deny_reply(verdict)
+        # Stash so handlers can compute "how many more can I show?"
+        self._last_verdict = verdict
 
         # — Dispatch
         if command.kind == "today":
@@ -555,6 +589,8 @@ class FeishuCommandRouter:
             reply = await self._activate(command.args)
         elif command.kind == "search":
             reply = await self._search(command.args)
+        elif command.kind == "content":
+            reply = await self._content(command.args)
         elif command.kind == "preferences":
             reply = await self._preferences(command.args)
         else:
@@ -564,35 +600,60 @@ class FeishuCommandRouter:
         # paywall-gated dispatch. Errors / denials don't consume quota
         # (handler set ``metadata["error"]`` or the deny branch already
         # short-circuited above).
-        if quota_type is not None and not reply.metadata.get("error"):
-            await _paywall_record(
-                redis_client=self._redis,
-                sender_open_id=getattr(self, "_sender_open_id", None),
-                quota_type=quota_type,
-            )
-
+        #
+        # Phase 16 — view_top_signals is SADD-distinct; the handler
+        # already wrote the actual shown IDs via
+        # ``record_view_top_signals``. Skip the legacy INCR fallback so
+        # we don't double-count.
+        if (
+            quota_type == "view_top_signals"
+            or reply.metadata.get("error")
+            or quota_type is None
+        ):
+            return reply
+        await _paywall_record(
+            redis_client=self._redis,
+            sender_open_id=getattr(self, "_sender_open_id", None),
+            quota_type=quota_type,
+        )
         return reply
 
     # ------------------------------------------------------------------
     # Command handlers
     # ------------------------------------------------------------------
     async def _today(self, args: str) -> CommandReply:
-        # — call the existing opportunities endpoint. The default
-        # `/api/opportunities` returns all-time top; we keep it simple
-        # here and let the UI's filter handle the window. Phase 6.x
-        # could add a `window_hours` query param.
+        """`/today` — Phase 16 distinct-signal SADD edition.
+
+        Reads the residual quota from ``self._last_verdict`` (set by
+        ``route()`` after the paywall check), fetches ``residual+5``
+        items to leave headroom, truncates to ``residual``, and SADD
+        the IDs that the user actually sees. Free user with quota=1
+        sees 1 signal; Pro user with quota=20 sees 20.
+        """
         _ = args
-        data = await self._get("/api/opportunities?limit=10")
+        residual, sender_open_id = self._residual_and_sender()
+        if residual == 0:
+            return CommandReply(
+                text="⏰ 今日信号额度已用完。",
+                metadata={"command": "today", "denied": True},
+            )
+        fetch_n = (residual if residual is not None else 10) + 5
+        data = await self._get(f"/api/opportunities?limit={fetch_n}")
         items = data.get("items") if isinstance(data, dict) else None
         if not items:
             return CommandReply(
                 text="今日暂无新机会。明天再看看 👀",
                 metadata={"command": "today", "items_count": 0},
             )
+        if residual is not None:
+            items = items[:residual]
+        # SADD the actually-shown IDs (Phase 16 — distinct quota).
+        ids = [o.get("id") for o in items if o.get("id") is not None]
+        recorded = await self._record_signal_ids(sender_open_id, ids)
         # — render as plain text (Feishu lark_md). Card rendering is
         # reserved for Phase 7 knowledge-base replies.
-        lines = ["**🔥 AI 机会雷达 · 今日 Top 10**", ""]
-        for idx, opp in enumerate(items[:10], start=1):
+        lines = ["**🔥 AI 机会雷达 · 今日 Top 信号**", ""]
+        for idx, opp in enumerate(items, start=1):
             score = float(opp.get("total_score") or 0)
             title = opp.get("title") or "(无标题)"
             url = f"{self.public_base_url}/opportunities/{opp.get('id')}"
@@ -600,23 +661,89 @@ class FeishuCommandRouter:
             lines.append(f"   [查看详情]({url})")
         return CommandReply(
             text="\n".join(lines),
-            metadata={"command": "today", "items_count": len(items)},
+            metadata={
+                "command": "today",
+                "items_count": len(items),
+                "view_top_signals_recorded": recorded,
+            },
         )
 
     async def _top(self, args: str) -> CommandReply:
+        """`/top` — Phase 16 distinct-signal SADD edition.
+
+        Same pattern as ``/today`` — the residual quota is shared, so a
+        user who used their daily quota on ``/today`` gets nothing
+        from ``/top`` and vice versa. SADD deduplicates across both.
+        """
         _ = args
-        data = await self._get("/api/opportunities?limit=10")
+        residual, sender_open_id = self._residual_and_sender()
+        if residual == 0:
+            return CommandReply(
+                text="⏰ 今日信号额度已用完。",
+                metadata={"command": "top", "denied": True},
+            )
+        fetch_n = (residual if residual is not None else 10) + 5
+        data = await self._get(f"/api/opportunities?limit={fetch_n}")
         items = data.get("items") if isinstance(data, dict) else None
         if not items:
             return CommandReply(text="数据库里还没有机会。")
-        lines = ["**🏆 历史 Top 10 机会**", ""]
-        for idx, opp in enumerate(items[:10], start=1):
+        if residual is not None:
+            items = items[:residual]
+        ids = [o.get("id") for o in items if o.get("id") is not None]
+        recorded = await self._record_signal_ids(sender_open_id, ids)
+        lines = ["**🏆 历史 Top 机会**", ""]
+        for idx, opp in enumerate(items, start=1):
             score = float(opp.get("total_score") or 0)
             title = opp.get("title") or "(无标题)"
             url = f"{self.public_base_url}/opportunities/{opp.get('id')}"
-            lines.append(f"{idx}. {title} — ⭐ {int(round(score))}")
+            lines.append(f"{idx}. **{title}** — ⭐ {int(round(score))}")
             lines.append(f"   [查看详情]({url})")
-        return CommandReply(text="\n".join(lines))
+        return CommandReply(
+            text="\n".join(lines),
+            metadata={
+                "command": "top",
+                "items_count": len(items),
+                "view_top_signals_recorded": recorded,
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 16 — view_top_signals SADD helpers
+    # ------------------------------------------------------------------
+    def _residual_and_sender(self) -> tuple[int | None, str]:
+        """Compute residual view_top_signals quota + sender_open_id.
+
+        Returns (residual, sender_open_id). ``residual`` is None when
+        the command bypassed paywall (``/today`` and ``/top`` are
+        always gated, so this only fires for tests that bypass).
+        """
+        sender_open_id = getattr(self, "_sender_open_id", None) or ""
+        verdict = getattr(self, "_last_verdict", None)
+        if (
+            verdict is None
+            or getattr(verdict, "quota_type", None) != "view_top_signals"
+        ):
+            return None, sender_open_id
+        residual = max(0, int(verdict.quota_limit) - int(verdict.quota_used))
+        return residual, sender_open_id
+
+    async def _record_signal_ids(
+        self, sender_open_id: str, signal_ids: list[Any]
+    ) -> bool:
+        """SADD ``signal_ids`` to the per-day distinct-quota set.
+
+        Returns True when at least one ID was recorded (or the caller
+        is anonymous / no Redis — both are no-ops). False means we
+        didn't touch Redis.
+        """
+        if not sender_open_id or not signal_ids or self._redis is None:
+            return False
+        # Lazy import keeps the module import-graph tiny for tests
+        # that never call ``route()``.
+        from app.services.subscriptions.paywall import record_view_top_signals
+
+        await record_view_top_signals(self._redis, sender_open_id, signal_ids)
+        return True
 
     async def _research(self, args: str) -> CommandReply:
         topic = args.strip()
@@ -922,27 +1049,280 @@ class FeishuCommandRouter:
         )
 
     async def _search(self, args: str) -> CommandReply:
-        """`/search <query>` — Phase 15C v2.0 stub.
+        """`/search <query>` — Phase 16 real implementation.
 
-        The real search interface (likely calling the LLM with a
-        constrained prompt + content_search index) lands in Phase 16.
-        Until then we tell the user what's coming and consume one
-        ``view_top_signals`` quota slot — same as ``/today`` because
-        that's roughly what we'll bill it as once live.
+        Calls ``/api/opportunities?q=<kw>`` (the SQL-LIKE filter added
+        in 16D) and applies the same distinct-signal SADD quota as
+        ``/today`` / ``/top``. The quota bucket is shared — a user who
+        already burned their quota on ``/today`` is denied here too.
         """
+        from urllib.parse import quote_plus
+
         query = (args or "").strip()
         if not query:
             return CommandReply(
                 text="用法:`/search <关键词>`\n例如:`/search AI 法律合同审核`",
                 metadata={"command": "search", "error": "missing_query"},
             )
-        return CommandReply(
-            text=(
-                "🔍 搜索功能开发中,Phase 16 上线。\n"
-                "当前可用:`/today` / `/top` / `/research` / `/report`。"
-            ),
-            metadata={"command": "search", "query": query, "stub": True},
+
+        residual, sender_open_id = self._residual_and_sender()
+        if residual == 0:
+            return CommandReply(
+                text="⏰ 今日信号额度已用完。",
+                metadata={"command": "search", "denied": True, "query": query},
+            )
+
+        fetch_n = (residual if residual is not None else 20) + 5
+        # `quote_plus` URL-encodes spaces + CJK + special chars so the
+        # query lands in FastAPI's `q` Query parameter intact.
+        encoded = quote_plus(query)
+        data = await self._get(
+            f"/api/opportunities?q={encoded}&limit={fetch_n}"
         )
+        items = data.get("items") if isinstance(data, dict) else None
+        if not items:
+            return CommandReply(
+                text=(
+                    f"🔍 没找到匹配「{query}」的机会。\n"
+                    f"试试 `/today` 或 `/top` 看看其他热门。"
+                ),
+                metadata={
+                    "command": "search",
+                    "query": query,
+                    "items_count": 0,
+                },
+            )
+        if residual is not None:
+            items = items[:residual]
+        ids = [o.get("id") for o in items if o.get("id") is not None]
+        recorded = await self._record_signal_ids(sender_open_id, ids)
+
+        lines = [f"**🔍 搜索结果 · `{query}`**", ""]
+        for idx, opp in enumerate(items, start=1):
+            score = float(opp.get("total_score") or 0)
+            title = opp.get("title") or "(无标题)"
+            url = f"{self.public_base_url}/opportunities/{opp.get('id')}"
+            lines.append(f"{idx}. **{title}** — ⭐ {int(round(score))}")
+            lines.append(f"   [查看详情]({url})")
+        return CommandReply(
+            text="\n".join(lines),
+            metadata={
+                "command": "search",
+                "query": query,
+                "items_count": len(items),
+                "view_top_signals_recorded": recorded,
+            },
+        )
+
+    async def _content(self, args: str) -> CommandReply:
+        """`/content <opportunity_id>` — Phase 16 ContentRadarAgent V2 +
+        Phase 17 compliance gate + persistence.
+
+        Builds a :class:`VerticalContext` from the sender's User
+        preferences (Phase 15A columns), hands the opportunity detail
+        to ``ContentRadarAgent.analyze()``, runs the rendered lark_md
+        through ``ComplianceService.check_content``, appends a warning
+        when the verdict is denied, then persists the row to
+        ``content_opportunities`` for the admin Content Center.
+
+        ``content_full`` quota is INCR-based (one piece per call) so
+        ``route()`` records consumption via the legacy
+        ``record_consumption`` path — this handler does NOT call
+        ``record_view_top_signals``.
+        """
+        sig_id_str = (args or "").strip()
+        if not sig_id_str.isdigit():
+            return CommandReply(
+                text=(
+                    "用法:`/content <opportunity_id>`\n"
+                    "例如:`/content 42`"
+                ),
+                metadata={"command": "content", "error": "bad_args"},
+            )
+        sig_id = int(sig_id_str)
+        detail = await self._get(f"/api/opportunities/{sig_id}")
+        if detail.get("_status", 200) >= 400:
+            return CommandReply(
+                text=f"❌ 信号 #{sig_id} 找不到。",
+                metadata={
+                    "command": "content",
+                    "error": "not_found",
+                    "signal_id": sig_id,
+                },
+            )
+
+        # — Build VerticalContext from User preferences (Phase 15A).
+        ctx = await self._vertical_context_for_sender()
+        # — Run the registered content agent (heuristic by default;
+        # LLMContentRadarAgent with provider=None auto-falls-back).
+        from app.services.agents.registry import try_get_agent
+
+        agent = try_get_agent("content")
+        if agent is None:
+            return CommandReply(
+                text="❌ ContentRadarAgent 未注册。",
+                metadata={
+                    "command": "content",
+                    "error": "no_agent",
+                    "signal_id": sig_id,
+                },
+            )
+        result = await agent.analyze(signal=detail, context=ctx, report=None)
+        text = _render_content_opportunity_zh(result.payload, ctx)
+
+        # — Phase 17: compliance gate on user-visible output. We do not
+        # block the reply (the user already submitted the request; a
+        # silent drop would be worse than a marked draft). The admin
+        # can review blocked rows at /api/admin/content_opportunities.
+        from app.services.compliance.service import default_service
+
+        compliance = default_service().check_content(
+            text, source=ctx.platform, context="content"
+        )
+        compliance_blocked = not compliance.allowed
+        compliance_risk_types = [rt.value for rt in compliance.risk_types]
+
+        if compliance_blocked:
+            text = (
+                text
+                + "\n\n⚠️ 内容已标记为合规风险,管理员审核后才可见。"
+            )
+
+        metadata = {
+            "command": "content",
+            "signal_id": sig_id,
+            "platform": ctx.platform,
+            "tone": ctx.tone,
+            "language": ctx.language,
+            "agent": agent.name,
+            "confidence": result.confidence,
+            "compliance_blocked": compliance_blocked,
+            "compliance_risk_score": compliance.risk_score,
+            "compliance_risk_types": compliance_risk_types,
+        }
+
+        # — Phase 17: persist the row so the admin Content Center can
+        # show it. Lazy import keeps the test path working when the
+        # DB engine is monkey-patched (see test_content_command.py).
+        persisted = await self._persist_content_opportunity(
+            signal_id=sig_id,
+            ctx=ctx,
+            payload=result.payload,
+            confidence=result.confidence,
+            agent_name=agent.name,
+            compliance_blocked=compliance_blocked,
+            compliance_risk_score=compliance.risk_score,
+            compliance_risk_types=compliance_risk_types,
+        )
+        metadata["persisted"] = persisted
+
+        return CommandReply(text=text, metadata=metadata)
+
+    async def _persist_content_opportunity(
+        self,
+        *,
+        signal_id: int,
+        ctx: Any,
+        payload: dict[str, Any],
+        confidence: float,
+        agent_name: str,
+        compliance_blocked: bool,
+        compliance_risk_score: float,
+        compliance_risk_types: list[str],
+    ) -> bool:
+        """Persist one row to ``content_opportunities``.
+
+        Returns True on commit, False on any DB failure (fail-open —
+        the user has already seen the reply, dropping it now would be
+        worse than losing the admin-visible row). Admin endpoints can
+        therefore see all *successful* rows; the missing ones are
+        surfaced only via logs.
+
+        We import lazily so tests without a DB sessionmaker simply
+        skip persistence instead of failing the request.
+        """
+        try:
+            from app.db import get_sessionmaker
+            from app.repositories.content_opportunities import (
+                ContentOpportunityRepository,
+            )
+
+            sessionmaker = get_sessionmaker()
+        except Exception as exc:  # noqa: BLE001 — fail-open
+            logger.warning(
+                "content_persist_no_sessionmaker",
+                signal_id=signal_id,
+                error=str(exc),
+            )
+            return False
+
+        try:
+            async with sessionmaker() as session:
+                repo = ContentOpportunityRepository(session)
+                await repo.create(
+                    signal_id=signal_id,
+                    platform=ctx.platform,
+                    audience=ctx.audience or None,
+                    niche=ctx.niche or None,
+                    tone=ctx.tone or None,
+                    content_angle=payload.get("content_angle"),
+                    hook=payload.get("hook"),
+                    title_candidates=payload.get("title_candidates"),
+                    material_ideas=payload.get("material_ideas"),
+                    script_outline=payload.get("script_outline"),
+                    recommended_length=payload.get("recommended_length"),
+                    cta=payload.get("cta"),
+                    risk_warning=payload.get("risk_warning"),
+                    content_score=float(confidence) * 100.0,
+                    status="draft",
+                    metadata_json={
+                        "compliance_blocked": compliance_blocked,
+                        "compliance_risk_score": compliance_risk_score,
+                        "compliance_risk_types": compliance_risk_types,
+                        "feishu_open_id": ctx.feishu_open_id,
+                        "agent_name": agent_name,
+                    },
+                )
+                await session.commit()
+        except Exception as exc:  # noqa: BLE001 — fail-open
+            logger.warning(
+                "content_persist_failed",
+                signal_id=signal_id,
+                error=str(exc),
+            )
+            return False
+        return True
+
+    async def _vertical_context_for_sender(self) -> Any:
+        """Look up (or auto-create) the sender's User row and return
+        a :class:`VerticalContext` for it.
+
+        Falls back to a default ``VerticalContext()`` when the sender
+        is anonymous (no Feishu open_id) or the DB is unreachable —
+        the agent still produces a sensible heuristic output.
+        """
+        from app.services.agents.base import VerticalContext
+        from app.services.users import build_vertical_context_for_open_id
+
+        sender_open_id = getattr(self, "_sender_open_id", None) or ""
+        if not sender_open_id:
+            return VerticalContext()
+        try:
+            from app.db import get_sessionmaker
+
+            sessionmaker = get_sessionmaker()
+            async with sessionmaker() as session:
+                ctx = await build_vertical_context_for_open_id(
+                    session, sender_open_id
+                )
+            return ctx
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "feishu_vertical_context_failed",
+                sender_open_id=sender_open_id,
+                error=str(exc)[:200],
+            )
+            return VerticalContext()
 
     async def _preferences(self, args: str) -> CommandReply:
         """`/preferences [set k=v | reset]` — Phase 15C v2.0.
@@ -1074,16 +1454,17 @@ def _help_reply() -> CommandReply:
         "**AI 机会雷达 — 命令菜单**",
         "",
         "/help — 显示本菜单",
-        "/today — 今日 Top 10 机会",
-        "/top — 全历史 Top 10",
-        "/research <主题> — 按需生成研究报告(¥299 场景)",
+        "/today — 今日信号(每日额度内)",
+        "/top — 全历史 Top 信号(共享每日额度)",
+        "/search <关键词> — 按关键词搜索(共享每日额度)",
+        "/research <主题> — 按需生成研究报告(深度研究配额)",
         "/refresh — 触发数据抓取",
         "/score — 触发重新评分",
         "/daily — 触发日报推送(同时同步 Top 10 到多维表格)",
         "/report <job_id> — 将已完成的研究报告推送至飞书云文档",
         "/doc <job_id> — /report 的别名",
         "/table — 手动同步机会表到多维表格",
-        "/search <关键词> — 搜索(Phase 16 上线)",
+        "/content <opportunity_id> — 基于偏好生成内容方案(内容配额)",
         "/preferences — 查看 / 设置偏好(vertical / niche / platform …)",
         "/activate <激活码> — 绑定闲鱼购买的激活码",
         "",
@@ -1091,6 +1472,75 @@ def _help_reply() -> CommandReply:
         "更多能力见 Web 端 /dashboard",
     ]
     return CommandReply(text="\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Phase 16 — content payload rendering
+# ---------------------------------------------------------------------------
+def _render_content_opportunity_zh(payload: dict[str, Any], ctx: Any) -> str:
+    """Render a :class:`VerticalResult.payload` (ContentOpportunity)
+    as Feishu lark_md.
+
+    Payload keys are populated by ``HeuristicContentRadarAgent``:
+      ``title_candidates`` (list[str])
+      ``hook``             (str)
+      ``script_outline``   (str)
+      ``material_ideas``   (list[str] | str)
+      ``cta``              (str)
+      ``risk_warning``     (str)
+
+    Missing sections are silently skipped — agents can leave any of
+    these empty without breaking the chat reply.
+    """
+    opp_id = payload.get("opportunity_id") or payload.get("signal_id") or "?"
+    lines: list[str] = [f"**🎬 内容方案 · #{opp_id}**", ""]
+    if ctx is not None and getattr(ctx, "platform", "general") != "general":
+        plat = getattr(ctx, "platform", "")
+        tone = getattr(ctx, "tone", "")
+        if plat or tone:
+            lines.append(
+                f"_平台:_ `{plat}` · _语调:_ `{tone}`"
+            )
+            lines.append("")
+
+    titles = payload.get("title_candidates") or []
+    if titles:
+        lines.append("**📝 标题候选**")
+        for i, t in enumerate(titles, 1):
+            lines.append(f"{i}. {t}")
+        lines.append("")
+
+    hook = payload.get("hook")
+    if hook:
+        lines.append(f"**🪝 开场钩子**\n{hook}\n")
+
+    outline = payload.get("script_outline")
+    if outline:
+        lines.append(f"**🎞️ 脚本大纲**\n{outline}\n")
+
+    materials = payload.get("material_ideas")
+    if materials:
+        if isinstance(materials, list):
+            lines.append("**🧰 素材建议**")
+            for m in materials:
+                lines.append(f"- {m}")
+            lines.append("")
+        else:
+            lines.append(f"**🧰 素材建议**\n{materials}\n")
+
+    cta = payload.get("cta")
+    if cta:
+        lines.append(f"**📣 CTA**\n{cta}\n")
+
+    risk = payload.get("risk_warning")
+    if risk:
+        lines.append(f"**⚠️ 风险提示**\n{risk}")
+
+    # Fallback when the agent returned an empty payload — surface a
+    # short note so the user doesn't get a blank card.
+    if len(lines) <= 2:
+        lines.append("(内容生成器没有产出可显示的字段)")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

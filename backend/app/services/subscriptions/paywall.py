@@ -1,12 +1,15 @@
-"""Subscription paywall — Phase 15B v2.0.
+"""Subscription paywall — Phase 16 v2.0.
 
 `gate()`(在 ``subscriptions/__init__.py``)只回答"订阅是否 active"
-这一个问题。Phase 15 还要在"每天能用几次"上做强制——这才是 doc §47
+这一个问题。Phase 15/16 还要在"每天能用几次"上做强制——这才是 doc §47
 要的"Free 每天 1 个 Signal / Basic 5 个 / Pro 20 个"语义。
 
 设计取舍见 plan 文件 §1-§6:
 
-  * **计数 = 命令调用次数**(INCR),不是 distinct signal。Phase 16 升级 SADD。
+  * **view_top_signals quota = SADD distinct IDs**(Phase 16)——doc §47
+    字面"每天 N 个 *公开 Signal*" = distinct 计数。Free 用户第 2 次
+    /today 必须返 quota deny,不是返 Top 10 但 INCR=2。Redis SET 而不是
+    INCR 字符串。research / content_full 仍走 INCR(每次调用 = 1 piece)。
   * **Redis 不可用 → fail-open**,记 warn log,不阻塞付费用户。
   * **TTL 到 UTC 当日 24:00**——key 自带日期,跨日自动重置。
   * **过期订阅 → 视为 free**(quota=1),给老用户 1 次/天尝鲜。
@@ -16,7 +19,10 @@
 
   在 dispatch handler 之前先 ``await check_access(...)``。
   不允许 → 直接 return ``CommandReply`` 拒绝文案,不进 handler。
-  handler 成功跑完 → ``await record_consumption(...)`` INCR +1。
+  handler 成功跑完 → ``await record_consumption(...)``(research /
+  content_full)或 ``await record_view_top_signals(...)``(view_top_signals)。
+  ``record_view_top_signals`` 需要 handler 把真实"展示给用户"的 signal
+  IDs 传进去——所以 handler 才有素材做"截断到剩余 quota"那一步。
 """
 
 from __future__ import annotations
@@ -256,6 +262,109 @@ async def _bump_quota(
 
 
 # ---------------------------------------------------------------------------
+# Phase 16 — Distinct-signal quota (SADD-based)
+# ---------------------------------------------------------------------------
+# doc §47 "Free 每天 1 个公开 Signal / Basic 5 / Pro 10~20" 字面意思
+# 是"每天能看到 *N 个不同的* signal",而不是"能调 N 次命令"。Phase 15
+# 用 INCR 走的是调用次数语义,Free 用户 /today 第 2 次依然返 Top 10,
+# 违反产品语义。Phase 16 改 SADD:每个 signal ID 一天只能被记录一次,
+# 第 2 次 /today 时 SCARD == limit → deny。
+#
+# Key schema 跟 INCR 一致(同 `quota_key(...)`),只是为了语义清晰把
+# "view_top_signals" 单独提到这个文件里——Redis 里它实际是 SET 类型,
+# 而 research / content_full 仍是 STRING(整数)。
+async def peek_view_top_signals_count(
+    redis_client: Any,
+    sender_open_id: str,
+    *,
+    now: datetime | None = None,
+) -> int:
+    """SCARD the per-day distinct-signal set.
+
+    Returns the number of *distinct* signal IDs already shown to
+    ``sender_open_id`` today. Returns 0 when the key is missing OR
+    Redis is unavailable — never raises (paywall must be best-effort).
+    """
+    if redis_client is None:
+        return 0
+    now = now or datetime.now(tz=timezone.utc)
+    key = quota_key("view_top_signals", sender_open_id, now)
+    try:
+        count = await redis_client.scard(key)
+    except AttributeError:
+        # Phase 16E — `redis_client.scard` missing (older fake / stub).
+        logger.warning("paywall_redis_scard_unsupported")
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "paywall_redis_scard_failed",
+            error=str(exc)[:200],
+        )
+        return 0
+    try:
+        return int(count)
+    except (TypeError, ValueError):
+        return 0
+
+
+async def record_view_top_signals(
+    redis_client: Any,
+    sender_open_id: str,
+    signal_ids: list[int | str],
+    *,
+    now: datetime | None = None,
+) -> int:
+    """SADD ``signal_ids`` to the per-day distinct-signal set.
+
+    Idempotent for duplicate IDs — Redis SADD returns the count of
+    *new* members added; we use that to refresh the TTL (first SADD
+    of the day → EXPIRE to UTC midnight). Empty ``signal_ids`` is a
+    no-op and returns 0 without touching Redis.
+
+    Returns the new SCARD, or 0 when Redis is unavailable.
+    """
+    if redis_client is None:
+        return 0
+    if not signal_ids:
+        return 0
+    now = now or datetime.now(tz=timezone.utc)
+    key = quota_key("view_top_signals", sender_open_id, now)
+    members = [str(sid) for sid in signal_ids]
+    try:
+        added = await redis_client.sadd(key, *members)
+    except AttributeError:
+        logger.warning("paywall_redis_sadd_unsupported")
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "paywall_redis_sadd_failed",
+            error=str(exc)[:200],
+        )
+        return 0
+    # First SADD of the day → set TTL. (SADD returns members-actually-
+    # added; comparing against requested length is more correct than
+    # testing "added == 1", because a duplicate is a no-op.)
+    if int(added) > 0:
+        try:
+            expire_fn = getattr(redis_client, "expire_set", None) or getattr(
+                redis_client, "expire", None
+            )
+            if expire_fn is not None:
+                await expire_fn(key, _seconds_until_utc_midnight(now))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "paywall_redis_set_expire_failed",
+                error=str(exc)[:200],
+            )
+    # Return the post-add SCARD so callers can show "used N / limit M".
+    try:
+        count = await redis_client.scard(key)
+        return int(count)
+    except Exception:  # noqa: BLE001
+        return int(added)
+
+
+# ---------------------------------------------------------------------------
 # Public API — access check + consumption recording
 # ---------------------------------------------------------------------------
 async def check_access(
@@ -297,9 +406,19 @@ async def check_access(
     )
     plan = _plan_for_row(row)
     limit = _quota_limit_for(plan, feature)
-    used = await _read_quota(
-        redis_client, quota_type=feature, feishu_open_id=sender_open_id, now=now
-    )
+    # Phase 16 — distinct-signal quota is SADD-based; everything else
+    # stays on INCR (research / content_full are "1 piece per call").
+    if feature == "view_top_signals":
+        used = await peek_view_top_signals_count(
+            redis_client, sender_open_id, now=now
+        )
+    else:
+        used = await _read_quota(
+            redis_client,
+            quota_type=feature,
+            feishu_open_id=sender_open_id,
+            now=now,
+        )
 
     # Hard plan block — feature requires a paid tier but plan gives 0/day.
     if limit <= 0:
@@ -422,6 +541,8 @@ __all__ = [
     "PaywallVerdict",
     "check_access",
     "command_to_feature",
+    "peek_view_top_signals_count",
     "quota_key",
     "record_consumption",
+    "record_view_top_signals",
 ]

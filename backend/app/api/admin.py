@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -47,9 +48,13 @@ from app.db import get_session
 from app.models import (
     ActivationCode,
     AuditLog,
+    ContentOpportunity,
     Source,
     Subscription,
 )
+from app.repositories import ContentOpportunityRepository
+from app.repositories.content_opportunities import IllegalStatusTransition
+from app.schemas import ContentOpportunityRejectRequest
 from app.services.activation import (
     ActivationError,
     DEFAULT_SERVER_PEPPER,
@@ -137,6 +142,43 @@ async def _audit_db(
         result=result,
         metadata=metadata,
     )
+
+
+def _require_webhook(
+    provided: Optional[str] = Header(default=None, alias="X-Radar-Webhook"),
+    settings: Settings = Depends(get_settings),
+) -> str:
+    """Verify the caller carries a valid internal webhook secret.
+
+    Phase 17 — the Content Center admin endpoints (``/content_opportunities``)
+    use this dependency instead of ``_require_admin``. The two are
+    intentionally separate auth paths today; Phase 18 should unify them
+    in ``app/api/deps.py``. Returns the actor label "webhook" for audit.
+
+    Logic is duplicated from ``app/api/internal.py::_check_webhook_secret``
+    because admin.py should not depend on internal.py (would create a
+    cycle once internal.py ever imports admin helpers).
+    """
+    expected = (
+        settings.app_secret_key
+        or os.environ.get("RADAR_WEBHOOK_SECRET", "")
+    )
+    if not expected:
+        return "webhook"  # dev / local — accept all
+    if not provided:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing webhook secret header",
+        )
+    if not hmac.compare_digest(
+        hashlib.sha256(provided.encode()).hexdigest(),
+        hashlib.sha256(expected.encode()).hexdigest(),
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid webhook secret",
+        )
+    return "webhook"
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +582,175 @@ async def update_source_compliance(
         "source_block_reason": row.source_block_reason,
         "last_compliance_check": _to_utc_iso(row.last_compliance_check),
     }
+
+
+# ---------------------------------------------------------------------------
+# Content Center (Phase 17) — webhook-auth admin endpoints
+# ---------------------------------------------------------------------------
+def _serialize_content_opportunity(row: ContentOpportunity) -> dict[str, Any]:
+    """Project a ContentOpportunity row + ``metadata_json`` bag into a
+    JSON-safe dict for admin list/detail responses."""
+    md = dict(row.metadata_json or {})
+    return {
+        "id": row.id,
+        "signal_id": row.signal_id,
+        "platform": row.platform,
+        "audience": row.audience,
+        "niche": row.niche,
+        "tone": row.tone,
+        "content_angle": row.content_angle,
+        "hook": row.hook,
+        "title_candidates": row.title_candidates,
+        "material_ideas": row.material_ideas,
+        "script_outline": row.script_outline,
+        "recommended_length": row.recommended_length,
+        "cta": row.cta,
+        "risk_warning": row.risk_warning,
+        "content_score": float(row.content_score),
+        "status": row.status,
+        "compliance_blocked": bool(md.get("compliance_blocked", False)),
+        "compliance_risk_score": float(md.get("compliance_risk_score", 0.0)),
+        "compliance_risk_types": list(md.get("compliance_risk_types", [])),
+        "metadata": md,
+        "created_at": _to_utc_iso(row.created_at),
+        "updated_at": _to_utc_iso(row.updated_at),
+    }
+
+
+@router.get(
+    "/content_opportunities",
+    summary="List content opportunities (admin, webhook)",
+)
+async def list_content_opportunities(
+    status_filter: Optional[str] = Query(
+        default=None,
+        alias="status",
+        description="Filter by status (draft | approved | published | archived | rejected)",
+    ),
+    signal_id: Optional[int] = Query(default=None),
+    compliance_blocked: Optional[bool] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    session: AsyncSession = Depends(get_session),
+    _actor: str = Depends(_require_webhook),
+) -> dict[str, Any]:
+    """List ContentOpportunity rows for the admin Content Center.
+
+    ``compliance_blocked`` is filtered in Python post-walk because
+    Postgres ``->>`` and SQLite ``json_extract`` differ; per-page
+    result is small enough that an O(limit) Python pass is fine.
+    """
+    repo = ContentOpportunityRepository(session)
+    rows, total = await repo.list_paginated(
+        status=status_filter, signal_id=signal_id,
+        limit=limit, offset=offset,
+    )
+    items = [_serialize_content_opportunity(r) for r in rows]
+    if compliance_blocked is not None:
+        items = [
+            it for it in items
+            if it["compliance_blocked"] == compliance_blocked
+        ]
+        # ``total`` reflects the post-filter count (Phase 17 — admin UI
+        # uses this as a "show only blocked" toggle; the per-page
+        # result set is small enough that an O(limit) Python pass is
+        # fine and the count is exact).
+        total = len(items)
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@router.get(
+    "/content_opportunities/{co_id}",
+    summary="Single content opportunity (admin, webhook)",
+)
+async def get_content_opportunity(
+    co_id: int,
+    session: AsyncSession = Depends(get_session),
+    _actor: str = Depends(_require_webhook),
+) -> dict[str, Any]:
+    repo = ContentOpportunityRepository(session)
+    row = await repo.get_by_id(co_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="content_opportunity not found")
+    return _serialize_content_opportunity(row)
+
+
+async def _transition_content_opportunity(
+    session: AsyncSession,
+    *,
+    co_id: int,
+    new_status: str,
+    actor: str,
+    reason: Optional[str] = None,
+) -> dict[str, Any]:
+    """Shared helper for approve/reject/publish endpoints."""
+    repo = ContentOpportunityRepository(session)
+    try:
+        row = await repo.transition_status(co_id, new_status)
+    except ContentOpportunityRepository.NotFound:
+        raise HTTPException(status_code=404, detail="content_opportunity not found")
+    except IllegalStatusTransition as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    await session.commit()
+    await session.refresh(row)
+
+    await _audit_db(
+        session,
+        action="content_opportunity_transition",
+        actor=actor,
+        resource_type="content_opportunity",
+        resource_id=str(co_id),
+        metadata={"to": new_status, "reason": reason},
+    )
+    return _serialize_content_opportunity(row)
+
+
+@router.post(
+    "/content_opportunities/{co_id}/approve",
+    summary="draft → approved (admin, webhook)",
+)
+async def approve_content_opportunity(
+    co_id: int,
+    session: AsyncSession = Depends(get_session),
+    actor: str = Depends(_require_webhook),
+) -> dict[str, Any]:
+    return await _transition_content_opportunity(
+        session, co_id=co_id, new_status="approved", actor=actor,
+    )
+
+
+@router.post(
+    "/content_opportunities/{co_id}/reject",
+    summary="* → rejected (admin, webhook)",
+)
+async def reject_content_opportunity(
+    co_id: int,
+    body: ContentOpportunityRejectRequest,
+    session: AsyncSession = Depends(get_session),
+    actor: str = Depends(_require_webhook),
+) -> dict[str, Any]:
+    return await _transition_content_opportunity(
+        session,
+        co_id=co_id,
+        new_status="rejected",
+        actor=actor,
+        reason=body.reason,
+    )
+
+
+@router.post(
+    "/content_opportunities/{co_id}/publish",
+    summary="approved → published (admin, webhook)",
+)
+async def publish_content_opportunity(
+    co_id: int,
+    session: AsyncSession = Depends(get_session),
+    actor: str = Depends(_require_webhook),
+) -> dict[str, Any]:
+    return await _transition_content_opportunity(
+        session, co_id=co_id, new_status="published", actor=actor,
+    )
 
 
 __all__ = ["router"]

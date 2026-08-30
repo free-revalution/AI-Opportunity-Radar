@@ -404,6 +404,13 @@ class ContentOpportunity(Base):
     status: Mapped[str] = mapped_column(
         String(32), default="draft", nullable=False, index=True
     )
+    # ---- V2 Phase 17 ----------------------------------------------------
+    # Per-row bag for compliance gate verdicts + admin review metadata.
+    # ``server_default='{}'`` keeps old rows readable. See migration
+    # ``f7a2c9d4e8b1_v2_0_content_opportunity_metadata.py``.
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

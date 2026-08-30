@@ -115,5 +115,46 @@ class SignalRepository:
             total_engagement=float(row.total_engagement or 0.0),
         )
 
+    async def list_recent(
+        self,
+        *,
+        status: str | None = None,
+        min_signal_score: float | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[Sequence[Signal], int]:
+        """Recent signals, optionally filtered.
+
+        Phase 17 — the admin Content Center lists signals via
+        ``GET /api/signals``. Order is ``signal_score DESC, created_at
+        DESC`` so the highest-scoring newest signal surfaces first; this
+        matches the user's mental model "what's hot right now".
+
+        Mirrors ``OpportunityRepository.list_paginated`` so admin UIs
+        can use the same pagination pattern across both endpoints.
+        """
+        from sqlalchemy import and_
+
+        base = select(Signal)
+        count_q = select(func.count()).select_from(Signal)
+
+        filters = []
+        if status:
+            filters.append(Signal.status == status)
+        if min_signal_score is not None:
+            filters.append(Signal.signal_score >= min_signal_score)
+        if filters:
+            cond = and_(*filters)
+            base = base.where(cond)
+            count_q = count_q.where(cond)
+
+        base = base.order_by(
+            Signal.signal_score.desc(), Signal.created_at.desc()
+        ).limit(limit).offset(offset)
+
+        result = await self.session.execute(base)
+        total = await self.session.scalar(count_q) or 0
+        return result.scalars().all(), int(total)
+
 
 __all__ = ["SignalAggregate", "SignalRepository"]
