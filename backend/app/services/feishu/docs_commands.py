@@ -145,6 +145,11 @@ class DocsContext:
     settings: Settings
     sender_open_id: Optional[str] = None
     chat_id: Optional[str] = None
+    # — Phase 27 fix: redis_client is exposed so the `/docs tree`
+    # async path can build an independent FeishuAppClient in the
+    # background task (the inbound-handler-scoped client gets
+    # aclose()'d before the background task finishes its walk).
+    redis_client: Optional[Any] = None
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +299,8 @@ async def _handle_tree(*, args: str, ctx: DocsContext):
     record = await submit_docs_tree_task(
         chat_id=ctx.chat_id or "",
         sender_open_id=ctx.sender_open_id or "",
-        ctx=ctx,
+        settings=ctx.settings,
+        redis_client=ctx.redis_client,
     )
     return _reply(
         (

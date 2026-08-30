@@ -217,9 +217,9 @@ async def submit_docs_tree_task(
     *,
     chat_id: str,
     sender_open_id: str,
-    ctx: Any,  # DocsContext (avoid import cycle)
-    receive_id_type: str = "chat_id",
     settings: Optional[Settings] = None,
+    redis_client: Optional[Any] = None,
+    receive_id_type: str = "chat_id",
 ) -> TaskRecord:
     """Schedule a background tree-walk for ``/docs tree``.
 
@@ -229,9 +229,15 @@ async def submit_docs_tree_task(
     table snapshot, then posts a multi-card reply (split at 3 500
     chars each) back to ``chat_id``.
 
-    The background task constructs its own :class:`FeishuAppClient`
-    so the request-scoped httpx client (which was aclose()'d in the
-    inbound event handler's finally) does NOT leak in here.
+    Phase 27 fix — the background task constructs its OWN
+    :class:`FeishuAppClient` (and its own Drive/Bitable/ConfirmStore
+    stack) so the inbound event handler's request-scoped httpx
+    client — which is ``aclose()``'d in the handler's ``finally``
+    block before this background task finishes — does NOT corrupt
+    the async walk. Before this fix the background task reused the
+    inbound handler's DriveClient + shared httpx and crashed with
+    ``Cannot send a request, as the client has been closed`` for
+    every ``/docs tree`` invocation.
     """
     settings = settings or get_settings()
     task_id = uuid.uuid4().hex[:12]
@@ -265,7 +271,11 @@ async def submit_docs_tree_task(
         _TASKS[task_id] = record
 
     record._asyncio_task = asyncio.create_task(
-        _execute_docs_tree(record=record, ctx=ctx, settings=settings),
+        _execute_docs_tree(
+            record=record,
+            settings=settings,
+            redis_client=redis_client,
+        ),
         name=f"feishu-docs-tree-{task_id}",
     )
     record._asyncio_task.add_done_callback(_log_task_done)
@@ -282,21 +292,54 @@ async def submit_docs_tree_task(
 async def _execute_docs_tree(
     *,
     record: TaskRecord,
-    ctx: Any,
     settings: Settings,
+    redis_client: Optional[Any] = None,
 ) -> None:
-    """Run walk_tree + Bitable scan, then push a multi-card reply."""
+    """Run walk_tree + Bitable scan, then push a multi-card reply.
+
+    Builds an independent FeishuAppClient + Drive + Bitable +
+    ConfirmStore stack so the background task does NOT depend on
+    any client owned by the inbound event handler (whose httpx
+    AsyncClient is aclose()'d in the handler's finally block before
+    this task finishes).
+    """
     from app.services.feishu.app_client import FeishuAppClient
 
     summary: dict[str, Any] = {}
     error_text: Optional[str] = None
     cards: list[str] = []
 
+    app_client = FeishuAppClient(settings=settings)
     try:
-        tree = await ctx.drive_manager.walk(max_depth=3)
+        # — Build an independent Drive/Bitable/Confirm stack.
+        from app.services.feishu.bitable_manager import BitableManager
+        from app.services.feishu.confirm_store import get_confirm_store
+        from app.services.feishu.content_client import (
+            FeishuBitableClient,
+            FeishuDriveClient,
+        )
+        from app.services.feishu.drive_manager import DriveManager
+
+        drive = FeishuDriveClient(app_client=app_client, settings=settings)
+        bitable_client = FeishuBitableClient(
+            app_client=app_client,
+            settings=settings,
+            token_setting="feishu_bitable_opportunities_app_token",
+        )
+        confirm_store = (
+            get_confirm_store(redis_client) if redis_client is not None else None
+        )
+        drive_manager = DriveManager(
+            drive=drive, settings=settings, confirm_store=confirm_store
+        )
+        bitable_manager = BitableManager(
+            client=bitable_client, settings=settings, confirm_store=confirm_store
+        )
+
+        tree = await drive_manager.walk(max_depth=3)
         cards.append(_render_tree_card(tree))
 
-        bitable_summary = await _bitable_snapshot(bitable_manager=ctx.bitable_manager)
+        bitable_summary = await _bitable_snapshot(bitable_manager=bitable_manager)
         cards.append(_render_bitable_card(bitable_summary))
 
         summary = {
@@ -311,6 +354,8 @@ async def _execute_docs_tree(
             error=str(exc),
             exc_info=True,
         )
+    finally:
+        await app_client.aclose()
 
     record.finished_at = _now()
     if error_text is None:

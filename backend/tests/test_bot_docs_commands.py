@@ -316,7 +316,14 @@ async def test_run_tree_submits_async_task(
     from app.services.feishu import task_runner as tr
     from app.services.feishu.task_runner import TaskRecord
 
-    async def fake_submit(*, chat_id, sender_open_id, ctx, receive_id_type="chat_id", settings=None):
+    async def fake_submit(
+        *,
+        chat_id,
+        sender_open_id,
+        settings=None,
+        redis_client=None,
+        receive_id_type="chat_id",
+    ):
         return TaskRecord(
             task_id="tree_task_001",
             submitted_at=0.0,

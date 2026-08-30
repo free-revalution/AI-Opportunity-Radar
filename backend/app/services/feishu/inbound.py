@@ -1097,6 +1097,7 @@ class FeishuCommandRouter:
             settings=self.settings,
             sender_open_id=getattr(self, "_sender_open_id", None),
             chat_id=getattr(self, "_chat_id", None),
+            redis_client=redis_client,
         )
 
 
