@@ -40,7 +40,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
@@ -49,6 +49,7 @@ from app.models import (
     ActivationCode,
     AuditLog,
     ContentOpportunity,
+    Signal,
     Source,
     Subscription,
 )
@@ -751,6 +752,152 @@ async def publish_content_opportunity(
     return await _transition_content_opportunity(
         session, co_id=co_id, new_status="published", actor=actor,
     )
+
+
+# ---------------------------------------------------------------------------
+# Dashboard summary (Phase 19)
+# ---------------------------------------------------------------------------
+# Sole-operator console: one endpoint that returns everything the
+# `/admin` landing page needs — ContentOpportunity + Signal status
+# breakdowns + recent activity feed from AuditLog. Webhook auth (not
+# _require_admin) so the Phase 18 sessionStorage prompt works.
+#
+# Three serial SELECTs against indexed columns; expected < 200ms even
+# at 10k rows. No caching — Phase 20+ may add ETags.
+
+_CONTENT_STATUS_BUCKETS: tuple[str, ...] = (
+    "draft", "approved", "published", "rejected", "archived",
+)
+_SIGNAL_STATUS_BUCKETS: tuple[str, ...] = (
+    "discovered", "validating", "verified", "analyzing",
+    "published", "expired", "rejected",
+)
+
+
+async def _build_dashboard(session: AsyncSession) -> dict[str, Any]:
+    """Aggregate stats + last 20 content_opportunity transitions."""
+    now = datetime.now(timezone.utc)
+    seven_days_ago = now - timedelta(days=7)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # 1. ContentOpportunity aggregates ---------------------------------
+    co_total = (await session.execute(
+        select(func.count()).select_from(ContentOpportunity)
+    )).scalar_one()
+
+    co_by_status_rows = (await session.execute(
+        select(ContentOpportunity.status, func.count())
+        .group_by(ContentOpportunity.status)
+    )).all()
+    co_by_status = {s: 0 for s in _CONTENT_STATUS_BUCKETS}
+    for status_value, count in co_by_status_rows:
+        if status_value in co_by_status:
+            co_by_status[status_value] = count
+
+    co_recent_7d = (await session.execute(
+        select(func.count()).select_from(ContentOpportunity)
+        .where(ContentOpportunity.created_at >= seven_days_ago)
+    )).scalar_one()
+
+    co_new_today = (await session.execute(
+        select(func.count()).select_from(ContentOpportunity)
+        .where(ContentOpportunity.created_at >= today_start)
+    )).scalar_one()
+
+    # Blocked review queue = drafts with compliance_blocked=true in
+    # metadata_json. Pull the latest 200 drafts (Phase 17 plan §B
+    # notes SQL JSON index is deferred to Phase 20) and filter in
+    # Python. The dashboard's "today" workload is well under that.
+    draft_rows = (await session.execute(
+        select(ContentOpportunity.metadata_json)
+        .where(ContentOpportunity.status == "draft")
+        .limit(200)
+    )).all()
+    blocked_review_queue = sum(
+        1 for (md,) in draft_rows
+        if isinstance(md, dict) and md.get("compliance_blocked") is True
+    )
+
+    # 2. Signal aggregates ---------------------------------------------
+    sig_total = (await session.execute(
+        select(func.count()).select_from(Signal)
+    )).scalar_one()
+
+    sig_by_status_rows = (await session.execute(
+        select(Signal.status, func.count())
+        .group_by(Signal.status)
+    )).all()
+    sig_by_status = {s: 0 for s in _SIGNAL_STATUS_BUCKETS}
+    for status_value, count in sig_by_status_rows:
+        if status_value in sig_by_status:
+            sig_by_status[status_value] = count
+
+    sig_recent_7d = (await session.execute(
+        select(func.count()).select_from(Signal)
+        .where(Signal.created_at >= seven_days_ago)
+    )).scalar_one()
+    sig_new_today = (await session.execute(
+        select(func.count()).select_from(Signal)
+        .where(Signal.created_at >= today_start)
+    )).scalar_one()
+
+    # 3. Recent activity feed (last 20 content_opportunity_transition) -
+    activity_rows = (await session.execute(
+        select(AuditLog)
+        .where(AuditLog.action == "content_opportunity_transition")
+        .order_by(AuditLog.created_at.desc())
+        .limit(20)
+    )).scalars().all()
+
+    return {
+        "generated_at": _to_utc_iso(now),
+        "content_opportunities": {
+            "total": int(co_total),
+            "by_status": co_by_status,
+            "blocked_review_queue": blocked_review_queue,
+            "recent_7d_count": int(co_recent_7d),
+            "new_today": int(co_new_today),
+        },
+        "signals": {
+            "total": int(sig_total),
+            "by_status": sig_by_status,
+            "recent_7d_count": int(sig_recent_7d),
+            "new_today": int(sig_new_today),
+            "verified_count": sig_by_status.get("verified", 0),
+        },
+        "recent_activity": [
+            {
+                "id": r.id,
+                "actor_type": r.actor_type,
+                "actor_id": r.actor_id,
+                "action": r.action,
+                "resource_type": r.resource_type,
+                "resource_id": r.resource_id,
+                "result": r.result,
+                "metadata_json": r.metadata_json,
+                "created_at": _to_utc_iso(r.created_at),
+            }
+            for r in activity_rows
+        ],
+    }
+
+
+@router.get(
+    "/dashboard",
+    summary="Admin dashboard summary (admin, webhook)",
+)
+async def get_dashboard(
+    session: AsyncSession = Depends(get_session),
+    _actor: str = Depends(_require_webhook),
+) -> dict[str, Any]:
+    """Aggregated stats + recent activity feed for the operator console.
+
+    Returns ContentOpportunity status breakdown, blocked-review queue,
+    Signal health, and the latest 20 ``content_opportunity_transition``
+    AuditLog rows. Sole-operator dashboard — one round-trip per page
+    load is enough; refresh by browser reload.
+    """
+    return await _build_dashboard(session)
 
 
 __all__ = ["router"]

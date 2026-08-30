@@ -582,3 +582,44 @@ export interface SignalListResponse {
   limit: number;
   offset: number;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 19 — admin dashboard summary
+// ---------------------------------------------------------------------------
+export interface DashboardActivityItem {
+  id: number;
+  actor_type: string;
+  actor_id: string | null;
+  action: string;
+  resource_type: string | null;
+  resource_id: string | null;
+  result: string;
+  // Backend stores it as `metadata_json`; frontend renames to
+  // `metadata` so the wire payload matches the JS naming convention.
+  metadata_json: Record<string, unknown>;
+  created_at: string | null;
+}
+
+export interface DashboardContentStats {
+  total: number;
+  by_status: Record<ContentOpportunityStatus, number>;
+  /** Drafts marked compliance_blocked=true (review queue size). */
+  blocked_review_queue: number;
+  recent_7d_count: number;
+  new_today: number;
+}
+
+export interface DashboardSignalStats {
+  total: number;
+  by_status: Record<SignalLifecycleStatus, number>;
+  recent_7d_count: number;
+  new_today: number;
+  verified_count: number;
+}
+
+export interface DashboardResponse {
+  generated_at: string;
+  content_opportunities: DashboardContentStats;
+  signals: DashboardSignalStats;
+  recent_activity: DashboardActivityItem[];
+}

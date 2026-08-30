@@ -563,6 +563,7 @@ import type {
   ContentOpportunity,
   ContentOpportunityListResponse,
   ContentOpportunityRejectRequest,
+  DashboardResponse,
   Signal,
   SignalListResponse,
 } from "@/types";
@@ -666,5 +667,15 @@ export async function fetchSignals(
   );
 }
 
+// ---------------------------------------------------------------------------
+// Phase 19 — admin dashboard summary
+// ---------------------------------------------------------------------------
+/** Phase 19 — single round-trip for the /admin landing page:
+ *  ContentOpportunity status breakdown, blocked-review queue,
+ *  Signal health, last 20 content_opportunity_transition AuditLog rows. */
+export async function fetchDashboard(): Promise<DashboardResponse> {
+  return jsonFetchWithSecret<DashboardResponse>("/api/admin/dashboard");
+}
+
 // Re-export the new types so consumers can import them from `@/lib/api`.
-export type { Signal, ContentOpportunity };
+export type { Signal, ContentOpportunity, DashboardResponse };

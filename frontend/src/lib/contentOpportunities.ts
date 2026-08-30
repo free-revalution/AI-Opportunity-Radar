@@ -67,3 +67,21 @@ export function truncate(s: string | null | undefined, max: number = 40): string
   if (!s) return "";
   return s.length > max ? s.slice(0, max - 1) + "…" : s;
 }
+
+/** Render an AuditLog `content_opportunity_transition` metadata dict
+ * as a one-liner like "draft → approved". Phase 19 dashboard feed. */
+export function formatActivityTransition(
+  metadata: Record<string, unknown>,
+): string {
+  const from = typeof metadata.from === "string" ? metadata.from : "?";
+  const to = typeof metadata.to === "string" ? metadata.to : "?";
+  return `${from} → ${to}`;
+}
+
+/** Optional reason text from a transition (reject carries one). */
+export function activityReason(
+  metadata: Record<string, unknown>,
+): string | null {
+  const r = metadata.reason;
+  return typeof r === "string" && r.length > 0 ? r : null;
+}
