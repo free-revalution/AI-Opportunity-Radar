@@ -141,11 +141,13 @@ def monkey_httpx(monkeypatch):
 # Tests
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_submit_returns_immediately_with_running_record(monkey_httpx) -> None:
+async def test_submit_returns_immediately_with_queued_record(monkey_httpx) -> None:
     rec = await submit_pipeline_run(
         chat_id="oc_async", sender_open_id="ou_async", settings=_settings()
     )
-    assert rec.status == "running"
+    # Phase 33 PR-33-E: submit 立即返回时 status="queued"(等 semaphore)。
+    # 拿 slot 后 _acquire_and_run 改成 "running" — 那是后台 task 的事。
+    assert rec.status == "queued"
     assert rec.task_id
     assert rec.chat_id == "oc_async"
     assert rec.sender_open_id == "ou_async"
@@ -272,25 +274,74 @@ async def test_list_recent_returns_recent_tasks(monkey_httpx) -> None:
 
 
 @pytest.mark.asyncio
-async def test_concurrency_cap_rejects_excess(monkey_httpx) -> None:
-    """5 in-flight would exceed the cap of 4 → 5th is rejected."""
+async def test_concurrency_cap_queues_excess(monkey_httpx) -> None:
+    """Phase 33 PR-33-E: 5th /run 进入 queued,等前 4 个释放 slot。
+
+    之前 hard-reject("too many concurrent runs"),现在 bounded
+    wait-queue — 5 个 /run 都立即返回 queued,running 等前 4 释放。
+    """
     recs: list[TaskRecord] = []
-    # The first 4 occupy the running slots; the 5th gets rejected.
-    for i in range(4):
+    for i in range(5):
         recs.append(
             await submit_pipeline_run(
                 chat_id=f"oc_{i}", sender_open_id=f"ou_{i}", settings=_settings()
             )
         )
-    rec = await submit_pipeline_run(
-        chat_id="oc_5", sender_open_id="ou_5", settings=_settings()
-    )
-    assert rec.status == "failed"
-    assert rec.error and "too many" in rec.error
+    # 5 个全部立即返回,都进 queued(没 hard reject)
+    for r in recs:
+        assert r.status == "queued", (
+            f"task {r.task_id} status={r.status}, expected queued"
+        )
     # — Cleanup so the asyncio event loop doesn't leak warnings.
     for r in recs:
         if r._asyncio_task is not None:
-            await r._asyncio_task
+            # 给每个 task 一点点时间跑完,避免 cancel 太暴力
+            try:
+                await asyncio.wait_for(r._asyncio_task, timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+
+
+@pytest.mark.asyncio
+async def test_queue_timeout_yields_friendly_error(
+    monkeypatch, monkey_httpx
+) -> None:
+    """Phase 33 PR-33-E 回归: semaphore.acquire 超时 → record.status=failed,
+    error 含 '⏳ 流水线正在排队中' 字样(中文 friendly,非 'too many')。
+
+    做法: 直接 acquire 4 次占满 semaphore,然后提交 1 个 /run,
+    等超时。timeout 缩到 0.1s 让测试快。
+    """
+    from app.services.feishu import task_runner as tr_mod
+
+    # 把 wait timeout 缩到 0.1s,test 仍 < 1s
+    monkeypatch.setattr(tr_mod, "_RUN_QUEUE_WAIT_SECONDS", 0.1)
+    # 让 semaphore 重置成新实例(防前面测试残留)
+    monkeypatch.setattr(tr_mod, "_RUN_SEMAPHORE", None)
+
+    # 占满 semaphore 4 个 slot
+    sem = tr_mod._get_run_semaphore()
+    held: list[asyncio.Lock] = []
+    for _ in range(4):
+        await sem.acquire()
+        held.append(sem)  # 占着不放
+
+    try:
+        rec = await submit_pipeline_run(
+            chat_id="oc_q", sender_open_id="ou_q", settings=_settings()
+        )
+        assert rec._asyncio_task is not None
+        # 等后台 task 拿到 asyncio.TimeoutError
+        try:
+            await asyncio.wait_for(rec._asyncio_task, timeout=2.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+
+        assert rec.status == "failed"
+        assert rec.error and "⏳" in rec.error
+    finally:
+        for _ in range(4):
+            sem.release()
 
 
 # ---------------------------------------------------------------------------

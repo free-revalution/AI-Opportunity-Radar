@@ -51,6 +51,11 @@ logger = get_logger(__name__)
 
 _TASK_RETENTION_SEC = 300  # keep finished task records for 5 min so /status can show them
 _MAX_CONCURRENT_TASKS = 4  # bound resource use; 4 in-flight pipelines is plenty for /run spam
+# Phase 33 PR-33-E: 限流改成 bounded wait-queue — 第 5 个 /run
+# 等信号量 30s,期间 reply 不报错。超时报错"⏳ 流水线正在排队中…",
+# 比硬拒"too many concurrent runs"友好得多。
+_RUN_SEMAPHORE: asyncio.Semaphore | None = None
+_RUN_QUEUE_WAIT_SECONDS: float = 30.0
 
 
 @dataclass(slots=True)
@@ -115,6 +120,14 @@ async def _count_running() -> int:
         return sum(1 for r in _TASKS.values() if r.status == "running")
 
 
+def _get_run_semaphore() -> asyncio.Semaphore:
+    """Phase 33 PR-33-E: lazy 单例 Semaphore。"""
+    global _RUN_SEMAPHORE
+    if _RUN_SEMAPHORE is None:
+        _RUN_SEMAPHORE = asyncio.Semaphore(_MAX_CONCURRENT_TASKS)
+    return _RUN_SEMAPHORE
+
+
 async def submit_pipeline_run(
     *,
     chat_id: str,
@@ -140,27 +153,43 @@ async def submit_pipeline_run(
         receive_id_type=receive_id_type,
     )
 
-    running = await _count_running()
-    if running >= _MAX_CONCURRENT_TASKS:
-        record.status = "failed"
-        record.finished_at = _now()
-        record.error = (
-            f"too many concurrent pipeline runs ({running}/{_MAX_CONCURRENT_TASKS})"
-        )
-        async with _TASKS_LOCK:
-            _TASKS[task_id] = record
-        logger.warning(
-            "feishu_async_run_rejected",
-            chat_id=chat_id,
-            running=running,
-        )
-        return record
+    # Phase 33 PR-33-E: 限流改成 bounded wait-queue。
+    # 之前直接拒(>4 running → "too many concurrent runs")。
+    # 现在挂到 semaphore 上 wait_for 30s,期间 record.status="queued"。
+    # 30s 内拿到 slot → 跑;超时报错"⏳ 流水线正在排队中,请稍后重试"。
+    # 操作员 spam /run 时体验从"被拒"变成"在等"。
 
+    record.status = "queued"
     async with _TASKS_LOCK:
         _TASKS[task_id] = record
 
+    async def _acquire_and_run() -> None:
+        try:
+            await asyncio.wait_for(
+                _get_run_semaphore().acquire(),
+                timeout=_RUN_QUEUE_WAIT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            record.status = "failed"
+            record.finished_at = _now()
+            record.error = (
+                f"⏳ 流水线正在排队中,请稍后重试或查看 /status "
+                f"(> {_RUN_QUEUE_WAIT_SECONDS:.0f}s 等待超时)"
+            )
+            logger.warning(
+                "feishu_async_run_queue_timeout",
+                chat_id=chat_id,
+                task_id=task_id,
+            )
+            return
+        try:
+            record.status = "running"
+            await _execute_pipeline(record=record, settings=settings)
+        finally:
+            _get_run_semaphore().release()
+
     record._asyncio_task = asyncio.create_task(
-        _execute_pipeline(record=record, settings=settings),
+        _acquire_and_run(),
         name=f"feishu-pipeline-{task_id}",
     )
     # Surface uncaught exceptions (defensive — _execute_pipeline should
