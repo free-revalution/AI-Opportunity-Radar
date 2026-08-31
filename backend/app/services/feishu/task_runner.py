@@ -665,7 +665,22 @@ async def _post_pipeline_summary(
     error_text: Optional[str],
     summary: dict[str, Any],
 ) -> None:
-    """Send the pipeline result back to the originating chat."""
+    """Send the pipeline result back to the originating chat.
+
+    Phase 30 — replaces the single static text card with two interactive
+    cards:
+
+      1. **Header card** — run summary (counts, docx status, run_id).
+      2. **Top-N signal card** — Top-N opportunities pulled from
+         ``GET /api/internal/opportunities/top``, each with a
+         ``[生成报告]`` button whose ``action.value`` is
+         ``{"action": "write_detail_docx", "opportunity_id": <id>}``
+         so the inbound handler can route the click to
+         :func:`app.services.feishu.card_actions.handle_card_action_trigger`.
+
+    Failure branch stays a single plain-text message — no point
+    building interactive cards when the run itself failed.
+    """
     from app.services.feishu.app_client import FeishuAppClient
 
     if error_text is not None:
@@ -688,7 +703,50 @@ async def _post_pipeline_summary(
             await client.aclose()
         return
 
-    # — success branch — format the result summary as a card.
+    # — Success branch — fetch Top-N + push two cards.
+    n = max(1, int(getattr(settings, "radar_top_n_push", 5) or 5))
+    top_opps = await _fetch_top_opportunities(settings=settings, n=n)
+
+    client = FeishuAppClient(settings=settings)
+    try:
+        # Card 1 — header summary
+        await client.send_message(
+            receive_id=record.chat_id,
+            receive_id_type=record.receive_id_type,
+            msg_type="interactive",
+            content=_build_header_card(
+                summary=summary,
+                task_id=record.task_id,
+            ),
+            compliance_context="feishu_async_run_success_header",
+        )
+        # Card 2 — Top-N signals with [生成报告] buttons.
+        if top_opps:
+            await client.send_message(
+                receive_id=record.chat_id,
+                receive_id_type=record.receive_id_type,
+                msg_type="interactive",
+                content=_build_top_n_signal_card(
+                    opportunities=top_opps,
+                    task_id=record.task_id,
+                ),
+                compliance_context="feishu_async_run_success_topn",
+            )
+    finally:
+        await client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Phase 30 PR-4c — card builders for /run Top-N reply
+# ---------------------------------------------------------------------------
+def _build_header_card(
+    *,
+    summary: dict[str, Any],
+    task_id: str,
+) -> dict[str, Any]:
+    """Header card — same content as the previous static text card,
+    but rendered as an interactive card so it sits next to the Top-N
+    signal card in the chat scrollback."""
     run_id = summary.get("run_id", "?")
     raw_count = summary.get("raw_count", 0)
     new_count = summary.get("new_count", 0)
@@ -696,37 +754,182 @@ async def _post_pipeline_summary(
     digest_sent = summary.get("digest_sent", False)
     started = summary.get("started_at", "")
     finished = summary.get("finished_at", "")
-    text = (
-        f"✅ 流水线完成（task_id={record.task_id}, run_id={run_id}）。\n"
-        f"采集: {raw_count} 条\n"
-        f"新增: {new_count} 条\n"
-        f"信号: {signal_count} 条\n"
-        f"日报已发送: {'是' if digest_sent else '否'}\n"
+    body = (
+        f"✅ **流水线完成** (task_id=`{task_id}`, run_id=`{run_id}`)\n"
+        f"采集: **{raw_count}** 条\n"
+        f"新增: **{new_count}** 条\n"
+        f"信号: **{signal_count}** 条\n"
+        f"日报已发送: **{'是' if digest_sent else '否'}**\n"
         f"耗时: {started} → {finished or '运行中'}"
     )
-    client = FeishuAppClient(settings=settings)
-    try:
-        await client.send_message(
-            receive_id=record.chat_id,
-            receive_id_type=record.receive_id_type,
-            msg_type="interactive",
-            content={
-                "config": {"wide_screen_mode": True},
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "AI 机会雷达 · /run"},
+            "template": "green",
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": body},
+            },
+            {
+                "tag": "note",
                 "elements": [
                     {
-                        "tag": "div",
-                        "text": {"tag": "lark_md", "content": text},
+                        "tag": "plain_text",
+                        "content": "Top-N 信号卡: 点 [生成报告] 即可写详情 docx",
                     }
                 ],
-                "header": {
-                    "title": {"tag": "plain_text", "content": "AI 机会雷达 · /run"},
-                    "template": "green" if not error_text else "red",
-                },
             },
-            compliance_context="feishu_async_run_success",
+        ],
+    }
+
+
+def _build_top_n_signal_card(
+    *,
+    opportunities: list[dict[str, Any]],
+    task_id: str,
+) -> dict[str, Any]:
+    """Top-N signal card — each opp is a row with metadata + a
+    ``[生成报告]`` button whose value is the action payload the
+    inbound handler expects.
+
+    Buttons stack vertically; Feishu allows up to N actions per card,
+    but we cap at 5 (one per opp) so a single card renders cleanly
+    on mobile. When N > 5, the bot splits across multiple cards —
+    that work happens in :func:`_post_pipeline_summary`.
+    """
+    elements: list[dict[str, Any]] = []
+    for idx, opp in enumerate(opportunities, start=1):
+        title = str(opp.get("title") or "(未命名)")[:60]
+        score = float(opp.get("total_score") or 0)
+        category = str(opp.get("category") or "—")
+        source_count = int(opp.get("source_count") or 0)
+        opp_id = int(opp.get("id") or 0)
+
+        # — Row content
+        row_md = (
+            f"**#{idx} {title}**\n"
+            f"Score: **{score:.0f}** · "
+            f"Category: `{category}` · Sources: {source_count}"
         )
-    finally:
-        await client.aclose()
+        if opp.get("summary"):
+            row_md += f"\n> {_truncate(str(opp.get('summary')), max_chars=80)}"
+        elements.append(
+            {
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": row_md},
+            }
+        )
+
+        # — Action button for this opp
+        if opp_id > 0:
+            elements.append(
+                {
+                    "tag": "action",
+                    "actions": [
+                        {
+                            "tag": "button",
+                            "type": "primary",
+                            "text": {
+                                "tag": "plain_text",
+                                "content": "生成报告",
+                            },
+                            "value": {
+                                "action": "write_detail_docx",
+                                "opportunity_id": opp_id,
+                            },
+                        }
+                    ],
+                }
+            )
+        # — Separator between rows (skip after last)
+        if idx < len(opportunities):
+            elements.append({"tag": "hr"})
+
+    # — Footer note
+    elements.append(
+        {
+            "tag": "note",
+            "elements": [
+                {
+                    "tag": "plain_text",
+                    "content": (
+                        f"Via /run · task_id={task_id} · "
+                        "点击按钮 = card.action.trigger_v1"
+                    ),
+                }
+            ],
+        }
+    )
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "🔥 Top-N 机会信号"},
+            "template": "blue",
+        },
+        "elements": elements,
+    }
+
+
+def _truncate(text: str, *, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "…"
+
+
+async def _fetch_top_opportunities(
+    *,
+    settings: Settings,
+    n: int,
+) -> list[dict[str, Any]]:
+    """GET /api/internal/opportunities/top — Top-N by total_score.
+
+    Fail-open: on HTTP error we log warn and return ``[]``. The header
+    card is still useful on its own; the user just won't get the
+    Top-N buttons. (Phase 30 design — same approach as the in-bot
+    paywall fall-open.)
+    """
+    base_url = (
+        getattr(settings, "feishu_internal_api_url", "") or "http://localhost:8000"
+    ).rstrip("/")
+    webhook_secret = (
+        settings.app_secret_key
+        or getattr(settings, "feishu_webhook_secret", "")
+        or ""
+    )
+    headers: dict[str, str] = {}
+    if webhook_secret:
+        headers["X-Radar-Webhook"] = webhook_secret
+    url = f"{base_url}/api/internal/opportunities/top?n={n}"
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url, headers=headers)
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "feishu_topn_fetch_failed",
+            url=url,
+            error=str(exc)[:200],
+        )
+        return []
+    if response.status_code >= 400:
+        logger.warning(
+            "feishu_topn_fetch_http_error",
+            url=url,
+            status=response.status_code,
+        )
+        return []
+    try:
+        payload = response.json()
+    except ValueError:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    items = payload.get("items") or []
+    return [it for it in items if isinstance(it, dict)]
 
 
 __all__ = [
