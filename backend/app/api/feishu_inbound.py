@@ -446,16 +446,18 @@ async def _handle_card_action(
     Idempotency
     -----------
 
-    Unlike ``im.message.receive_v1``, button clicks have a ``user_action``
-    context but no stable ``event_id`` worth dedup-ing in Redis. We rely
-    on :class:`DetailDocxService`'s per-opportunity SETNX cache to
-    suppress duplicate docx writes (24h window) — see
-    :func:`app.services.feishu.detail_docx.write_to_drive`.
+    Phase 31 P31-B: button clicks now carry a ``header.event_id`` (see
+    card_actions.py for the Feishu payload shape), so we reuse
+    :func:`app.services.feishu.inbound._event_already_processed` —
+    *transport-level* SETNX that suppresses Feishu 5xx retries.
 
-    Feishu retries the action event up to 3 times on timeouts; the
-    response window is generous (~30s) and DetailDocxService keeps the
-    call well under that for cached hits. Fresh writes cost ~2-3s on
-    Feishu's side.
+    This stacks with :class:`DetailDocxService`'s per-opportunity SETNX
+    cache (24h window, see :func:`app.services.feishu.detail_docx.write_to_drive`)
+    which is *business-level* — same opportunity, same day, same doc_id.
+    The two layers are defense-in-depth, not interchangeable:
+
+      * event_id SETNX → no Feishu retry double-spend
+      * detail-docx SETNX → idempotent docx body across intentional re-clicks
     """
     from app.services.feishu.card_actions import (
         handle_card_action_trigger,
@@ -465,6 +467,24 @@ async def _handle_card_action(
 
     event_id = str((body.get("header") or {}).get("event_id") or "")
     action_name, value = (None, None)  # for logging
+
+    # Phase 31 P31-B: transport-level event_id SETNX.
+    # No event_id → fail-open (no dedup possible); some Feishu edge
+    # events omit it. See PR-2 design §3.
+    if event_id:
+        from app.services.feishu.inbound import _event_already_processed
+        from app.services.redis_client import get_redis
+
+        redis_for_dedup = await get_redis()
+        if await _event_already_processed(
+            event_id, redis_client=redis_for_dedup
+        ):
+            logger.info(
+                "feishu_card_action_duplicate_skipped",
+                event_id=event_id,
+            )
+            return {"code": 0, "msg": "ok", "duplicate": True}
+
     try:
         card_reply = await handle_card_action_trigger(
             event_payload=body,
