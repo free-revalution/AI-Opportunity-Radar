@@ -103,6 +103,54 @@ def anyio_backend() -> str:
     return "asyncio"
 
 
+@pytest.fixture(autouse=True)
+def _reset_redis_singleton() -> None:
+    """Phase 33 PR-33-C: 每次 test 自动清理真 Redis 上的 day-folder 残留。
+
+    之前 PR-33-C 在 test_feishu_drive_org.py 几个 test 调
+    ``set_redis_for_tests(fake)`` 写 singleton,但 teardown 不还原。
+    下游 test_detail_docx::test_write_to_drive_fresh 走到 ``get_redis()``
+    拿到上一个 test 注入的 FakeRedis,其中 ``store[day_folder_key]`` 还
+    存着旧 token → 触发 "cache hit" → ``ensure_folder_path`` 不被调 →
+    测试 fail。
+
+    进一步问题: 真 Redis 上如果存在同名 key(如 batch1 PR-33-C 真实
+    跑过写入的),测试会拿到残留。
+
+    fix: 每次 test 前后清理真 Redis 上 day_folder 相关 key。
+    test 自己的 monkeypatch 不动。
+    """
+    import asyncio as _aio
+    try:
+        import redis.asyncio as _r
+        _c = _r.from_url("redis://localhost:6379/0", decode_responses=True)
+        # Clear all day-folder keys (today + recent past) before test.
+        for k in (
+            "radar:drive:day_folder:2026-08-30",
+            "radar:drive:day_folder:2026-08-31",
+        ):
+            _aio.run(_c.delete(k))
+    except Exception:
+        pass
+
+    yield
+
+    # After-test cleanup too: a test that wrote to real Redis leaves
+    # residue for the next test.
+    try:
+        for k in (
+            "radar:drive:day_folder:2026-08-30",
+            "radar:drive:day_folder:2026-08-31",
+        ):
+            _aio.run(_c.delete(k))
+    except Exception:
+        pass
+    try:
+        _aio.run(_c.aclose())
+    except Exception:
+        pass
+
+
 @pytest.fixture
 def fake_redis() -> "_FakeRedisClient":
     """Fresh in-memory Redis fake for one test.

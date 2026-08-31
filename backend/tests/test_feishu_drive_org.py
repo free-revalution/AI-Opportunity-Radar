@@ -338,15 +338,32 @@ class _FakeRedis:
         return True
 
 
-@pytest.mark.asyncio
-async def test_day_folder_uses_redis_cache_on_second_call() -> None:
-    """PR-33-C 回归: 第二次 get_or_create_day_folder 应该命中 Redis,
-    不再调 ensure_folder_path。
+def _set_redis_with_cleanup(monkeypatch, value) -> None:
+    """替换 redis singleton,test 结束自动还原 — 防 PR-33-C 测试污染
+    其他模块(尤其 detail_docx)的 get_redis() 调用。
+
+    Phase 33 PR-33-C 修复: 之前 3 个测试用 ``set_redis_for_tests(fake)``
+    直接写 singleton,test 结束不还原。下游 test_detail_docx::test_write_to_drive_fresh
+    走到 ``get_redis()`` 拿到的还是上一个 test 的 FakeRedis,且其中
+    ``store[day_folder_key]`` 还存着之前的 token,导致 "cache hit",
+    ``ensure_folder_path`` 不被调用 → ``drive._folders`` 空 → 测试失败。
+
+    fix: monkeypatch.setattr 把 _client 还原成 test 前的值。
     """
     from app.services import redis_client
 
+    redis_client.set_redis_for_tests(value)
+    # monkeypatch 在 teardown 时把 _client 还原回原值(None 或上一个 fake)
+    monkeypatch.setattr(redis_client, "_client", value)
+
+
+@pytest.mark.asyncio
+async def test_day_folder_uses_redis_cache_on_second_call(monkeypatch) -> None:
+    """PR-33-C 回归: 第二次 get_or_create_day_folder 应该命中 Redis,
+    不再调 ensure_folder_path。
+    """
     fake = _FakeRedis()
-    redis_client.set_redis_for_tests(fake)
+    _set_redis_with_cleanup(monkeypatch, fake)
 
     drive = FakeDriveClient()
     # Pre-create folder 让 ensure_folder_path 能找到
@@ -383,11 +400,9 @@ async def test_day_folder_uses_redis_cache_on_second_call() -> None:
 
 
 @pytest.mark.asyncio
-async def test_day_folder_falls_back_when_redis_down() -> None:
+async def test_day_folder_falls_back_when_redis_down(monkeypatch) -> None:
     """PR-33-C 回归: Redis 不可用时 (None) 走原路径,功能不变。"""
-    from app.services import redis_client
-
-    redis_client.set_redis_for_tests(None)  # Redis 挂
+    _set_redis_with_cleanup(monkeypatch, None)  # Redis 挂
 
     drive = FakeDriveClient()
     service = DriveOrgService(drive=drive)
@@ -398,12 +413,10 @@ async def test_day_folder_falls_back_when_redis_down() -> None:
 
 
 @pytest.mark.asyncio
-async def test_day_folder_per_day_keys() -> None:
+async def test_day_folder_per_day_keys(monkeypatch) -> None:
     """PR-33-C 回归: 不同 day 用不同 cache key — 不会跨天拿到旧 token。"""
-    from app.services import redis_client
-
     fake = _FakeRedis()
-    redis_client.set_redis_for_tests(fake)
+    _set_redis_with_cleanup(monkeypatch, fake)
 
     drive = FakeDriveClient()
     service = DriveOrgService(drive=drive)
