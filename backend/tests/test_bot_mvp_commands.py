@@ -273,6 +273,12 @@ async def test_router_status_renders_run_summary():
                         "items": [],
                     },
                     "total_signals": 12,
+                    "subsystems": {
+                        "database": "ok",
+                        "redis": "ok",
+                        "feishu": "ok",
+                        "llm": "ok",
+                    },
                     "now": "2026-08-30T08:30:00+00:00",
                 }
             )
@@ -281,8 +287,11 @@ async def test_router_status_renders_run_summary():
     router = _make_router(handler)
     reply = await router.route(BotCommand(kind="status"))
     assert "系统状态" in reply.text
-    assert "Collector: OK" in reply.text
+    # Phase 33 PR-33-D: 4 真探针都 ok → 全部渲染为 OK
     assert "Database: OK" in reply.text
+    assert "Redis: OK" in reply.text
+    assert "Feishu: OK" in reply.text
+    assert "LLM: OK" in reply.text
     assert "Last Run" in reply.text
     assert "success" in reply.text
     assert "信息源: 5 / 5 healthy" in reply.text
@@ -314,6 +323,35 @@ async def test_router_status_handles_endpoint_error():
     router = _make_router(handler)
     reply = await router.route(BotCommand(kind="status"))
     assert "暂时无法获取系统状态" in reply.text
+
+
+async def test_router_status_renders_warn_and_down_markers():
+    """Phase 33 PR-33-D 回归: subsystem=warn 渲染 ⚠️,down 渲染 ✗。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/internal/status":
+            return _ok_json(
+                {
+                    "last_run": None,
+                    "sources": {"total": 5, "healthy": 0, "items": []},
+                    "total_signals": 0,
+                    "subsystems": {
+                        "database": "ok",
+                        "redis": "down",
+                        "feishu": "warn",
+                        "llm": "ok",
+                    },
+                    "now": "2026-08-30T08:30:00+00:00",
+                }
+            )
+        return httpx.Response(404)
+
+    router = _make_router(handler)
+    reply = await router.route(BotCommand(kind="status"))
+    assert "Database: OK" in reply.text
+    assert "Redis: ✗" in reply.text  # down
+    assert "Feishu: ⚠️" in reply.text  # warn
+    assert "LLM: OK" in reply.text
 
 
 # ---------------------------------------------------------------------------

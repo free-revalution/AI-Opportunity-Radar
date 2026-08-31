@@ -878,7 +878,12 @@ class FeishuCommandRouter:
         )
 
     async def _status(self) -> CommandReply:
-        """/status — show last run summary + per-source health."""
+        """/status — show last run summary + per-source health.
+
+        Phase 33 PR-33-D: subsystem 健康状态从硬编码 "OK" 改成从
+        ``/api/internal/status`` 的 ``subsystems`` 字段真探针渲染。
+        每个子系统 ok → "OK" / warn → "⚠️" / down → "✗"。
+        """
         result = await self._get("/api/internal/status")
         if result.get("_status", 200) >= 400:
             return CommandReply(
@@ -903,13 +908,33 @@ class FeishuCommandRouter:
                 f"信号 {last.get('signal_count') or 0}"
             )
 
+        # Phase 33 PR-33-D: 真探针状态渲染
+        subsystems = result.get("subsystems") or {}
+
+        def _render(key: str, label: str) -> str:
+            state = subsystems.get(key) or "warn"
+            if state == "ok":
+                marker = "OK"
+            elif state == "warn":
+                marker = "⚠️"
+            else:  # down
+                marker = "✗"
+            return f"{label}: {marker}"
+
+        subsystem_lines = "\n".join(
+            _render(k, label)
+            for k, label in (
+                ("database", "Database"),
+                ("redis", "Redis"),
+                ("feishu", "Feishu"),
+                ("llm", "LLM"),
+            )
+        )
+
         return CommandReply(
             text=(
                 "系统状态\n\n"
-                "Collector: OK\n"
-                "Database: OK\n"
-                "LLM: OK\n"
-                "Feishu: OK\n\n"
+                f"{subsystem_lines}\n\n"
                 f"{run_line}\n\n"
                 f"信息源: {healthy} / {total} healthy\n"
                 f"累计信号: {result.get('total_signals', 0)}"

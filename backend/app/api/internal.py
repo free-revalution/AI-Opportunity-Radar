@@ -24,6 +24,7 @@ Kept here:
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -32,6 +33,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_admin
+from app.config import Settings, get_settings
 from app.db import get_session
 from app.metrics import record_pipeline_run
 from app.repositories import RunRepository
@@ -511,9 +513,21 @@ async def run_pipeline(
 )
 async def get_status(
     session: AsyncSession = Depends(get_session),
+    settings: Settings = Depends(get_settings),
     _actor: str = Depends(require_admin),
 ) -> dict[str, Any]:
-    """Feishu /status reply source."""
+    """Feishu /status reply source.
+
+    Phase 33 PR-33-D: 加 ``subsystems`` 字段,4 个真探针:
+      - database: SELECT 1
+      - redis: ping
+      - feishu: 看 token 是否配置(token 配置即 healthy,
+        不发真实 HTTP — 飞书鉴权失败在 /run 时已经报错)
+      - llm: 看主 provider API key 是否配置
+
+    每个子系统返回 ``"ok" | "warn" | "down"``,inbound _status 把
+    这些状态渲染成 OK / ⚠️ / ✗。
+    """
     runs = RunRepository(session)
     latest = await runs.latest()
 
@@ -521,13 +535,82 @@ async def get_status(
     total_signals = await _signal_total(session)
     dedup = await _dedup_today_stats(session)
 
+    subsystems = await _probe_subsystems(session=session, settings=settings)
+
     return {
         "last_run": _serialize_run(latest) if latest else None,
         "sources": sources,
         "total_signals": total_signals,
         "dedup_today": dedup,
+        "subsystems": subsystems,
         "now": datetime.now(tz=timezone.utc).isoformat(),
     }
+
+
+async def _probe_subsystems(
+    *,
+    session: AsyncSession,
+    settings: Settings,
+) -> dict[str, str]:
+    """Phase 33 PR-33-D: 4 个子系统健康探针。
+
+    每个返回 ``"ok" | "warn" | "down"``,失败原因不外泄(避免 reply 膨胀)。
+    """
+    out: dict[str, str] = {}
+
+    # 1) database — SELECT 1
+    try:
+        from sqlalchemy import text
+
+        await session.execute(text("SELECT 1"))
+        out["database"] = "ok"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("status_probe_database_failed", error=str(exc)[:200])
+        out["database"] = "down"
+
+    # 2) redis — ping (fail-open if client None)
+    try:
+        from app.services.redis_client import get_redis
+
+        redis = await get_redis()
+        if redis is None:
+            out["redis"] = "warn"  # 不可达但非致命
+        else:
+            try:
+                await asyncio.wait_for(redis.ping(), timeout=1.0)
+                out["redis"] = "ok"
+            except Exception as exc:
+                logger.warning("status_probe_redis_failed", error=str(exc)[:200])
+                out["redis"] = "down"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("status_probe_redis_unexpected", error=str(exc)[:200])
+        out["redis"] = "warn"
+
+    # 3) feishu — 简易配置探针(token 配齐即 OK,真实 HTTP 在 /run 阶段验证)
+    if (
+        settings.feishu_app_id
+        and settings.feishu_app_secret
+        and settings.feishu_webhook_url
+    ):
+        out["feishu"] = "ok"
+    else:
+        out["feishu"] = "warn"
+
+    # 4) llm — 看主 provider API key
+    primary = settings.llm_default_provider
+    if primary == "MiniMax":
+        configured = bool(settings.MiniMax_api_key)
+    elif primary == "openai":
+        configured = bool(settings.openai_api_key)
+    elif primary == "anthropic":
+        configured = bool(settings.anthropic_api_key)
+    elif primary == "gemini":
+        configured = bool(settings.gemini_api_key)
+    else:
+        configured = False
+    out["llm"] = "ok" if configured else "warn"
+
+    return out
 
 
 @router.get(
