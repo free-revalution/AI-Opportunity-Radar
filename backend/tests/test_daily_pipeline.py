@@ -351,3 +351,37 @@ async def test_pipeline_run_failed_branch_commits_run_row(client, monkeypatch):
     )
     assert last["error"] is not None
     assert "simulated research outage" in last["error"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 33 PR-33-H — Drive 未配置 → soft skip(非 success 内嵌 error)
+# ---------------------------------------------------------------------------
+async def test_pipeline_drive_not_configured_returns_soft_skip(
+    client, monkeypatch
+) -> None:
+    """PR-33-H: drive 未配置时,response.docx 是 ``{"skipped": "drive_not_configured"}``
+    而不是 ``{"error": "FEISHU_DRIVE_ROOT_FOLDER_TOKEN not configured"}``。
+
+    通过 monkeypatch settings.feishu_drive_root_folder_token="" 走 else 分支。
+    """
+    from app.config import get_settings
+
+    # 1) 清空 drive token,让 internal.run_pipeline 走 else 分支
+    monkeypatch.setattr(
+        get_settings(), "feishu_drive_root_folder_token", ""
+    )
+
+    response = client.post(
+        "/api/internal/pipeline/run",
+        json={"send_digest": False, "write_docx": True},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # status 仍然是 success — drive 是 optional sink
+    assert body["status"] == "success"
+    # docx 字段应该 soft skip,不含 error key
+    docx = body.get("docx") or {}
+    assert "error" not in docx, (
+        f"drive not configured should be soft skip, got error: {docx.get('error')}"
+    )
+    assert docx.get("skipped") == "drive_not_configured"

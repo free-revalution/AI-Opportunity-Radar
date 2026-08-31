@@ -463,9 +463,12 @@ async def run_pipeline(
                     )
                     docx_ref = {"error": str(exc)[:200]}
             else:
-                docx_ref = {
-                    "error": "FEISHU_DRIVE_ROOT_FOLDER_TOKEN not configured"
-                }
+                # Phase 33 PR-33-H: drive 未配置 → soft skip。
+                # 之前 ``docx_ref = {"error": "..."}`` 嵌在 success 响应里,
+                # 操作员读 summary 看到 "status=success" 同时有 "error" 字段,
+                # 困惑。改成 ``{"skipped": "drive_not_configured"}`` 语义清晰,
+                # 真异常才走 error 路径。
+                docx_ref = {"skipped": "drive_not_configured"}
 
         await runs.finish_success(
             run,
