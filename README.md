@@ -75,42 +75,66 @@ dedup-vs-clustering regressions at a glance.
 
 ---
 
-## 飞书云文档 4 段结构 (Phase 25 v2.1)
+## 飞书云文档结构 (Phase 25 v2.1 + Phase 30 收敛)
 
-每日 `08:00` cron 会把日报同时写到飞书云盘,落地到一个固定的 4 段结构:
+每日 `08:00` cron 会把日报写到飞书云盘,落地到一个固定的目录结构。
+**Phase 30** 收敛到单一有用段 — 删掉了不实用的 📌 首页 / 📅 今日 / 📚 信息源 三段:
 
 ```
 📁 <FEISHU_DRIVE_ROOT_FOLDER_TOKEN>           ← 在飞书云盘创建并复制 token
-├── 📌 首页
-├── 📅 今日
-├── 📁 每日报告
-│   ├── 2026-08-30/
-│   │   └── 2026-08-30 AI 商业日报.docx
-│   ├── 2026-08-29/
-│   │   └── 2026-08-29 AI 商业日报.docx
-│   └── …
-└── 📚 信息源
+└── 📁 每日报告
+    ├── 2026-08-30/
+    │   ├── 2026-08-30 AI 商业日报.docx       ← Phase 29 每日报告
+    │   └── detail-<opp-slug>.docx            ← Phase 30 用户点按钮生成的详情
+    ├── 2026-08-29/
+    │   └── …
+    └── …
 ```
+
+Phase 30 同时启用了 2 张飞书多维表格:
+
+* **Data 表**(`FEISHU_BITABLE_DATA_APP_TOKEN`): 每次 `/run` 抓取的 RawItem
+  按 `Source:External ID` 主键落库,**绝不丢数据**。Operation 员可直接在
+  飞书后台按信息源 / 类别筛选 / 排序,无需 SQL。
+* **Opportunities 表**(`FEISHU_BITABLE_OPPORTUNITIES_APP_TOKEN`): 筛选后
+  Top-N(by `total_score`)机会;行带 `Title / Score / Category / Sub Scores /
+  Summary / Radar URL / Source Count`,可直接导出 CSV。
+
+`/run` 完成后,机器人会发**两张交互卡**:
+1. **Header 卡**(绿) — 计数摘要,显示 `run_id / raw_count / signal_count`。
+2. **Top-N 信号卡**(蓝) — 每条机会一行 + `[生成报告]` 按钮;按钮的
+   `value={"action":"write_detail_docx","opportunity_id":<id>}` 触发
+   `card.action.trigger_v1` → 写 `detail-<slug>.docx` → 回推 `[查看详情]` 卡。
 
 操作步骤:
 
 1. 飞书云盘 → 新建文件夹(任意命名)→ 复制 token → `FEISHU_DRIVE_ROOT_FOLDER_TOKEN=`
-2. `make migrate` → 新增 `daily_digest_docs` 表(date PK + doc_id + doc_url + folder_token)
-3. 启动后端,调用 `GET /api/internal/docs/tree` → 自动 ensure 4 个子段(幂等)
-4. 手动触发完整 pipeline:
+2. `make migrate` → 新增 `daily_digest_docs` + 给 `opportunities` 加
+   `problem / potential_business / keywords_json` 三列
+3. 启动后端,调用 `GET /api/internal/docs/tree` → 自动 resolve 单段结构
+4. (可选) 在飞书后台创建 Data App,把 token 填到
+   `FEISHU_BITABLE_DATA_APP_TOKEN=` — 留空时第一次 `/run` 自动创建并 warn
+5. (可选) 在 Opportunities 表手动加 Phase 30 新列:
+   `Sub Scores / Summary / Source Count` — 代码端 `optional[str]` 容错
+6. 手动触发完整 pipeline:
    ```bash
    curl -X POST http://localhost:8000/api/internal/pipeline/run \
         -H "X-Radar-Webhook: $RADAR_WEBHOOK_SECRET" \
         -d '{"send_digest": true, "write_docx": true}'
    ```
-5. 查询某天的 docx:`GET /api/internal/docs/daily?date=2026-08-30`
+7. 查询某天的 docx:`GET /api/internal/docs/daily?date=2026-08-30`
+8. 查询 Top-N(给卡片用):`GET /api/internal/opportunities/top?n=5`
 
 `write_docx: true` 时,`run_pipeline` 会额外:
 - 调 `DriveOrgService.write_daily_digest()` 写当日 Docx
 - 持久化 `DailyDigestDoc` 行(date PK,FK 到 runs.id)
 - 在 `run_pipeline` 的响应里返回 `docx: {date, doc_id, doc_url, folder_token}`
+- 同时返回 `data_sink: {inserted, skipped_dedup, total}` 与
+  `opportunities_sink: {inserted, requested, table}` — 两个多维表格 sink 的
+  落地计数
 
-若 `FEISHU_DRIVE_ROOT_FOLDER_TOKEN` 未配置,`write_docx` 会被静默跳过并返回 `{error: "..."}`,不会阻断 pipeline。
+若 `FEISHU_DRIVE_ROOT_FOLDER_TOKEN` 未配置,`write_docx` 会被静默跳过并
+返回 `{error: "..."}`,不会阻断 pipeline。
 
 ---
 
