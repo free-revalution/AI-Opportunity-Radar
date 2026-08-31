@@ -316,15 +316,22 @@ async def run_pipeline(
         # ----- Phase 30 — store-first + chat-pick architecture -----
         # 2.5 把本次 /run 新增的 RawItem 写入 Data 多维表格(永远不丢)
         from app.config import get_settings as _get_settings
+        from app.utils import retry_async as _retry_async
 
         _phase30_settings = _get_settings()
+        _max_retries = _phase30_settings.radar_pipeline_max_retries
+        _base_delay = _phase30_settings.radar_pipeline_base_delay_seconds
         data_sink: dict[str, Any] = {"inserted": 0, "skipped_duplicate": 0}
         # 总是尝试(空 token 时 DataTableClient 内部 ensure_app 会自动建)
         try:
-            data_sink = await _write_data_table(
+            data_sink = await _retry_async(
+                _write_data_table,
                 session=session,
                 settings=_phase30_settings,
                 run_id=run.id,
+                max_attempts=_max_retries,
+                base_delay=_base_delay,
+                op_name="pipeline.write_data_table",
             )
         except Exception as exc:  # noqa: BLE001 — record and continue
             logger.warning(
@@ -336,10 +343,14 @@ async def run_pipeline(
 
         # 4.5 Screening 后回填 Data 表的 Category / Score / Opportunity ID
         try:
-            backfilled = await _backfill_data_table_screening(
+            backfilled = await _retry_async(
+                _backfill_data_table_screening,
                 session=session,
                 settings=_phase30_settings,
                 run_id=run.id,
+                max_attempts=_max_retries,
+                base_delay=_base_delay,
+                op_name="pipeline.backfill_data_table",
             )
             data_sink["backfilled"] = backfilled
         except Exception as exc:  # noqa: BLE001
@@ -353,11 +364,15 @@ async def run_pipeline(
         # 5.5 Phase 30 — Top-N opportunities 写 Opportunities 多维表格
         opportunities_sink: dict[str, Any] = {"inserted": 0}
         try:
-            opportunities_sink = await _write_opportunities_table(
+            opportunities_sink = await _retry_async(
+                _write_opportunities_table,
                 session=session,
                 settings=_phase30_settings,
                 run_id=run.id,
                 n=_phase30_settings.radar_top_n_push,
+                max_attempts=_max_retries,
+                base_delay=_base_delay,
+                op_name="pipeline.write_opportunities_table",
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -386,8 +401,23 @@ async def run_pipeline(
             preview_obj = await service.build_digest_preview()
             digest_preview = preview_obj.get("text", "") or ""
             if body.send_digest:
-                outcome = await service.send_digest()
-                digest_sent = outcome.notifications_delivered > 0
+                # Phase 31 P31-C: 飞书 IM 偶发 5xx 重试
+                from app.utils import retry_async as _retry_digest
+
+                try:
+                    outcome = await _retry_digest(
+                        service.send_digest,
+                        max_attempts=_max_retries,
+                        base_delay=_base_delay,
+                        op_name="pipeline.send_digest",
+                    )
+                    digest_sent = outcome.notifications_delivered > 0
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "internal_pipeline_send_digest_failed",
+                        run_id=run.id,
+                        error=str(exc),
+                    )
 
         # 7. docx — Phase 25 v2.1: write 每日报告 Docx (Feishu 4 段结构)
         if body.write_docx:
@@ -396,6 +426,7 @@ async def run_pipeline(
             from app.config import get_settings
             from app.services.feishu.content_client import FeishuDriveClient
             from app.services.feishu.drive_org import DriveOrgService
+            from app.utils import retry_async as _retry_docx
 
             settings = get_settings()
             if settings.feishu_drive_root_folder_token:
@@ -404,12 +435,16 @@ async def run_pipeline(
                     drive=drive, settings=settings, session=session
                 )
                 try:
-                    ref = await docx_service.write_daily_digest(
+                    ref = await _retry_docx(
+                        docx_service.write_daily_digest,
                         day=DateType.today(),
                         markdown=digest_preview,
                         run_id=run.id,
                         raw_count=raw_count,
                         signal_count=signal_count,
+                        max_attempts=_max_retries,
+                        base_delay=_base_delay,
+                        op_name="pipeline.write_daily_docx",
                     )
                     await session.commit()
                     docx_ref = {

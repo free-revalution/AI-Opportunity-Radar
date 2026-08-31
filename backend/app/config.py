@@ -175,6 +175,13 @@ class Settings(BaseSettings):
     # the same opportunity within the window returns the previously
     # generated doc_id (no rewrite). Default 24h.
     radar_detail_doc_idempotency_ttl: int = 86_400
+    # Phase 31 P31-C — pipeline sink retry. Wraps the 5 Feishu write
+    # stages (``_write_data_table``, ``_backfill_data_table_screening``,
+    # ``_write_opportunities_table``, ``send_digest``, ``write_daily_docx``).
+    # Exponential backoff: ``base_delay`` × ``attempt_index - 1``.
+    # Default 3 attempts × 2s base = ~6s total worst case for a stage.
+    radar_pipeline_max_retries: int = 3
+    radar_pipeline_base_delay_seconds: float = 2.0
 
     # ---------- Bot channel selection (Phase 6 v2.0) ----------
     # Primary channel used by `NotificationService` + n8n daily digests.
