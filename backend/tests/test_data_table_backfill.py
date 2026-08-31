@@ -60,12 +60,17 @@ class _FakeBitableClient:
         page_token: Optional[str] = None,
         filter_: Optional[dict[str, Any]] = None,
     ) -> tuple[list[dict[str, Any]], Optional[str]]:
-        # 简化的 Source is filter
-        out: list[dict[str, Any]] = []
-        for r in self._records:
-            fields = r.get("fields") or {}
-            if filter_ and "conditions" in filter_:
-                conds = filter_["conditions"]
+        # Phase 33 PR-33-B: 支持 page_token 翻页 — FakeBitableClient
+        # 之前总是返回 None(整张表),不能验证多页场景。
+        # 简单实现: 把 records 按 page_size 切片,page_token 是下一页 offset
+        # 的字符串形式 "page_N"。
+
+        # 1) 应用 filter
+        if filter_ and "conditions" in filter_:
+            conds = filter_["conditions"]
+            filtered = []
+            for r in self._records:
+                fields = r.get("fields") or {}
                 match = True
                 for c in conds:
                     fn = c.get("field_name")
@@ -77,10 +82,25 @@ class _FakeBitableClient:
                         match = False
                         break
                 if match:
-                    out.append(r)
-            else:
-                out.append(r)
-        return out[:page_size], None
+                    filtered.append(r)
+        else:
+            filtered = list(self._records)
+
+        # 2) 解析 page_token → offset
+        offset = 0
+        if page_token:
+            try:
+                offset = int(page_token.replace("page_", ""))
+            except (ValueError, AttributeError):
+                offset = 0
+
+        # 3) 切片 + 算 next_token
+        page = filtered[offset : offset + page_size]
+        next_offset = offset + page_size
+        next_token = (
+            f"page_{next_offset}" if next_offset < len(filtered) else None
+        )
+        return page, next_token
 
     async def batch_create_records(
         self,
@@ -525,3 +545,160 @@ async def test_update_screening_results_no_metric_on_success(
     updated = await client.update_screening_results(mapping=mapping)
     assert updated == 1
     assert metric_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 33 PR-33-B — batched list_records 替代 N+1 串行查
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_fetch_records_by_sources_single_page(
+    sqlite_session: Any, fake_bitable: _FakeBitableClient
+) -> None:
+    """PR-33-B: 单页场景(< 500 行)— helper 一次 fetch 返回 {source: record_id}。"""
+    fake_bitable._records = [
+        {"record_id": "r1", "table_id": "tb_data",
+         "fields": {"Source": "github:g1", "Title": "t1"}},
+        {"record_id": "r2", "table_id": "tb_data",
+         "fields": {"Source": "reddit:r1", "Title": "r1"}},
+    ]
+
+    from app.services.feishu.data_table import DataTableClient
+
+    client = DataTableClient(app_client=_FakeAppClient(settings=__import__(
+        "app.config", fromlist=["get_settings"]
+    ).get_settings()))
+    client._bitable = fake_bitable  # type: ignore[assignment]
+
+    out = await client._fetch_records_by_sources(
+        table_id="tb_data", wanted_sources={"github:g1", "reddit:r1"}
+    )
+    assert out == {"github:g1": "r1", "reddit:r1": "r2"}
+
+
+@pytest.mark.asyncio
+async def test_fetch_records_by_sources_paginates(
+    sqlite_session: Any, fake_bitable: _FakeBitableClient
+) -> None:
+    """PR-33-B: 多页场景(> page_size)— helper 翻页拿全表。"""
+    # 1200 行,page_size=500 → 3 页(500 + 500 + 200)
+    fake_bitable._records = [
+        {"record_id": f"r{i:04d}", "table_id": "tb_data",
+         "fields": {"Source": f"github:g{i:04d}", "Title": f"t{i}"}}
+        for i in range(1200)
+    ]
+
+    from app.services.feishu.data_table import DataTableClient
+
+    client = DataTableClient(app_client=_FakeAppClient(settings=__import__(
+        "app.config", fromlist=["get_settings"]
+    ).get_settings()))
+    client._bitable = fake_bitable  # type: ignore[assignment]
+
+    # wanted_sources 是 subset,只返回这 3 行
+    wanted = {"github:g0001", "github:g0500", "github:g1199"}
+    out = await client._fetch_records_by_sources(
+        table_id="tb_data", wanted_sources=wanted, page_size=500
+    )
+    assert out == {
+        "github:g0001": "r0001",
+        "github:g0500": "r0500",
+        "github:g1199": "r1199",
+    }
+
+
+@pytest.mark.asyncio
+async def test_existing_sources_uses_single_fetch_not_n_plus_1(
+    sqlite_session: Any, fake_bitable: _FakeBitableClient
+) -> None:
+    """PR-33-B 回归: existing_sources 应该 1 次 list_records,不是 N 次。
+
+    通过计数 fake.list_records 调用次数来证明。
+    """
+    # Pre-seed 5 行,代表"已存在"的主键
+    fake_bitable._records = [
+        {"record_id": f"r{i}", "table_id": "tb_data",
+         "fields": {"Source": f"github:g{i}", "Title": f"t{i}"}}
+        for i in range(5)
+    ]
+
+    from app.services.feishu.data_table import DataTableClient
+
+    client = DataTableClient(app_client=_FakeAppClient(settings=__import__(
+        "app.config", fromlist=["get_settings"]
+    ).get_settings()))
+    client._bitable = fake_bitable  # type: ignore[assignment]
+
+    call_count = {"n": 0}
+    real_list = type(client._bitable).list_records
+
+    async def _counting_list(
+        self: Any, **kwargs: Any
+    ) -> tuple[list[dict[str, Any]], Optional[str]]:
+        call_count["n"] += 1
+        return await real_list(self, **kwargs)
+
+    import unittest.mock
+    with unittest.mock.patch.object(
+        type(client._bitable), "list_records", _counting_list
+    ):
+        # 5 个 source_key 进来,新 helper 应该 1 次 fetch
+        existing = await client.existing_sources(
+            sources=[f"github:g{i}" for i in range(5)]
+        )
+    assert existing == {f"github:g{i}" for i in range(5)}
+    # PR-33-B: 单次 fetch。如果回退到 N+1 这里会是 5(per-source filter)
+    assert call_count["n"] == 1, (
+        f"existing_sources made {call_count['n']} list_records calls — "
+        "PR-33-B 回归:有人改回 N+1 模式了?"
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_screening_results_uses_single_lookup(
+    sqlite_session: Any, fake_bitable: _FakeBitableClient
+) -> None:
+    """PR-33-B 回归: update_screening_results 应该 1 次 list_records 查 record_id。"""
+    # Pre-seed 3 行 record
+    fake_bitable._records = [
+        {"record_id": "r1", "table_id": "tb_data",
+         "fields": {"Source": "github:g1", "Title": "t1"}},
+        {"record_id": "r2", "table_id": "tb_data",
+         "fields": {"Source": "github:g2", "Title": "t2"}},
+        {"record_id": "r3", "table_id": "tb_data",
+         "fields": {"Source": "reddit:r1", "Title": "r1"}},
+    ]
+    fake_bitable._records_for_list = fake_bitable._records
+
+    from app.services.feishu.data_table import DataTableClient
+
+    client = DataTableClient(app_client=_FakeAppClient(settings=__import__(
+        "app.config", fromlist=["get_settings"]
+    ).get_settings()))
+    client._bitable = fake_bitable  # type: ignore[assignment]
+    client._bitable._session = sqlite_session  # type: ignore[attr-defined]
+
+    call_count = {"n": 0}
+    real_list = type(client._bitable).list_records
+
+    async def _counting_list(
+        self: Any, **kwargs: Any
+    ) -> tuple[list[dict[str, Any]], Optional[str]]:
+        call_count["n"] += 1
+        return await real_list(self, **kwargs)
+
+    import unittest.mock
+    with unittest.mock.patch.object(
+        type(client._bitable), "list_records", _counting_list
+    ):
+        mapping = {
+            "github:g1": {"Category": "x", "Score": 80, "Opportunity ID": 1},
+            "github:g2": {"Category": "y", "Score": 70, "Opportunity ID": 2},
+            "reddit:r1": {"Category": "z", "Score": 60, "Opportunity ID": 3},
+        }
+        updated = await client.update_screening_results(mapping=mapping)
+    assert updated == 3
+    # PR-33-B: 单次 fetch 查 record_id(不是 3 次 per-source)
+    assert call_count["n"] == 1, (
+        f"update_screening_results made {call_count['n']} list_records — "
+        "PR-33-B 回归:有人改回 per-source 查?"
+    )

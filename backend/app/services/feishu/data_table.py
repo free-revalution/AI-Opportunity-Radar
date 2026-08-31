@@ -242,10 +242,75 @@ class DataTableClient:
     # ------------------------------------------------------------------
     # Dedup + bulk insert
     # ------------------------------------------------------------------
+    async def _fetch_records_by_sources(
+        self,
+        *,
+        table_id: str,
+        wanted_sources: Optional[set[str]] = None,
+        page_size: int = 500,
+    ) -> dict[str, str]:
+        """Phase 33 PR-33-B: 单次翻页整张表,本地按 Source 主键分组。
+
+        原 N+1 模式: 每个 source_key 一次 list_records(filter Source is X)
+        → /run 50 opp ≈ 50 次串行 HTTP,每 ~200-500ms,合计 10-25s。
+
+        新模式: 一次 list_records(无 filter,page_size=500 翻页)拉整张表,
+        本地用 set 过滤掉不在 wanted_sources 的行。/run 规模 << 表规模,
+        一次完整 fetch ~1-2s,即使 1 万行也只 ~3 次翻页。
+
+        Args:
+          table_id: Feishu Bitable table_id
+          wanted_sources: 可选 — 若提供,只返回主键在此集合内的行
+                          (避免把整张表都返回给 caller)
+          page_size: 飞书 list_records 上限 500
+
+        Returns:
+          ``{source_key: record_id}`` 字典。
+        """
+        out: dict[str, str] = {}
+        page_token: Optional[str] = None
+        pages = 0
+        while True:
+            try:
+                items, next_token = await self._bitable.list_records(
+                    table_id=table_id,
+                    page_size=page_size,
+                    page_token=page_token,
+                )
+            except FeishuContentError as exc:
+                logger.warning(
+                    "feishu_data_table_paged_fetch_failed",
+                    page=pages,
+                    error=str(exc),
+                )
+                break
+            for item in items:
+                rid = (item.get("record_id") or "").strip()
+                if not rid:
+                    continue
+                fields = item.get("fields") or {}
+                val = fields.get("Source")
+                if isinstance(val, list):
+                    val = val[0] if val else None
+                if val is None:
+                    continue
+                key = str(val)
+                if wanted_sources is not None and key not in wanted_sources:
+                    continue
+                out[key] = rid
+            pages += 1
+            if not next_token:
+                break
+            page_token = next_token
+        return out
+
     async def existing_sources(self, sources: Iterable[str]) -> set[str]:
-        """预查 Data 表中已存在的主键集合。"""
-        sources_list = [s for s in sources if s]
-        if not sources_list:
+        """预查 Data 表中已存在的主键集合。
+
+        Phase 33 PR-33-B: 单次翻页整张表(本地 filter),不再 N 次串行 list_records。
+        """
+        sources_set = {s for s in sources if s}
+        if not sources_set:
             return set()
         try:
             _, table_id = await self.ensure_table()
@@ -253,40 +318,18 @@ class DataTableClient:
             logger.warning("feishu_data_table_ensure_failed_skip_dedup", error=str(exc))
             return set()
 
-        existing: set[str] = set()
-        # 飞书 list_records filter_ 支持 `is` operator 对 Text 列精确匹配;
-        # 用 `or` 把每个 source 单独查(避免 array IN 的兼容性风险)
-        for source_key in sources_list:
-            try:
-                items, _ = await self._bitable.list_records(
-                    table_id=table_id,
-                    page_size=10,
-                    filter_={
-                        "conditions": [
-                            {
-                                "field_name": "Source",
-                                "operator": "is",
-                                "value": [source_key],
-                            }
-                        ]
-                    },
-                )
-            except FeishuContentError as exc:
-                logger.warning(
-                    "feishu_data_table_existing_lookup_failed",
-                    source_key=source_key,
-                    error=str(exc),
-                )
-                continue
-            for item in items:
-                fields = (item.get("fields") or {})
-                val = fields.get("Source")
-                if isinstance(val, list):
-                    if val:
-                        existing.add(str(val[0]))
-                elif val is not None:
-                    existing.add(str(val))
-        return existing
+        try:
+            record_by_source = await self._fetch_records_by_sources(
+                table_id=table_id, wanted_sources=sources_set
+            )
+        except FeishuContentError as exc:
+            logger.warning(
+                "feishu_data_table_existing_lookup_failed",
+                error=str(exc),
+            )
+            return set()
+        # 只返回 caller 关心的 source_key 集合,避免内部字典泄漏
+        return {k for k in record_by_source.keys() if k in sources_set}
 
     async def bulk_insert_raw_items(
         self,
@@ -389,38 +432,21 @@ class DataTableClient:
             )
             return 0
 
-        # 按 Source 批量查(每个主键一个 list 调用,简单可靠)
-        record_id_by_source: dict[str, str] = {}
-        for source_key in mapping.keys():
-            try:
-                items, _ = await self._bitable.list_records(
-                    table_id=table_id,
-                    page_size=10,
-                    filter_={
-                        "conditions": [
-                            {
-                                "field_name": "Source",
-                                "operator": "is",
-                                "value": [source_key],
-                            }
-                        ]
-                    },
-                )
-            except FeishuContentError as exc:
-                logger.warning(
-                    "feishu_data_table_lookup_for_update_failed",
-                    source_key=source_key,
-                    error=str(exc),
-                )
-                continue
-            for item in items:
-                rid = (item.get("record_id") or "").strip()
-                fields = item.get("fields") or {}
-                val = fields.get("Source")
-                if isinstance(val, list):
-                    val = val[0] if val else None
-                if rid and val is not None:
-                    record_id_by_source[str(val)] = rid
+        # 按 Source 批量查 record_id。
+        # Phase 33 PR-33-B: 单次翻页整张表(本地 filter wanted_sources),
+        # 不再每主键一次 list_records。
+        try:
+            record_id_by_source = await self._fetch_records_by_sources(
+                table_id=table_id,
+                wanted_sources=set(mapping.keys()),
+            )
+        except FeishuContentError as exc:
+            logger.warning(
+                "feishu_data_table_lookup_for_update_failed",
+                error=str(exc),
+                n=len(mapping),
+            )
+            record_id_by_source = {}
 
         # 并发 update
         import asyncio
