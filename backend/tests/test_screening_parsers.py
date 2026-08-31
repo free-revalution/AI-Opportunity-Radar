@@ -130,3 +130,86 @@ def test_bool_is_not_accepted_as_int():
     payload = _valid_payload(trend_strength=True)
     with pytest.raises(ValidationError):
         parse_screening_response(payload)
+
+
+# ---------------------------------------------------------------------------
+# Phase 29 regression — LLM responses occasionally omit a numeric
+# sub-score and return ``null``. The previous implementation raised
+# ``ValidationError("trend_strength: expected int, got NoneType")``,
+# which on a real /run with 50+ opportunities inflated
+# ``opportunities_failed`` to 10-20% of attempts. We now fall back to
+# a neutral 50 (mid-range) and warn-log the event.
+# ---------------------------------------------------------------------------
+def test_parse_none_subscore_defaults_to_neutral_50():
+    """When the LLM omits a sub-score (returns ``null``), the parser
+    must not raise — it should fall back to a neutral 50 so the
+    screening can still produce a signal."""
+    for field_name in (
+        "trend_strength",
+        "demand_strength",
+        "monetization_potential",
+        "competition_gap",
+        "china_gap",
+        "execution_feasibility",
+    ):
+        payload = _valid_payload(**{field_name: None})
+        result = parse_screening_response(payload)
+        assert getattr(result, field_name) == 50, (
+            f"{field_name}=None should default to 50 (neutral), "
+            f"got {getattr(result, field_name)}"
+        )
+
+
+def test_parse_all_none_subscores_still_produces_a_result():
+    """The pathological case — every sub-score is null. Screening must
+    still produce a ScreeningResult (not raise) so the opportunity
+    isn't dropped from the pipeline."""
+    payload = {
+        "is_business_relevant": True,
+        "category": "Other",
+        "problem": "",
+        "potential_business": "",
+        "trend_strength": None,
+        "demand_strength": None,
+        "monetization_potential": None,
+        "competition_gap": None,
+        "china_gap": None,
+        "execution_feasibility": None,
+    }
+    result = parse_screening_response(payload)
+    assert result.is_business_relevant is True
+    assert result.trend_strength == 50
+    assert result.demand_strength == 50
+    # — irrelevant cap rule must still apply: even with all-neutral
+    # subscores, is_business_relevant=True keeps them at 50 (not capped).
+    assert result.trend_strength == 50
+
+
+def test_parse_partial_none_subscores_keeps_others():
+    """Mix of null + real scores — the real scores must survive
+    intact, only the nulls get the neutral default."""
+    payload = _valid_payload(
+        trend_strength=None,
+        demand_strength=72,
+        monetization_potential=None,
+        competition_gap=40,
+        china_gap=None,
+        execution_feasibility=80,
+    )
+    result = parse_screening_response(payload)
+    assert result.trend_strength == 50       # None → neutral
+    assert result.demand_strength == 72      # kept
+    assert result.monetization_potential == 50  # None → neutral
+    assert result.competition_gap == 40      # kept
+    assert result.china_gap == 50            # None → neutral
+    assert result.execution_feasibility == 80  # kept
+
+
+def test_parse_missing_subscore_also_defaults_to_50():
+    """If the LLM omits the field entirely (not even ``null``), the
+    parser must also default to 50 — ``payload.get(name)`` returns
+    ``None`` in both cases so the same code path applies."""
+    payload = _valid_payload()
+    payload.pop("trend_strength")
+    result = parse_screening_response(payload)
+    assert result.trend_strength == 50

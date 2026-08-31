@@ -565,7 +565,14 @@ async def _execute_pipeline(*, record: TaskRecord, settings: Settings) -> None:
     summary: dict[str, Any] = {}
     error_text: Optional[str] = None
     try:
-        async with httpx.AsyncClient(timeout=300.0) as client:
+        # Phase 29 fix — real /run (with research stage on, Browser-Use
+        # polling included) takes 8-12 minutes on the live stack. The
+        # previous 300s timeout meant every bot-initiated /run surfaced
+        # as ``pipeline request failed:`` (empty exception) to the user,
+        # even though the pipeline itself completed server-side. We
+        # give 15 minutes here so the post-back carries the success
+        # summary instead of the timeout.
+        async with httpx.AsyncClient(timeout=900.0) as client:
             response = await client.post(
                 pipeline_url, json=payload, headers=headers
             )

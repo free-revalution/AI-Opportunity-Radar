@@ -4,6 +4,15 @@ The screening service relies on this module to coerce loosely-typed
 LLM output into a strictly-typed `ScreeningResult` dataclass. Anything
 that does not match the schema raises `ValidationError` so the caller
 can either retry or mark the opportunity as `failed`.
+
+Phase 29 fix — LLM responses occasionally omit a numeric sub-score
+(``trend_strength`` etc.) and return ``null`` instead. The previous
+implementation raised :class:`ValidationError` for every such row,
+which on a real-mode run with 50+ opportunities turned into 8-10
+``opp <id>: parse error: trend_strength: expected int, got NoneType``
+errors and left ``opportunities_failed`` inflated. We now fall back
+to a neutral default (50 — mid-range) and warn-log the event so the
+operator can investigate if the pattern becomes systemic.
 """
 
 from __future__ import annotations
@@ -11,7 +20,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.utils import ValidationError
+from app.utils import ValidationError, get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass(slots=True)
@@ -32,7 +43,39 @@ class ScreeningResult:
     confidence: float = 0.5
 
 
-def _as_int(value: Any, *, field: str) -> int:
+# Neutral mid-range default applied when the LLM returns ``None`` for
+# a numeric sub-score. 50 keeps the opportunity in the screening pool
+# (so a real run doesn't lose 10-20% of its signals) while flagging it
+# as uncertain — the warn-log gives the operator visibility.
+_NEUTRAL_INT_DEFAULT = 50
+
+
+def _as_int(
+    value: Any,
+    *,
+    field: str,
+    default: int = _NEUTRAL_INT_DEFAULT,
+) -> int:
+    """Coerce ``value`` to a clamped int in [0, 100].
+
+    Falls back to ``default`` (50) on ``None`` so LLM responses that
+    omit the field don't kill the entire screening for the row. All
+    other type-mismatch errors still raise :class:`ValidationError` —
+    silent coercion would mask real schema drift.
+    """
+    if value is None:
+        # Phase 29 fix — the previous behaviour raised
+        # ``ValidationError("trend_strength: expected int, got NoneType")``
+        # for every LLM response that omitted the field, which on real
+        # runs inflated ``opportunities_failed`` to 10-20% of attempts.
+        # 50 keeps the opportunity in the screening pool; the warn-log
+        # surfaces systemic drift so the operator can retune the prompt.
+        logger.warning(
+            "screening_field_missing",
+            field=field,
+            default=default,
+        )
+        return default
     if isinstance(value, bool):
         # bool is subclass of int — disallow.
         raise ValidationError(f"{field}: expected int, got bool")

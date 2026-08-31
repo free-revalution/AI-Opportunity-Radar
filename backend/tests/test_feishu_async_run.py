@@ -12,6 +12,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -264,3 +265,54 @@ async def test_concurrency_cap_rejects_excess(monkey_httpx) -> None:
     for r in recs:
         if r._asyncio_task is not None:
             await r._asyncio_task
+
+
+# ---------------------------------------------------------------------------
+# Phase 29 regression — real /run (with research stage on, Browser-Use
+# polling included) takes 8-12 minutes on the live stack. The previous
+# 300s httpx timeout meant every bot-initiated /run surfaced as
+# ``pipeline request failed:`` (empty ReadTimeout exception) to the user,
+# even though the pipeline itself completed server-side. The fix bumps
+# the timeout to 900s so the post-back carries the success summary.
+# ---------------------------------------------------------------------------
+async def test_pipeline_async_run_uses_long_timeout(monkeypatch, monkey_httpx) -> None:
+    """The httpx.AsyncClient the task_runner builds for the pipeline
+    POST must carry a timeout ≥ 600s, otherwise long real-mode runs
+    surface as ``pipeline request failed:`` to the bot user."""
+    import app.services.feishu.task_runner as task_runner_module
+    from app.services.feishu import task_runner
+
+    captured_timeouts: list[float] = []
+
+    original_async_client = httpx.AsyncClient
+
+    def _capturing_client(*args, **kwargs):
+        # Capture the timeout kwarg (or default arg) used by the
+        # task_runner when it builds its pipeline HTTP client.
+        if "timeout" in kwargs and kwargs["timeout"] is not None:
+            captured_timeouts.append(float(kwargs["timeout"]))
+        return original_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(task_runner_module.httpx, "AsyncClient", _capturing_client)
+    monkeypatch.setattr(task_runner.httpx, "AsyncClient", _capturing_client)
+
+    rec = await task_runner.submit_pipeline_run(
+        chat_id="oc_timeout",
+        sender_open_id="ou_timeout",
+        settings=_settings(),
+    )
+    # — Wait for the background task to actually run (it calls
+    # httpx.AsyncClient immediately inside _execute_pipeline).
+    if rec._asyncio_task is not None:
+        try:
+            await asyncio.wait_for(rec._asyncio_task, timeout=2.0)
+        except (asyncio.TimeoutError, Exception):
+            pass
+
+    assert captured_timeouts, "task_runner never built an httpx.AsyncClient"
+    # — Real-mode /run is 8-12 min; we want at least 600s. The current
+    # value is 900s.
+    assert captured_timeouts[0] >= 600.0, (
+        f"task_runner httpx timeout too short: {captured_timeouts[0]}s — "
+        f"bot /run will keep timing out on real runs."
+    )
