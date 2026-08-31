@@ -21,9 +21,6 @@ from app.services.feishu.content_client import FeishuContentError
 from app.services.feishu.drive_manager import DriveManager
 from app.services.feishu.drive_org import (
     SECTION_DAILY,
-    SECTION_HOME,
-    SECTION_SOURCES,
-    SECTION_TODAY,
 )
 
 
@@ -148,14 +145,10 @@ async def fake_drive() -> FakeDrive:
     s = get_settings()
     s.feishu_drive_root_folder_token = "root_tok"
     drive = FakeDrive(settings=s)
-    # — Phase 27: ensure_root_tree is now read-only, so tests need
-    # the 4 section folders pre-populated to mimic a manually-built
-    # tree. Production gets these via the operator's manual setup
-    # (per the Phase 25 v2.1 README).
-    await drive.create_folder(parent_token="root_tok", name=SECTION_HOME)
-    await drive.create_folder(parent_token="root_tok", name=SECTION_TODAY)
+    # — Phase 30 — single-section tree: only ``📁 每日报告`` is
+    # required. The Phase 25 v2.1 design had 4 sections; the
+    # Plan D4 redesign drops the unused 3.
     await drive.create_folder(parent_token="root_tok", name=SECTION_DAILY)
-    await drive.create_folder(parent_token="root_tok", name=SECTION_SOURCES)
     return drive
 
 
@@ -174,27 +167,36 @@ def manager(fake_drive: FakeDrive, fake_store: ConfirmStore) -> DriveManager:
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_ensure_tree_creates_four_sections(manager: DriveManager) -> None:
+    """Phase 30 — single-section tree. Only ``📁 每日报告`` is required.
+
+    Pre-P30 this test asserted 4 sections. The Phase 30 redesign
+    dropped the 3 unused ones (plan D4).
+    """
     tokens = await manager.ensure_tree()
-    # — keys are English token names; values are the Drive tokens.
-    for key in ("home", "today", "daily_reports", "sources"):
-        assert tokens[key], f"missing token for {key}"
+    # — Only daily_reports has a real token; home/today/sources are
+    # legacy back-compat fields and stay empty.
+    assert tokens["daily_reports"], "missing token for daily_reports"
     assert tokens["root"] == "root_tok"
+    assert tokens["home"] == ""
+    assert tokens["today"] == ""
+    assert tokens["sources"] == ""
 
 
 @pytest.mark.asyncio
 async def test_walk_returns_root_with_children(manager: DriveManager) -> None:
     tree = await manager.walk(max_depth=2)
     assert tree["token"] == "root_tok"
-    assert any(c["name"] == SECTION_HOME for c in tree["children"])
-    assert any(c["name"] == SECTION_TODAY for c in tree["children"])
+    # — Phase 30: only 📁 每日报告 is a direct child.
+    assert any(c["name"] == SECTION_DAILY for c in tree["children"])
+    assert len(tree["children"]) == 1
 
 
 @pytest.mark.asyncio
 async def test_resolve_path_to_section(manager: DriveManager) -> None:
-    node = await manager.resolve(path=SECTION_TODAY)
+    node = await manager.resolve(path=SECTION_DAILY)
     assert node is not None
     assert node.type == "folder"
-    assert node.path == SECTION_TODAY
+    assert node.path == SECTION_DAILY
 
 
 @pytest.mark.asyncio
@@ -212,7 +214,7 @@ async def test_resolve_path_anti_traversal(manager: DriveManager) -> None:
 @pytest.mark.asyncio
 async def test_list_section_default_today(manager: DriveManager) -> None:
     await manager.ensure_tree()
-    items = await manager.list_section(section=SECTION_TODAY)
+    items = await manager.list_section(section=SECTION_DAILY)
     assert isinstance(items, list)
 
 
@@ -224,8 +226,8 @@ async def test_list_section_unknown_returns_empty(manager: DriveManager) -> None
 
 @pytest.mark.asyncio
 async def test_find_files_substring_match(manager: DriveManager) -> None:
-    await manager.create_child_folder(section=SECTION_TODAY, name="AI 报告")
-    await manager.create_child_folder(section=SECTION_HOME, name="日报样板")
+    await manager.create_child_folder(section=SECTION_DAILY, name="AI 报告")
+    await manager.create_child_folder(section=SECTION_DAILY, name="日报样板")
     items = await manager.find_files(keyword="报告", limit=10)
     names = [it["name"] for it in items]
     assert "AI 报告" in names
@@ -237,17 +239,17 @@ async def test_find_files_substring_match(manager: DriveManager) -> None:
 @pytest.mark.asyncio
 async def test_create_child_folder_returns_token(manager: DriveManager) -> None:
     result = await manager.create_child_folder(
-        section=SECTION_SOURCES, name="News"
+        section=SECTION_DAILY, name="News"
     )
     assert result["token"].startswith("fld_")
-    assert result["section"] == SECTION_SOURCES
+    assert result["section"] == SECTION_DAILY
     assert result["name"] == "News"
 
 
 @pytest.mark.asyncio
 async def test_create_child_folder_empty_name_raises(manager: DriveManager) -> None:
     with pytest.raises(FeishuContentError):
-        await manager.create_child_folder(section=SECTION_TODAY, name="")
+        await manager.create_child_folder(section=SECTION_DAILY, name="")
 
 
 @pytest.mark.asyncio
@@ -272,12 +274,12 @@ async def test_mkdir_path_rejects_non_top_level(manager: DriveManager) -> None:
 async def test_move_to_section(manager: DriveManager) -> None:
     await manager.ensure_tree()
     created = await manager.create_child_folder(
-        section=SECTION_TODAY, name="tmp"
+        section=SECTION_DAILY, name="tmp"
     )
     result = await manager.move_to_section(
         file_token=created["token"],
         file_type="folder",
-        target_section=SECTION_HOME,
+        target_section=SECTION_DAILY,
     )
     assert result["target_folder_token"]
 
@@ -286,7 +288,7 @@ async def test_move_to_section(manager: DriveManager) -> None:
 async def test_rename(manager: DriveManager) -> None:
     await manager.ensure_tree()
     created = await manager.create_child_folder(
-        section=SECTION_TODAY, name="old"
+        section=SECTION_DAILY, name="old"
     )
     result = await manager.rename(
         file_token=created["token"],
@@ -301,9 +303,9 @@ async def test_rename(manager: DriveManager) -> None:
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_request_delete_returns_action(manager: DriveManager) -> None:
-    await manager.create_child_folder(section=SECTION_TODAY, name="victim")
+    await manager.create_child_folder(section=SECTION_DAILY, name="victim")
     action = await manager.request_delete(
-        path=f"{SECTION_TODAY}/victim"
+        path=f"{SECTION_DAILY}/victim"
     )
     assert action.kind == "drive_delete"
     assert action.action_id
@@ -314,10 +316,10 @@ async def test_request_delete_returns_action(manager: DriveManager) -> None:
 async def test_execute_delete_consumes_token_and_deletes(
     manager: DriveManager, fake_drive: FakeDrive
 ) -> None:
-    await manager.create_child_folder(section=SECTION_TODAY, name="victim")
-    action = await manager.request_delete(path=f"{SECTION_TODAY}/victim")
+    await manager.create_child_folder(section=SECTION_DAILY, name="victim")
+    action = await manager.request_delete(path=f"{SECTION_DAILY}/victim")
     # — Resolve to a DriveNode and execute.
-    node = await manager.resolve(path=f"{SECTION_TODAY}/victim")
+    node = await manager.resolve(path=f"{SECTION_DAILY}/victim")
     assert node is not None
     outcome = await manager.execute_delete(action=action)
     assert outcome["poll"]["status"] == "success"
@@ -329,9 +331,9 @@ async def test_request_delete_without_confirm_store_raises(
     fake_drive: FakeDrive,
 ) -> None:
     mgr = DriveManager(drive=fake_drive, confirm_store=None)
-    await mgr.create_child_folder(section=SECTION_TODAY, name="x")
+    await mgr.create_child_folder(section=SECTION_DAILY, name="x")
     with pytest.raises(ConfirmStoreUnavailable):
-        await mgr.request_delete(path=f"{SECTION_TODAY}/x")
+        await mgr.request_delete(path=f"{SECTION_DAILY}/x")
 
 
 # ---------------------------------------------------------------------------
@@ -347,9 +349,9 @@ async def test_within_root_accepts_root_and_empty(manager: DriveManager) -> None
 @pytest.mark.asyncio
 async def test_within_root_accepts_descendant(manager: DriveManager) -> None:
     """A child folder created inside a section should pass within_root."""
-    await manager.create_child_folder(section=SECTION_TODAY, name="descendant")
+    await manager.create_child_folder(section=SECTION_DAILY, name="descendant")
     # — Capture the token from inside the manager's own list_section.
-    items = await manager.list_section(section=SECTION_TODAY)
+    items = await manager.list_section(section=SECTION_DAILY)
     assert items, "expected the section to list the new child"
     child_token = items[0]["token"]
     assert await manager.within_root(token=child_token) is True

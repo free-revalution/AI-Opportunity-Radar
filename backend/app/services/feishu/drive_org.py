@@ -1,33 +1,27 @@
-"""Phase 25 v2.1 — 飞书云盘 4 段结构编排 (Drive Org service).
+"""Phase 30 — 飞书云盘单段结构编排 (Drive Org service).
 
-Implements the simplify-plan §27 4-section Drive Org layout:
+Phase 25 v2.1 原本是 4 段结构,Phase 30 按 plan §0/D4 收敛到**单一**段:
 
   <root>
-  ├── 📌 首页        (HomePage)
-  ├── 📅 今日        (Today folder)
-  ├── 📁 每日报告    (Daily Reports folder)
-  │   ├── YYYY-MM-DD          (per-day subfolder)
-  │   │   └── YYYY-MM-DD AI 商业日报   (Docx — the digest content)
-  │   ├── YYYY-MM-DD (older)
-  │   └── …
-  └── 📚 信息源      (Sources)
+  └── 📁 每日报告    (Daily Reports folder)
+      ├── YYYY-MM-DD          (per-day subfolder)
+      │   ├── YYYY-MM-DD AI 商业日报   (Docx — the digest content)
+      │   └── detail-<slug>.docx       (Phase 30 — 用户点按钮生成的详情)
+      ├── YYYY-MM-DD (older)
+      └── …
 
-The bot keeps three responsibilities in this layout:
+Phase 30 删除了 📌 首页 / 📅 今日 / 📚 信息源 三段(用户原话:"目录太多
+不实用")。``SECTION_HOME`` / ``SECTION_TODAY`` / ``SECTION_SOURCES`` 这三
+个常量**保留为模块级 deprecated 字符串**(避免破坏 docs_commands /
+drive_manager 的旧 import),但不再出现在 ``_VALID_TOP_LEVEL_SECTIONS``,
+``resolve_path`` / ``ensure_root_tree`` 会忽略它们。
 
-  1. **Ensure the 4 root children exist** (idempotent — re-runs
-     find-or-create each section by name).
-  2. **Write the per-day Docx** under ``每日报告/YYYY-MM-DD/``
-     with a deterministic title so the docx search surface
-     (and the operator) can find it by date.
-  3. **Persist the date → doc_id mapping** to the
-     ``daily_digest_docs`` table so internal APIs can resolve
-     a date back to the Docx URL.
+Bot 职责:
 
-Folder / file creation is delegated to :class:`FeishuDriveClient`
-(the existing Phase 7 client). The two pieces — folder + Docx —
-both go through :func:`ensure_folder_path` and
-:func:`create_docx_from_markdown` so the per-folder creation
-flow is already idempotent.
+  1. **确保 📁 每日报告 子文件夹存在**(idempotent — 重复运行 find-or-create)。
+  2. **写入每日报 Docx**(Phase 25 既有行为)。
+  3. **写入详情 Docx**(Phase 30 — 用户点 [生成报告] 按钮时)。
+  4. **date → doc_id 映射** 写入 ``daily_digest_docs`` 表。
 """
 
 from __future__ import annotations
@@ -49,15 +43,26 @@ logger = get_logger(__name__)
 
 # --- Section names (Chinese, kept here so the bot reply can
 # echo them when it shows the tree to the user).
-SECTION_HOME = "📌 首页"
-SECTION_TODAY = "📅 今日"
+# Phase 30 — only SECTION_DAILY is part of the new single-section tree.
+# The other three constants are kept as module-level deprecated strings
+# so legacy import paths in ``docs_commands`` / ``drive_manager`` keep
+# working without runtime errors; ``_VALID_TOP_LEVEL_SECTIONS`` below
+# intentionally excludes them so ``resolve_path`` rejects paths into
+# the old sections.
 SECTION_DAILY = "📁 每日报告"
-SECTION_SOURCES = "📚 信息源"
+SECTION_HOME = "📌 首页"        # DEPRECATED — Phase 30, no longer in tree
+SECTION_TODAY = "📅 今日"       # DEPRECATED — Phase 30, no longer in tree
+SECTION_SOURCES = "📚 信息源"   # DEPRECATED — Phase 30, no longer in tree
 
 
 @dataclass(slots=True)
 class RootTokens:
-    """Tokens of the 4 root sections + the root itself.
+    """Tokens of the (now single) root section + the root itself.
+
+    Phase 30 — only ``daily_reports`` is actively populated.
+    The three other fields are kept as empty strings for backward
+    compatibility with code paths that still read them via
+    ``as_dict`` / ``__getitem__`` / ``get``.
 
     Acts like a dict (``as_dict`` / ``__getitem__`` / ``get``) so
     callers can use either dataclass-attribute or dict-key style
@@ -65,10 +70,12 @@ class RootTokens:
     """
 
     root: str
-    home: str
-    today: str
     daily_reports: str
-    sources: str
+    # Phase 30 — removed real fields; kept for back-compat with
+    # any external code that still asks for them via dict access.
+    home: str = ""
+    today: str = ""
+    sources: str = ""
 
     def as_dict(self) -> dict[str, str]:
         return {
@@ -119,14 +126,10 @@ class DriveNode:
     parent_path: Optional[str] = None  # for nested resolution
 
 
-# Top-level section names — kept in a tuple so `resolve_path` can
-# detect a user trying to escape the root via absolute paths.
-_VALID_TOP_LEVEL_SECTIONS: tuple[str, ...] = (
-    SECTION_HOME,
-    SECTION_TODAY,
-    SECTION_DAILY,
-    SECTION_SOURCES,
-)
+# Top-level section names — Phase 30: only SECTION_DAILY is valid.
+# ``resolve_path`` uses this to detect a user trying to escape the
+# root via absolute paths.
+_VALID_TOP_LEVEL_SECTIONS: tuple[str, ...] = (SECTION_DAILY,)
 
 
 def _is_valid_top_level(segment: str) -> bool:
@@ -134,7 +137,7 @@ def _is_valid_top_level(segment: str) -> bool:
 
 
 class DriveOrgService:
-    """Orchestrates the 飞书云盘 4 段结构 (Drive Org) tree.
+    """Orchestrates the 飞书云盘单段结构 (Drive Org) tree — Phase 30.
 
     Stateless beyond the constructor — every call re-reads the
     current root folder token from :class:`Settings`. Idempotent
@@ -157,7 +160,11 @@ class DriveOrgService:
     # Tree management
     # ------------------------------------------------------------------
     async def ensure_root_tree(self) -> RootTokens:
-        """Locate each of the 4 sections under the root folder.
+        """Locate ``📁 每日报告`` under the root folder.
+
+        Phase 30 — single-section tree. Only ``SECTION_DAILY`` is
+        required; the 3 deprecated sections (📌 首页 / 📅 今日 / 📚 信息源)
+        are NOT enforced (any legacy folders are simply ignored).
 
         Phase 27 fix — earlier versions called ``ensure_folder_path``
         which auto-creates missing segments. The
@@ -170,7 +177,7 @@ class DriveOrgService:
         match by name. If a section is missing, raise a friendly
         :class:`FeishuContentError` so the operator can create the
         folder manually (matching the Phase 25 v2.1 readme steps —
-        "📌 首页 / 📅 今日 / 📁 每日报告 / 📚 信息源").
+        "📁 每日报告").
         """
         if not self.drive.is_configured:
             raise FeishuContentError(
@@ -189,39 +196,39 @@ class DriveOrgService:
             if name and token:
                 by_name[name] = token
 
-        missing: list[str] = []
-        section_map = {
-            SECTION_HOME: None,
-            SECTION_TODAY: None,
-            SECTION_DAILY: None,
-            SECTION_SOURCES: None,
-        }
-        for section_name in section_map:
-            token = by_name.get(section_name)
-            if not token:
-                missing.append(section_name)
-            else:
-                section_map[section_name] = token
-
-        if missing:
-            quoted = ", ".join(f"「{n}」" for n in missing)
+        daily_token = by_name.get(SECTION_DAILY)
+        if not daily_token:
             raise FeishuContentError(
-                f"drive_org: root folder is missing required section(s): "
-                f"{quoted}. Create these sub-folders manually under the "
-                f"configured root folder, then retry."
+                f"drive_org: root folder is missing required section 「{SECTION_DAILY}」. "
+                f"Create this sub-folder manually under the configured root folder, then retry."
             )
 
         logger.info(
             "drive_org_root_tree_resolved",
             root=root[:24],
-            sections=4,
+            sections=1,
         )
-        return RootTokens(
-            root=root,
-            home=section_map[SECTION_HOME] or "",
-            today=section_map[SECTION_TODAY] or "",
-            daily_reports=section_map[SECTION_DAILY] or "",
-            sources=section_map[SECTION_SOURCES] or "",
+        return RootTokens(root=root, daily_reports=daily_token)
+
+    # ------------------------------------------------------------------
+    # Phase 30 — detail-docx folder helper
+    # ------------------------------------------------------------------
+    async def get_or_create_day_folder(self, *, day: date) -> str:
+        """返回 ``📁 每日报告/{YYYY-MM-DD}/`` 的 folder_token(不存在则建)。
+
+        给 detail_docx.py 复用 — 详情 docx 必须落在当天目录下。
+        """
+        if not self.drive.is_configured:
+            raise FeishuContentError(
+                "drive_org: feishu drive not configured "
+                "(set FEISHU_DRIVE_ROOT_FOLDER_TOKEN)"
+            )
+        day_str = day.strftime("%Y-%m-%d")
+        daily_root = await self.drive.ensure_folder_path(
+            parent_token=self.drive.folder_token, path=[SECTION_DAILY]
+        )
+        return await self.drive.ensure_folder_path(
+            parent_token=daily_root, path=[day_str]
         )
 
     # ------------------------------------------------------------------

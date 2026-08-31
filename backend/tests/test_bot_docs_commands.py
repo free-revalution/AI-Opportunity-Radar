@@ -32,9 +32,9 @@ def test_parse_empty_returns_menu() -> None:
 
 
 def test_parse_ls() -> None:
-    sub, rest = parse_docs_subcommand("ls 📅 今日")
+    sub, rest = parse_docs_subcommand("ls 📁 每日报告")
     assert sub == DocsSubcommand.LS
-    assert rest == "📅 今日"
+    assert rest == "📁 每日报告"
 
 
 def test_parse_ls_with_english_alias() -> None:
@@ -127,8 +127,8 @@ class _FakeDriveManager:
             "token": "r",
             "type": "folder",
             "children": [
-                {"name": "📅 今日", "token": "t", "type": "folder", "children": []},
-                {"name": "📚 信息源", "token": "s", "type": "folder", "children": []},
+                {"name": "📁 每日报告", "token": "t", "type": "folder", "children": []},
+                {"name": "📁 每日报告", "token": "s", "type": "folder", "children": []},
             ],
         }
 
@@ -145,7 +145,7 @@ class _FakeDriveManager:
 
     async def find_files(self, *, keyword: str, scope: str = "all", limit: int = 20) -> list[dict[str, Any]]:
         self.find_files_calls.append(keyword)
-        return [{"name": f"{keyword}.docx", "token": "x", "type": "docx", "section": "📅 今日"}]
+        return [{"name": f"{keyword}.docx", "token": "x", "type": "docx", "section": "📁 每日报告"}]
 
     async def create_child_folder(self, *, section: str, name: str) -> dict[str, Any]:
         self.created.append((section, name))
@@ -257,7 +257,7 @@ def ctx() -> DocsContext:
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_run_ls(ctx: DocsContext) -> None:
-    reply = await run_docs_subcommand(args="ls 📅 今日", ctx=ctx)
+    reply = await run_docs_subcommand(args="ls 📁 每日报告", ctx=ctx)
     assert "📂" in reply.text or "demo.txt" in reply.text
     assert reply.metadata["subcommand"] == "ls"
 
@@ -270,9 +270,9 @@ async def test_run_find(ctx: DocsContext) -> None:
 
 @pytest.mark.asyncio
 async def test_run_create(ctx: DocsContext) -> None:
-    reply = await run_docs_subcommand(args="create foo 📅 今日", ctx=ctx)
+    reply = await run_docs_subcommand(args="create foo 📁 每日报告", ctx=ctx)
     assert "已创建" in reply.text
-    assert ("📅 今日", "foo") in ctx.drive_manager.created  # type: ignore[attr-defined]
+    assert ("📁 每日报告", "foo") in ctx.drive_manager.created  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
@@ -286,7 +286,7 @@ async def test_run_mkdir(ctx: DocsContext) -> None:
 @pytest.mark.asyncio
 async def test_run_mv(ctx: DocsContext) -> None:
     reply = await run_docs_subcommand(
-        args="mv 📅 今日/foo 📚 信息源", ctx=ctx
+        args="mv 📁 每日报告/foo 📁 每日报告", ctx=ctx
     )
     assert ctx.drive_manager.mv_calls  # type: ignore[attr-defined]
 
@@ -294,14 +294,14 @@ async def test_run_mv(ctx: DocsContext) -> None:
 @pytest.mark.asyncio
 async def test_run_rename(ctx: DocsContext) -> None:
     reply = await run_docs_subcommand(
-        args="rename 📅 今日/foo new_name", ctx=ctx
+        args="rename 📁 每日报告/foo new_name", ctx=ctx
     )
     assert ctx.drive_manager.rename_calls  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
 async def test_run_rm_returns_confirm_token(ctx: DocsContext) -> None:
-    reply = await run_docs_subcommand(args="rm 📅 今日/foo", ctx=ctx)
+    reply = await run_docs_subcommand(args="rm 📁 每日报告/foo", ctx=ctx)
     assert "确认删除" in reply.text
     assert "abc1234567" in reply.text
     assert reply.metadata["action_id"] == "abc1234567"
@@ -389,7 +389,7 @@ async def test_run_confirm_executes_pending(ctx: DocsContext) -> None:
     pending = PendingAction(
         action_id="aaaa1111",
         kind="drive_delete",
-        payload={"path": "📅 今日/foo", "token": "tok", "type": "folder", "name": "foo"},
+        payload={"path": "📁 每日报告/foo", "token": "tok", "type": "folder", "name": "foo"},
         created_at=_time.time(),
         expires_at=_time.time() + 60,
     )

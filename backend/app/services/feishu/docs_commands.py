@@ -49,9 +49,6 @@ from app.services.feishu.content_client import FeishuContentError
 from app.services.feishu.drive_manager import DriveManager
 from app.services.feishu.drive_org import (
     SECTION_DAILY,
-    SECTION_HOME,
-    SECTION_SOURCES,
-    SECTION_TODAY,
 )
 from app.utils import get_logger
 
@@ -313,8 +310,11 @@ async def _handle_tree(*, args: str, ctx: DocsContext):
 
 
 async def _handle_ls(*, args: str, ctx: DocsContext):
-    """``/docs ls [section]`` — list a section's direct children."""
-    section_arg = args.strip() or SECTION_TODAY
+    """``/docs ls [section]`` — list a section's direct children.
+
+    Phase 30 — only ``📁 每日报告`` is a valid section.
+    """
+    section_arg = args.strip() or SECTION_DAILY
     items = await ctx.drive_manager.list_section(section=section_arg)
     if not items:
         return _reply(
@@ -449,10 +449,13 @@ async def _handle_info(*, args: str, ctx: DocsContext):
 
 
 async def _handle_create(*, args: str, ctx: DocsContext):
-    """``/docs create <name> [section]`` — sub-folder in a section."""
+    """``/docs create <name> [section]`` — sub-folder in a section.
+
+    Phase 30 — only ``📁 每日报告`` is a valid section.
+    """
     parts = args.split(maxsplit=1)
     name = parts[0].strip() if parts else ""
-    section = parts[1].strip() if len(parts) > 1 else SECTION_TODAY
+    section = parts[1].strip() if len(parts) > 1 else SECTION_DAILY
     if not name:
         return _err_reply(sub=DocsSubcommand.CREATE, error="用法:/docs create <名称> [段]")
     try:
@@ -823,8 +826,8 @@ def _help_reply():
             [
                 "**📁 /docs 命令菜单（管理员）**",
                 "",
-                "/docs tree — 4 段结构（异步生成）",
-                "/docs ls [段] — 列出某段下的内容（默认 今日）",
+                "/docs tree — 1 段结构（📁 每日报告，异步生成）",
+                "/docs ls [段] — 列出某段下的内容（默认 📁 每日报告）",
                 "/docs find <关键词> — 跨段搜索文件名",
                 "/docs daily [YYYY-MM-DD] — 某天的日报",
                 "/docs info <路径> — 文件元信息 + URL",

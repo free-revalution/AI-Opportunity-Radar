@@ -226,21 +226,21 @@ def _restore_settings_after_test(settings: Any):
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_docs_tree_returns_4_sections(client: Any, settings: Any) -> None:
+    """Phase 30 — single-section tree.
+
+    Pre-P30 this test asserted 4 sections (📌 首页 / 📅 今日 /
+    📁 每日报告 / 📚 信息源). The Phase 30 redesign (plan D4)
+    keeps only ``📁 每日报告``; home/today/sources always resolve
+    to empty strings for back-compat.
+    """
     _configure(settings)
-    # — the endpoint lazy-imports ``FeishuDriveClient`` from
-    # ``app.services.feishu.content_client`` so we patch the source
-    # module (the lookup site) rather than ``app.api.internal``.
     fake = _FakeDrive(settings=settings)
     root = settings.feishu_drive_root_folder_token
-    for idx, name in enumerate(
-        ("📌 首页", "📅 今日", "📁 每日报告", "📚 信息源"), start=1
-    ):
-        fake._folders[(root, name)] = f"fld_section_{idx}"
+    # — Phase 30 — only 📁 每日报告 is a real section.
+    fake._folders[(root, "📁 每日报告")] = "fld_section_daily"
     with pytest.MonkeyPatch.context() as mp:
         from app.services.feishu import content_client as cc_module
 
-        # — Make ``FeishuDriveClient.create_default(...)`` return THIS
-        # pre-populated fake (not the module-level _FAKE singleton).
         global _FAKE  # type: ignore[misc]
         _FAKE = fake
         mp.setattr(cc_module, "FeishuDriveClient", _FakeDrive)
@@ -248,11 +248,17 @@ async def test_docs_tree_returns_4_sections(client: Any, settings: Any) -> None:
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["configured"] is True
+    # — Phase 30 — sections list still exposes 4 keys for back-compat
+    # with the bot /docs command surface, but only daily_reports
+    # carries a real token.
     assert body["sections"] == ["home", "today", "daily_reports", "sources"]
     tokens = body["tokens"]
     assert tokens["root"] == "root_folder_token"
-    for key in ("home", "today", "daily_reports", "sources"):
-        assert tokens[key].startswith("fld_")
+    assert tokens["daily_reports"] == "fld_section_daily"
+    # — Legacy sections are empty strings, not "fld_*" tokens.
+    assert tokens["home"] == ""
+    assert tokens["today"] == ""
+    assert tokens["sources"] == ""
 
 
 @pytest.mark.asyncio
@@ -468,15 +474,10 @@ def _patch_docs_endpoints(monkeypatch: pytest.MonkeyPatch, *, settings: Any) -> 
 
     global _FAKE
     _FAKE = _FakeDrive(settings=settings)
-    # — Phase 27: ensure_root_tree is now read-only, so tests need
-    # the 4 section folders pre-populated to mimic a manually-built
-    # tree. We poke the fake's internal storage directly so the
-    # helper stays synchronous.
+    # — Phase 30 — single-section tree. Pre-populate only the
+    # one real section so tests don't have to set it up themselves.
     root = settings.feishu_drive_root_folder_token
-    for idx, section_name in enumerate(
-        ("📌 首页", "📅 今日", "📁 每日报告", "📚 信息源"), start=1
-    ):
-        _FAKE._folders[(root, section_name)] = f"fld_section_{idx}"
+    _FAKE._folders[(root, "📁 每日报告")] = "fld_section_daily"
     fake_bitable = _FakeBitableClient()
     fake_app = _FakeAppClient(settings=settings)
 
@@ -545,16 +546,17 @@ class _MinimalRedis:
 def test_docs_ls_returns_section_items(
     client: Any, settings: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Phase 30 — only ``📁 每日报告`` is a valid section."""
     _configure(settings)
     fake_drive = _patch_docs_endpoints(monkeypatch, settings=settings)
     resp = client.get(
         "/api/internal/docs/ls",
-        params={"section": "📅 今日"},
+        params={"section": "📁 每日报告"},
         headers=_ADMIN_HEADERS,
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["section"] == "📅 今日"
+    assert body["section"] == "📁 每日报告"
     assert "items" in body
     assert fake_drive.folder_token  # smoke
 
@@ -590,16 +592,17 @@ def test_docs_find(
 def test_docs_info_resolves_section(
     client: Any, settings: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Phase 30 — only ``📁 每日报告`` is a valid section."""
     _configure(settings)
     _patch_docs_endpoints(monkeypatch, settings=settings)
     resp = client.get(
         "/api/internal/docs/info",
-        params={"path": "📅 今日"},
+        params={"path": "📁 每日报告"},
         headers=_ADMIN_HEADERS,
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["path"] == "📅 今日"
+    assert body["path"] == "📁 每日报告"
     assert body["type"] == "folder"
     assert body["token"]
 
@@ -655,27 +658,29 @@ def test_docs_mkdir_missing_path_returns_400(
 def test_docs_create_child_folder(
     client: Any, settings: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Phase 30 — only ``📁 每日报告`` is a valid section."""
     _configure(settings)
     _patch_docs_endpoints(monkeypatch, settings=settings)
     resp = client.post(
         "/api/internal/docs/create",
-        json={"section": "📚 信息源", "name": "News"},
+        json={"section": "📁 每日报告", "name": "News"},
         headers=_ADMIN_HEADERS,
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["name"] == "News"
-    assert body["section"] == "📚 信息源"
+    assert body["section"] == "📁 每日报告"
 
 
 def test_docs_create_missing_name_returns_400(
     client: Any, settings: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Missing ``name`` should 400 before we touch the Drive."""
     _configure(settings)
     _patch_docs_endpoints(monkeypatch, settings=settings)
     resp = client.post(
         "/api/internal/docs/create",
-        json={"section": "📅 今日"},
+        json={"section": "📁 每日报告"},
         headers=_ADMIN_HEADERS,
     )
     assert resp.status_code == 400
@@ -687,19 +692,21 @@ def test_docs_create_missing_name_returns_400(
 def test_docs_mv(
     client: Any, settings: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Phase 30 — single section, so move source/target are both
+    ``📁 每日报告`` (we still test the move end-to-end)."""
     _configure(settings)
     fake_drive = _patch_docs_endpoints(monkeypatch, settings=settings)
-    # — Pre-seed a child folder inside 📅 今日 so move has a target.
+    # — Pre-seed a child folder inside 📁 每日报告 so move has a target.
     resp = client.post(
         "/api/internal/docs/create",
-        json={"section": "📅 今日", "name": "victim"},
+        json={"section": "📁 每日报告", "name": "victim"},
         headers=_ADMIN_HEADERS,
     )
     assert resp.status_code == 200, resp.text
     created_token = resp.json()["token"]
     resp = client.post(
         "/api/internal/docs/mv",
-        json={"path": "📅 今日/victim", "target_section": "📚 信息源"},
+        json={"path": "📁 每日报告/victim", "target_section": "📁 每日报告"},
         headers=_ADMIN_HEADERS,
     )
     assert resp.status_code == 200, resp.text
@@ -717,7 +724,7 @@ def test_docs_mv_unknown_path_returns_404(
     _patch_docs_endpoints(monkeypatch, settings=settings)
     resp = client.post(
         "/api/internal/docs/mv",
-        json={"path": "📅 今日/nope", "target_section": "📚 信息源"},
+        json={"path": "📁 每日报告/nope", "target_section": "📁 每日报告"},
         headers=_ADMIN_HEADERS,
     )
     assert resp.status_code == 404
@@ -729,17 +736,18 @@ def test_docs_mv_unknown_path_returns_404(
 def test_docs_rename(
     client: Any, settings: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Phase 30 — single section ``📁 每日报告``."""
     _configure(settings)
     fake_drive = _patch_docs_endpoints(monkeypatch, settings=settings)
     resp = client.post(
         "/api/internal/docs/create",
-        json={"section": "📅 今日", "name": "old"},
+        json={"section": "📁 每日报告", "name": "old"},
         headers=_ADMIN_HEADERS,
     )
     created_token = resp.json()["token"]
     resp = client.post(
         "/api/internal/docs/rename",
-        json={"path": "📅 今日/old", "new_name": "new"},
+        json={"path": "📁 每日报告/old", "new_name": "new"},
         headers=_ADMIN_HEADERS,
     )
     assert resp.status_code == 200, resp.text
@@ -754,16 +762,17 @@ def test_docs_rename(
 def test_docs_rm_stages_pending_action(
     client: Any, settings: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Phase 30 — only ``📁 每日报告`` is a valid section."""
     _configure(settings)
     _patch_docs_endpoints(monkeypatch, settings=settings)
     client.post(
         "/api/internal/docs/create",
-        json={"section": "📅 今日", "name": "doomed"},
+        json={"section": "📁 每日报告", "name": "doomed"},
         headers=_ADMIN_HEADERS,
     )
     resp = client.post(
         "/api/internal/docs/rm",
-        json={"path": "📅 今日/doomed"},
+        json={"path": "📁 每日报告/doomed"},
         headers=_ADMIN_HEADERS,
     )
     assert resp.status_code == 200, resp.text
@@ -777,16 +786,17 @@ def test_docs_rm_stages_pending_action(
 def test_docs_confirm_executes_pending(
     client: Any, settings: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Phase 30 — only ``📁 每日报告`` is a valid section."""
     _configure(settings)
     fake_drive = _patch_docs_endpoints(monkeypatch, settings=settings)
     client.post(
         "/api/internal/docs/create",
-        json={"section": "📅 今日", "name": "victim"},
+        json={"section": "📁 每日报告", "name": "victim"},
         headers=_ADMIN_HEADERS,
     )
     resp = client.post(
         "/api/internal/docs/rm",
-        json={"path": "📅 今日/victim"},
+        json={"path": "📁 每日报告/victim"},
         headers=_ADMIN_HEADERS,
     )
     action_id = resp.json()["action_id"]

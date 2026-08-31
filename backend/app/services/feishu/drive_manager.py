@@ -34,9 +34,6 @@ from app.services.feishu.content_client import (
 )
 from app.services.feishu.drive_org import (
     SECTION_DAILY,
-    SECTION_HOME,
-    SECTION_SOURCES,
-    SECTION_TODAY,
     DriveNode,
     DriveOrgService,
 )
@@ -46,13 +43,16 @@ logger = get_logger(__name__)
 
 
 class DriveManager:
-    """High-level 飞书云盘 management surface for the bot."""
+    """High-level 飞书云盘 management surface for the bot.
+
+    Phase 30 — single-section tree. Only ``SECTION_DAILY`` is recognised
+    as a top-level section; legacy constants ``SECTION_HOME`` / ``SECTION_TODAY``
+    / ``SECTION_SOURCES`` are still importable from ``drive_org`` (for
+    back-compat) but DriveManager will reject them as unknown sections.
+    """
 
     SECTION_SECTION_TOKEN_KEYS = {
-        SECTION_HOME: "home",
-        SECTION_TODAY: "today",
         SECTION_DAILY: "daily_reports",
-        SECTION_SOURCES: "sources",
     }
 
     def __init__(
@@ -72,15 +72,15 @@ class DriveManager:
     # Read surface
     # ------------------------------------------------------------------
     async def ensure_tree(self) -> dict[str, str]:
-        """Ensure the 4 sections exist; return ``{section: token}``."""
+        """Ensure the (single) ``📁 每日报告`` section exists; return ``{section: token}``."""
         tokens = await self.org.ensure_root_tree()
         return tokens.as_dict()
 
     async def walk(self, *, max_depth: int = 3) -> dict[str, Any]:
         """Return the section tree as a nested dict.
 
-        Calls :meth:`ensure_tree` first so the 4 sections are present
-        even when the operator never explicitly initialised them.
+        Calls :meth:`ensure_tree` first so the section is present
+        even when the operator never explicitly initialised it.
         """
         await self.ensure_tree()
         return await self.org.walk_tree(max_depth=max_depth)
@@ -88,7 +88,7 @@ class DriveManager:
     async def resolve(self, *, path: str) -> Optional[DriveNode]:
         """Resolve a user path to a :class:`DriveNode` (or ``None``).
 
-        Calls :meth:`ensure_tree` first so the 4 sections exist —
+        Calls :meth:`ensure_tree` first so the section exists —
         ``resolve_path`` reads the tree, it doesn't create it.
         """
         await self.ensure_tree()
@@ -375,7 +375,7 @@ class DriveManager:
 
 
 def _is_top_level_segment(segment: str) -> bool:
-    """True if ``segment`` is one of the 4 root section names."""
+    """True if ``segment`` is the single root section name (``📁 每日报告``)."""
     return segment.strip() in DriveManager.SECTION_SECTION_TOKEN_KEYS
 
 

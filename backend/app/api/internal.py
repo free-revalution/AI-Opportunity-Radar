@@ -705,7 +705,7 @@ class _NullBitableClient:
     summary="Phase 26 — list children of a top-level Drive section",
 )
 async def docs_ls(
-    section: str = "📅 今日",
+    section: str = "📁 每日报告",
     limit: int = 30,
     _actor: str = Depends(require_admin),
 ) -> dict[str, Any]:
@@ -815,7 +815,7 @@ async def docs_create(
     settings = get_settings()
     drive_manager, _ = await _build_docs_services(settings=settings, session=None)
     name = (body.get("name") or "").strip()
-    section = (body.get("section") or "📅 今日").strip()
+    section = (body.get("section") or "📁 每日报告").strip()
     if not name:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="name is required"

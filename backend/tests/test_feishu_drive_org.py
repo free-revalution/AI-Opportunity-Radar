@@ -28,9 +28,6 @@ from app.config import get_settings
 from app.services.feishu.drive_org import (
     DriveOrgService,
     SECTION_DAILY,
-    SECTION_HOME,
-    SECTION_SOURCES,
-    SECTION_TODAY,
 )
 from app.services.feishu.content_client import FeishuContentError
 
@@ -122,27 +119,23 @@ def _fake_settings(root: str = "root_folder_token") -> Any:
 async def test_ensure_root_tree_resolves_existing_sections() -> None:
     """Phase 27 — ensure_root_tree is now read-only.
 
-    It only resolves tokens for the 4 sections that already exist
-    under the root folder. The earlier 'auto-create missing folders'
-    behaviour assumed ``POST /drive/v1/files`` was reachable, but
-    some Feishu tenants return 404 for that endpoint. We now
-    surface a friendly error when sections are missing instead.
+    Phase 30 — single-section tree: only ``📁 每日报告`` is required.
+    Earlier behaviour expected 4 sections; the Phase 30 redesign
+    (plan D4) drops 📌 首页 / 📅 今日 / 📚 信息源 entirely.
     """
     drive = FakeDriveClient()
-    # — Pre-populate the root folder with all 4 sections.
-    await drive.create_folder(name=SECTION_HOME, parent_token="root_folder_token")
-    await drive.create_folder(name=SECTION_TODAY, parent_token="root_folder_token")
+    # — Pre-populate the root folder with the single section.
     await drive.create_folder(name=SECTION_DAILY, parent_token="root_folder_token")
-    await drive.create_folder(name=SECTION_SOURCES, parent_token="root_folder_token")
 
     service = DriveOrgService(drive=drive)
     tokens = await service.ensure_root_tree()
     assert tokens.root == "root_folder_token"
     as_dict = tokens.as_dict()
-    assert as_dict["home"].startswith("fld_")
-    assert as_dict["today"].startswith("fld_")
     assert as_dict["daily_reports"].startswith("fld_")
-    assert as_dict["sources"].startswith("fld_")
+    # — Phase 30: home/today/sources always empty (legacy back-compat)
+    assert as_dict["home"] == ""
+    assert as_dict["today"] == ""
+    assert as_dict["sources"] == ""
 
 
 @pytest.mark.asyncio
@@ -151,18 +144,13 @@ async def test_ensure_root_tree_is_idempotent() -> None:
     same tokens (the read-only path is naturally idempotent —
     the create-then-list-create cycle is gone)."""
     drive = FakeDriveClient()
-    await drive.create_folder(name=SECTION_HOME, parent_token="root_folder_token")
-    await drive.create_folder(name=SECTION_TODAY, parent_token="root_folder_token")
     await drive.create_folder(name=SECTION_DAILY, parent_token="root_folder_token")
-    await drive.create_folder(name=SECTION_SOURCES, parent_token="root_folder_token")
 
     service = DriveOrgService(drive=drive)
     first = await service.ensure_root_tree()
     second = await service.ensure_root_tree()
-    assert first.home == second.home
-    assert first.today == second.today
     assert first.daily_reports == second.daily_reports
-    assert first.sources == second.sources
+    assert first.daily_reports.startswith("fld_")
 
 
 @pytest.mark.asyncio
@@ -178,12 +166,11 @@ async def test_ensure_root_tree_without_root_token_raises() -> None:
 async def test_ensure_root_tree_missing_sections_raises_friendly() -> None:
     """Phase 27 — when sections don't exist, raise a friendly
     message naming each missing section instead of trying to create
-    them (which 404s on tenants that disable folder creation)."""
-    drive = FakeDriveClient()
-    # — Only pre-populate 2 of the 4 sections.
-    await drive.create_folder(name=SECTION_HOME, parent_token="root_folder_token")
-    await drive.create_folder(name=SECTION_TODAY, parent_token="root_folder_token")
+    them (which 404s on tenants that disable folder creation).
 
+    Phase 30 — single section: only ``📁 每日报告`` is required."""
+    drive = FakeDriveClient()
+    # — Empty root folder (no sections pre-populated).
     service = DriveOrgService(drive=drive)
     with pytest.raises(FeishuContentError, match="missing required section"):
         await service.ensure_root_tree()
