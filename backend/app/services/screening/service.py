@@ -115,6 +115,11 @@ class ScreeningService:
             report.opportunities_screened += 1
             report.signals_created += int(outcome) if isinstance(outcome, int) else 0
 
+        # Phase 33 PR-33-A — 单次 commit 取代 per-opp commit。
+        # 50 opp × ~50-150ms/commit ≈ 2.5-7.5s WAL flush 开销降到 ~50-150ms。
+        # _screen_one / _mark_failed 内部只 flush(让行级错误尽早 surface)。
+        await self.session.commit()
+
         logger.info("screening_run_complete", **report.as_dict())
         return report
 
@@ -142,7 +147,6 @@ class ScreeningService:
         )
         result = parse_screening_response(payload)
         await self._apply(opp, result, raw_items)
-        await self.session.commit()
         return len(raw_items)
 
     def _build_snippets(self, items: Iterable[RawItem]) -> list[str]:
@@ -229,7 +233,9 @@ class ScreeningService:
 
     async def _mark_failed(self, opp: Opportunity) -> None:
         opp.status = self.SCREEN_FAILED_STATUS
-        await self.session.commit()
+        # Phase 33 PR-33-A — commit 移到 run_once 末尾,这里只 flush 让 row-level
+        # 错误尽早 surface。50 opp × commit ≈ 2.5-7.5s → 1 commit ≈ 50-150ms。
+        await self.session.flush()
 
 
 __all__ = ["ScreeningReport", "ScreeningService"]

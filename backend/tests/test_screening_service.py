@@ -267,3 +267,93 @@ async def test_screening_enriches_summary(sqlite_session):
     assert opp.summary is not None
     assert "Pre-existing context" in opp.summary
     assert "Potential business" in opp.summary
+
+
+# ---------------------------------------------------------------------------
+# Phase 33 PR-33-A — screening commit-once-at-end
+# ---------------------------------------------------------------------------
+async def test_screening_commits_once_at_end_not_per_opp(
+    sqlite_session, monkeypatch
+) -> None:
+    """PR-33-A 回归: N opp → 1 次 commit,不是 N 次。
+
+    通过 monkeypatch session.commit 计数。一个 opp 足以触发 1→1 验证;
+    若有人后续把 commit 加回 _screen_one 单 opp 路径,断言会立刻失败。
+    """
+    await _seed_clustered_opportunity(
+        sqlite_session,
+        title="AI Tool PR33A",
+        items=[
+            {
+                "external_id": "ext-pr33a-1",
+                "url": "https://hn.com/pr33a/1",
+                "title": "AI Tool PR33A",
+                "content": "AI content",
+            }
+        ],
+    )
+
+    commit_calls: list[int] = []
+
+    real_commit = sqlite_session.commit
+
+    async def _count_commit() -> None:
+        commit_calls.append(1)
+        await real_commit()
+
+    monkeypatch.setattr(sqlite_session, "commit", _count_commit)
+
+    service = ScreeningService(sqlite_session, provider=MockLLMProvider())
+    report = await service.run_once()
+
+    assert report.opportunities_screened == 1
+    # PR-33-A: 1 次 commit,不是 per-opp
+    assert len(commit_calls) == 1, (
+        f"expected 1 commit (run_once end), got {len(commit_calls)} — "
+        "PR-33-A 回归:screening 还在 per-opp commit?"
+    )
+
+
+async def test_screening_mark_failed_no_longer_commits(
+    sqlite_session, monkeypatch
+) -> None:
+    """PR-33-A 回归: _mark_failed 只 flush,不 commit。
+
+    模拟一个 opp 让 LLM 抛错,走 _mark_failed 分支,验证 commit 没被调。
+    """
+    from app.utils import RetryableError
+    from app.services.llm import LLMProvider
+
+    class _BoomProvider(LLMProvider):
+        async def complete_json(self, **kwargs):
+            raise RetryableError("simulated LLM down")
+
+    opp = await _seed_clustered_opportunity(
+        sqlite_session,
+        title="AI Tool",
+        items=[
+            {
+                "external_id": "boom-1",
+                "url": "https://hn.com/boom",
+                "title": "AI Tool",
+                "content": "AI content",
+            }
+        ],
+    )
+
+    commit_calls: list[int] = []
+
+    real_commit = sqlite_session.commit
+
+    async def _count_commit() -> None:
+        commit_calls.append(1)
+        await real_commit()
+
+    monkeypatch.setattr(sqlite_session, "commit", _count_commit)
+
+    service = ScreeningService(sqlite_session, provider=_BoomProvider())
+    report = await service.run_once()
+
+    assert report.opportunities_failed == 1
+    # _mark_failed 不再 commit;整个 run_once 末尾 commit 1 次
+    assert len(commit_calls) == 1
