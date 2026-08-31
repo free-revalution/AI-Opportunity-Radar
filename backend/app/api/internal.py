@@ -350,6 +350,23 @@ async def run_pipeline(
             )
             data_sink["backfilled"] = 0
 
+        # 5.5 Phase 30 — Top-N opportunities 写 Opportunities 多维表格
+        opportunities_sink: dict[str, Any] = {"inserted": 0}
+        try:
+            opportunities_sink = await _write_opportunities_table(
+                session=session,
+                settings=_phase30_settings,
+                run_id=run.id,
+                n=_phase30_settings.radar_top_n_push,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "internal_pipeline_opportunities_table_write_failed",
+                run_id=run.id,
+                error=str(exc),
+            )
+            opportunities_sink = {"inserted": 0, "error": str(exc)[:200]}
+
         # 6. digest (+ optional Docx write — Phase 25 v2.1)
         digest_sent = False
         docx_ref: Optional[dict[str, Any]] = None
@@ -441,6 +458,7 @@ async def run_pipeline(
             "digest_sent": digest_sent,
             "docx": docx_ref,
             "data_sink": data_sink,
+            "opportunities_sink": opportunities_sink,
             "error": None,
         }
     except Exception as exc:  # noqa: BLE001 — record and re-raise
@@ -1335,3 +1353,107 @@ async def _backfill_data_table_screening(
 # TODO(Phase 30): 在 _apply screening 完成时直接 emit raw_item→screening 映射,
 # 当前实现通过 ``SELECT Signal JOIN RawItem JOIN Opportunity`` 二次查询实现,
 # 足够简单且不需要改 ScreeningService 的接口。后续 Phase 31 可优化。
+
+
+# ===========================================================================
+# Phase 30 — Opportunities 多维表格 sink (Top-N)
+# ===========================================================================
+async def _write_opportunities_table(
+    *,
+    session: AsyncSession,
+    settings: Any,
+    run_id: int,
+    n: int = 5,
+) -> dict[str, Any]:
+    """把本次 /run 的 Top-N 机会(按 total_score 倒序)写入 Opportunities 多维表格。
+
+    - plan D10: 重写 mapper,用真实字段。
+    - plan §0 决策:Top-N 推送到群聊 → 用户点按钮生成详情 docx。
+    - 注意:这是**无脑 insert** — Opportunities 表只增不删,
+      每次 /run 都写最新 Top-N,运营在飞书 UI 看最新快照。
+    """
+    from app.repositories import OpportunityRepository
+    from app.services.feishu.app_client import FeishuAppClient
+    from app.services.feishu.content_client import FeishuBitableClient
+
+    if n <= 0:
+        return {"inserted": 0}
+
+    opp_repo = OpportunityRepository(session)
+    rows, _ = await opp_repo.list_paginated(limit=n, sort="total_score")
+    if not rows:
+        return {"inserted": 0}
+
+    base_url = (
+        settings.app_base_url
+        if hasattr(settings, "app_base_url")
+        else "http://localhost:3000"
+    )
+    items = [
+        {
+            "id": opp.id,
+            "title": opp.title,
+            "total_score": opp.total_score,
+            "category": opp.category,
+            "source_count": opp.source_count,
+            "summary": opp.summary,
+            "trend_score": opp.trend_score,
+            "demand_score": opp.demand_score,
+            "monetization_score": opp.monetization_score,
+            "competition_gap_score": opp.competition_gap_score,
+            "china_gap_score": opp.china_gap_score,
+            "execution_score": opp.execution_score,
+        }
+        for opp in rows
+    ]
+
+    app_client = FeishuAppClient(settings=settings)
+    bitable = FeishuBitableClient(
+        app_client=app_client,
+        settings=settings,
+        token_setting="feishu_bitable_opportunities_app_token",
+    )
+    inserted = await bitable.bulk_insert_opportunities(
+        items=items,
+        base_url_for_links=base_url,
+    )
+    logger.info(
+        "feishu_opportunities_table_inserted",
+        run_id=run_id,
+        inserted=inserted,
+        requested=n,
+    )
+    return {"inserted": inserted}
+
+
+@router.get(
+    "/opportunities/top",
+    summary="Top-N opportunities by total_score (Phase 30 — chat card)",
+)
+async def get_top_opportunities(
+    n: int = 5,
+    session: AsyncSession = Depends(get_session),
+    _actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    """供 task_runner 在 /run 完成后拉 Top-N 信号渲染飞书交互卡。
+
+    每个机会返回: ``id, title, slug, total_score, category, source_count, summary``。
+    """
+    n = max(1, min(n, 20))  # 限制范围,避免 IM 卡过载
+    opp_repo = OpportunityRepository(session)
+    rows, _ = await opp_repo.list_paginated(limit=n, sort="total_score")
+    return {
+        "items": [
+            {
+                "id": opp.id,
+                "title": opp.title,
+                "slug": opp.slug,
+                "total_score": opp.total_score,
+                "category": opp.category,
+                "source_count": opp.source_count,
+                "summary": (opp.summary or "")[:200],
+            }
+            for opp in rows
+        ],
+        "count": len(rows),
+    }

@@ -54,14 +54,19 @@ _DEFAULT_POLL_TIMEOUT_SEC = 60.0
 _BITABLE_BATCH_SIZE = 500
 
 # — Default columns created when we auto-create an Opportunities table.
+# Phase 30 rewrite — replaced the never-populated `Market Size` / `MVP
+# Days` / `Difficulty` trio with the real screening outputs that the
+# pipeline actually persists. See plan §2.2 / D10. Sub-scores are packed
+# into one text cell `T:80 D:65 …` (Bitable free-form text is the
+# simplest way to ship 6 sub-scores without custom field types).
 _OPP_FIELDS: list[dict[str, Any]] = [
-    {"field_name": "Title",        "type": 1},     # 1 = text
+    {"field_name": "Title",        "type": 1},   # Text, primary
     {"field_name": "Score",        "type": 1},
     {"field_name": "Category",     "type": 1},
-    {"field_name": "Market Size",  "type": 1},
-    {"field_name": "MVP Days",     "type": 1},
-    {"field_name": "Difficulty",   "type": 1},
     {"field_name": "Radar URL",    "type": 1},
+    {"field_name": "Source Count", "type": 1},
+    {"field_name": "Sub Scores",   "type": 1},
+    {"field_name": "Summary",      "type": 1},
 ]
 _OPP_TABLE_NAME = "Opportunities"
 
@@ -1392,16 +1397,38 @@ def _opp_to_bitable_fields(
     Bitable `fields` is `{ "<column_name>": <value> }` — for a Text
     column the value is a string. We strip + truncate so very long
     titles don't blow up the cell.
+
+    Phase 30 (plan D10): replaced the unused ``market_size`` / ``mvp_days``
+    / ``difficulty`` columns with ``Source Count`` / ``Sub Scores`` /
+    ``Summary`` — values the screening pipeline actually persists.
     """
     opp_id = opp.get("id")
     title = (opp.get("title") or "(无标题)").strip()[:200]
     score = opp.get("total_score")
     score_str = "" if score is None else str(int(round(float(score))))
     category = (opp.get("category") or "").strip()[:100]
-    market_size = (opp.get("market_size") or "").strip()[:100]
-    mvp_days = opp.get("mvp_days")
-    mvp_days_str = "" if mvp_days is None else str(int(mvp_days))
-    difficulty = (opp.get("difficulty") or "").strip()[:50]
+    source_count = opp.get("source_count") or 0
+    try:
+        source_count_str = str(int(source_count))
+    except (TypeError, ValueError):
+        source_count_str = "0"
+
+    # Pack 6 sub-scores into one text cell. 0 = missing, real number = persisted.
+    def _s(v: Any) -> int:
+        try:
+            return int(round(float(v or 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    sub_scores = (
+        f"T:{_s(opp.get('trend_score'))} "
+        f"D:{_s(opp.get('demand_score'))} "
+        f"M:{_s(opp.get('monetization_score'))} "
+        f"C:{_s(opp.get('competition_gap_score'))} "
+        f"Z:{_s(opp.get('china_gap_score'))} "
+        f"E:{_s(opp.get('execution_score'))}"
+    )
+    summary = (opp.get("summary") or "").strip()[:500]
     radar_url = f"{base_url.rstrip('/')}/opportunities/{opp_id}" if opp_id else ""
 
     return {
@@ -1409,10 +1436,10 @@ def _opp_to_bitable_fields(
             "Title": title,
             "Score": score_str,
             "Category": category,
-            "Market Size": market_size,
-            "MVP Days": mvp_days_str,
-            "Difficulty": difficulty,
             "Radar URL": radar_url,
+            "Source Count": source_count_str,
+            "Sub Scores": sub_scores,
+            "Summary": summary,
         }
     }
 

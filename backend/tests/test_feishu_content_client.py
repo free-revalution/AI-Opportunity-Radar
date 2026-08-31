@@ -648,24 +648,36 @@ async def test_token_mixin_refreshes_once_on_99991663() -> None:
 # Pure helper: _opp_to_bitable_fields
 # ---------------------------------------------------------------------------
 def test_opp_to_bitable_fields_shape() -> None:
-    """One Opportunity dict → Bitable `fields` shape with all 7 columns."""
+    """One Opportunity dict → Bitable `fields` shape with all 7 columns.
+
+    Phase 30 (plan D10) — mapper rewritten to use real screening outputs
+    (Source Count, Sub Scores, Summary) instead of never-populated
+    market_size / mvp_days / difficulty.
+    """
     opp = {
         "id": 42,
         "title": "AI Coach",
         "total_score": 88.7,
         "category": "Education",
-        "market_size": "¥10亿",
-        "mvp_days": 30,
-        "difficulty": "medium",
+        "source_count": 5,
+        "summary": "A focused AI tutor product.",
+        "trend_score": 80,
+        "demand_score": 75,
+        "monetization_score": 90,
+        "competition_gap_score": 70,
+        "china_gap_score": 85,
+        "execution_score": 65,
     }
     out = _opp_to_bitable_fields(opp, "http://radar.test")
     assert out["fields"]["Title"] == "AI Coach"
     assert out["fields"]["Score"] == "89"  # round(88.7)
     assert out["fields"]["Category"] == "Education"
-    assert out["fields"]["Market Size"] == "¥10亿"
-    assert out["fields"]["MVP Days"] == "30"
-    assert out["fields"]["Difficulty"] == "medium"
     assert out["fields"]["Radar URL"] == "http://radar.test/opportunities/42"
+    assert out["fields"]["Source Count"] == "5"
+    assert out["fields"]["Sub Scores"] == (
+        "T:80 D:75 M:90 C:70 Z:85 E:65"
+    )
+    assert out["fields"]["Summary"] == "A focused AI tutor product."
 
 
 def test_opp_to_bitable_fields_handles_missing_keys() -> None:
@@ -674,7 +686,9 @@ def test_opp_to_bitable_fields_handles_missing_keys() -> None:
     out = _opp_to_bitable_fields(opp, "http://x")
     assert out["fields"]["Title"] == "X"
     assert out["fields"]["Score"] == ""
-    assert out["fields"]["MVP Days"] == ""
+    assert out["fields"]["Source Count"] == "0"
+    assert out["fields"]["Sub Scores"] == "T:0 D:0 M:0 C:0 Z:0 E:0"
+    assert out["fields"]["Summary"] == ""
     assert out["fields"]["Radar URL"] == "http://x/opportunities/1"
 
 
