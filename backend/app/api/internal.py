@@ -313,6 +313,43 @@ async def run_pipeline(
             + _count(r_report, "reports_persisted", "signal_count")
         )
 
+        # ----- Phase 30 — store-first + chat-pick architecture -----
+        # 2.5 把本次 /run 新增的 RawItem 写入 Data 多维表格(永远不丢)
+        from app.config import get_settings as _get_settings
+
+        _phase30_settings = _get_settings()
+        data_sink: dict[str, Any] = {"inserted": 0, "skipped_duplicate": 0}
+        # 总是尝试(空 token 时 DataTableClient 内部 ensure_app 会自动建)
+        try:
+            data_sink = await _write_data_table(
+                session=session,
+                settings=_phase30_settings,
+                run_id=run.id,
+            )
+        except Exception as exc:  # noqa: BLE001 — record and continue
+            logger.warning(
+                "internal_pipeline_data_table_write_failed",
+                run_id=run.id,
+                error=str(exc),
+            )
+            data_sink = {"inserted": 0, "skipped_duplicate": 0, "error": str(exc)[:200]}
+
+        # 4.5 Screening 后回填 Data 表的 Category / Score / Opportunity ID
+        try:
+            backfilled = await _backfill_data_table_screening(
+                session=session,
+                settings=_phase30_settings,
+                run_id=run.id,
+            )
+            data_sink["backfilled"] = backfilled
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "internal_pipeline_data_table_backfill_failed",
+                run_id=run.id,
+                error=str(exc),
+            )
+            data_sink["backfilled"] = 0
+
         # 6. digest (+ optional Docx write — Phase 25 v2.1)
         digest_sent = False
         docx_ref: Optional[dict[str, Any]] = None
@@ -403,6 +440,7 @@ async def run_pipeline(
             "signal_count": signal_count,
             "digest_sent": digest_sent,
             "docx": docx_ref,
+            "data_sink": data_sink,
             "error": None,
         }
     except Exception as exc:  # noqa: BLE001 — record and re-raise
@@ -1188,3 +1226,112 @@ async def _dedup_today_stats(session: AsyncSession) -> dict[str, Any]:
         "opportunities_created": opp_new,
         "window_start": today_start.isoformat(),
     }
+
+# ===========================================================================
+# Phase 30 — store-first sinks (Data 多维表格)
+# ===========================================================================
+async def _write_data_table(
+    *,
+    session: AsyncSession,
+    settings: Any,
+    run_id: int,
+) -> dict[str, Any]:
+    """把本次 /run 新增的 RawItem 写入 Data 多维表格(永远不丢)。
+
+    选择窗口: ``fetched_at >= run.started_at``。
+    容错: 任何异常由 caller ``run_pipeline`` catch 后只记录,不阻塞 run。
+    """
+    from sqlalchemy import select as _sa_select
+
+    from app.models import Run as _Run
+    from app.services.feishu.app_client import FeishuAppClient
+    from app.services.feishu.data_table import DataTableClient
+
+    run = await session.get(_Run, run_id)
+    started_at = run.started_at if run else None
+    if started_at is None:
+        return {"inserted": 0, "skipped_duplicate": 0, "error": "run has no started_at"}
+
+    stmt = _sa_select(RawItem).where(RawItem.fetched_at >= started_at)
+    raw_items = list((await session.execute(stmt)).scalars().all())
+    if not raw_items:
+        return {"inserted": 0, "skipped_duplicate": 0}
+
+    app_client = FeishuAppClient(settings=settings)
+    try:
+        client = DataTableClient(app_client=app_client, settings=settings)
+        result = await client.bulk_insert_raw_items(items=raw_items, run_id=run_id)
+        return dict(result)
+    finally:
+        # FeishuAppClient 不一定暴露 close;保持构造即用、用完 GC。
+        pass
+
+
+async def _backfill_data_table_screening(
+    *,
+    session: AsyncSession,
+    settings: Any,
+    run_id: int,
+) -> int:
+    """回填本次 /run 新生成 Signal 对应 Data 表行的 Category / Score / Opportunity ID。
+
+    思路:
+      1. 找本次 run 新建的 Signal(signal_type='screening', created_at >= run.started_at)
+      2. JOIN RawItem 拿 source + external_id
+      3. JOIN Opportunity 拿 total_score
+      4. 组成 ``{primary_key: {Category, Score, Opportunity ID}}`` 调 update_screening_results
+    """
+    from sqlalchemy import select as _sa_select
+
+    from app.models import Opportunity as _Opportunity
+    from app.models import Run as _Run
+    from app.models import Signal as _Signal
+    from app.services.feishu.app_client import FeishuAppClient
+    from app.services.feishu.data_table import DataTableClient
+
+    run = await session.get(_Run, run_id)
+    started_at = run.started_at if run else None
+    if started_at is None:
+        return 0
+
+    from app.models import OpportunitySource as _OS
+
+    stmt = (
+        _sa_select(_Signal, RawItem, _Opportunity)
+        .join(RawItem, _Signal.raw_item_id == RawItem.id)
+        .join(_OS, _OS.raw_item_id == RawItem.id)
+        .join(_Opportunity, _Opportunity.id == _OS.opportunity_id)
+        .where(_Signal.created_at >= started_at)
+        .where(_Signal.signal_type == "screening")
+    )
+    rows = list((await session.execute(stmt)).all())
+    if not rows:
+        return 0
+
+    mapping: dict[str, dict[str, Any]] = {}
+    for signal, raw_item, opp in rows:
+        # 注:DB 模型字段叫 external_id(RawItem dataclass 叫 source_id,
+        # upsert 时映射),这里直接拼 source:external_id 作 Data 表主键。
+        pk = f"{raw_item.source}:{raw_item.external_id or ''}"
+        if not pk.endswith(":"):
+            payload: dict[str, Any] = {
+                "Category": signal.category or opp.category or "",
+                "Score": int(round(float(opp.total_score or 0))),
+                "Opportunity ID": int(opp.id),
+            }
+            # 同主键只写一次(选最大的 total_score)
+            existing = mapping.get(pk)
+            if existing is None or payload["Score"] > int(existing.get("Score", 0)):
+                mapping[pk] = payload
+
+    if not mapping:
+        return 0
+
+    app_client = FeishuAppClient(settings=settings)
+    client = DataTableClient(app_client=app_client, settings=settings)
+    return await client.update_screening_results(mapping=mapping)
+
+
+# TODO(Phase 30): 在 _apply screening 完成时直接 emit raw_item→screening 映射,
+# 当前实现通过 ``SELECT Signal JOIN RawItem JOIN Opportunity`` 二次查询实现,
+# 足够简单且不需要改 ScreeningService 的接口。后续 Phase 31 可优化。

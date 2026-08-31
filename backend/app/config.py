@@ -161,6 +161,21 @@ class Settings(BaseSettings):
     # Same auto-create behaviour as the digest table.
     feishu_bitable_opportunities_app_token: str = ""
 
+    # ---------- Phase 30 — store-first + chat-pick architecture -----------
+    # Bitable — Data table. Stores every /run's NEW raw items, deduped
+    # by `Source` primary key (`source:external_id`). Operators can
+    # browse / pivot / export raw data without going through screening.
+    # Auto-created on first /run when empty (logs new app_token for
+    # operators to persist back to .env).
+    feishu_bitable_data_app_token: str = ""
+    # Number of top opportunities pushed to the bot chat after /run.
+    # Each carries a [生成报告] button → writes a per-signal detail docx.
+    radar_top_n_push: int = 5
+    # Idempotency TTL for the detail-docx button click. Re-clicking
+    # the same opportunity within the window returns the previously
+    # generated doc_id (no rewrite). Default 24h.
+    radar_detail_doc_idempotency_ttl: int = 86_400
+
     # ---------- Bot channel selection (Phase 6 v2.0) ----------
     # Primary channel used by `NotificationService` + n8n daily digests.
     # Phase 6 product decision: Feishu first (国内可达 + 知识库 + 权限);

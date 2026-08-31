@@ -302,6 +302,13 @@ class Opportunity(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
 
+    # ---- Phase 30 — Screening原文持久化 (store-first + chat-pick) -----
+    # 让详情 docx 能直接展示 screening LLM 的原文,而无需重跑 LLM。
+    # 老行全部为 NULL — 详情 docx 渲染时按 section 缺失处理。
+    problem: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    potential_business: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    keywords_json: Mapped[Optional[list[str]]] = mapped_column(JSON, nullable=True)
+
     sources: Mapped[list["OpportunitySource"]] = relationship(
         back_populates="opportunity", cascade="all, delete-orphan"
     )

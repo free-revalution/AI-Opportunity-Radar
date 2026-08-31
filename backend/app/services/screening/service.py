@@ -177,6 +177,13 @@ class ScreeningService:
         elif result.problem:
             opp.summary = result.problem[:2000]
 
+        # Phase 30 — store-first + chat-pick: persist screening 原文 so the
+        # detail docx (built on button click) can show problem / business /
+        # keywords without re-running the LLM. Migration a30b1c2d3e4f.
+        opp.problem = (result.problem or "")[:2000] or None
+        opp.potential_business = (result.potential_business or "")[:2000] or None
+        opp.keywords_json = list(result.keywords or []) if result.keywords else None
+
         opp.trend_score = float(result.trend_strength)
         opp.demand_score = float(result.demand_strength)
         opp.monetization_score = float(result.monetization_potential)
