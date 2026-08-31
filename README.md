@@ -136,6 +136,19 @@ Phase 30 同时启用了 2 张飞书多维表格:
 若 `FEISHU_DRIVE_ROOT_FOLDER_TOKEN` 未配置,`write_docx` 会被静默跳过并
 返回 `{error: "..."}`,不会阻断 pipeline。
 
+### Phase 32 — Data 表 screening 回填串行化
+
+飞书 Bitable 多维表格底层基于版本维度串行处理同一文档的写接口。
+`update_screening_results` 原本用 `asyncio.gather` 并发 N 个 `update_record`,
+在 Screening 写出 ~10-30 行的规模下虽未踩线(`update_record` 上限 50 req/s),
+但飞书文档明确"同 Bitable 不支持并发写接口" — 多维表格底层串行,
+并发触发 `code=1254291 Write conflict`。
+
+**Phase 32 PR-32-A** 改成串行 for 循环,update 失败次数记
+`radar_external_service_errors_total{provider="feishu_data_table", kind="update_record_failed"}`
+metric — 后续运营可在 `/metrics` 端点盯这个值,真触发冲突时第一时间感知。
+**不引入** semaphore / 令牌桶 / 全局限流 — Screening 写入行数小,
+串行开销 ~300-900ms 可接受。
 ---
 
 ## 信息源列表

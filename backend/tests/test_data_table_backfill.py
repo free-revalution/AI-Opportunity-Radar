@@ -373,3 +373,155 @@ async def test_unbounded_empty_db_noop(
         "scanned": 0,
     }
     assert fake_bitable._records == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 32 PR-32-A — update_screening_results 串行化回归测试
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_update_screening_results_runs_serially(
+    sqlite_session: Any, fake_bitable: _FakeBitableClient
+) -> None:
+    """PR-32-A 回归测试: 确认 update_screening_results 不并发执行 update_record。
+
+    飞书 Bitable 底层串行处理同文档写 — 并发触发 1254291 Write conflict。
+    通过 asyncio.Lock 观测最大并发数 = 1 来证明串行化。
+    """
+    import asyncio
+
+    concurrent_peaks: list[int] = []
+    in_flight = 0
+    lock = asyncio.Lock()
+
+    async def _fake_update_record(
+        self: Any,
+        *,
+        table_id: Any,
+        record_id: Any,
+        fields: Any,
+    ) -> dict[str, Any]:
+        nonlocal in_flight
+        in_flight += 1
+        concurrent_peaks.append(in_flight)
+        # 模拟飞书调用耗时,放大串行/并发的差异
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        # 同步落 fake records
+        for r in self._records:  # type: ignore[attr-defined]
+            if r["record_id"] == record_id:
+                r["fields"] = {**r["fields"], **fields}
+                return r
+        return {"record_id": record_id, "fields": fields}
+
+    # Pre-seed: 3 行 Data 表记录,供 update_screening_results 命中 record_id
+    fake_bitable._records = [
+        {"record_id": "rec_1", "table_id": "tb_data",
+         "fields": {"Source": "github:g1", "Title": "t1"}},
+        {"record_id": "rec_2", "table_id": "tb_data",
+         "fields": {"Source": "github:g2", "Title": "t2"}},
+        {"record_id": "rec_3", "table_id": "tb_data",
+         "fields": {"Source": "reddit:r1", "Title": "r1"}},
+    ]
+    # 让 list_records 在 phase 32 测试中查得到这 3 行(覆盖默认 filter)
+    fake_bitable._records_for_list = fake_bitable._records
+
+    from app.services.feishu.data_table import DataTableClient
+    client = DataTableClient(app_client=_FakeAppClient(settings=__import__(
+        "app.config", fromlist=["get_settings"]
+    ).get_settings()))
+    client._bitable = fake_bitable  # type: ignore[assignment]
+    client._bitable._session = sqlite_session  # type: ignore[attr-defined]
+
+    # Monkeypatch update_record 计数并发
+    import unittest.mock
+
+    with unittest.mock.patch.object(
+        type(client._bitable), "update_record", _fake_update_record
+    ):
+        mapping = {
+            "github:g1": {"Category": "x", "Score": 80, "Opportunity ID": 1},
+            "github:g2": {"Category": "y", "Score": 70, "Opportunity ID": 2},
+            "reddit:r1": {"Category": "z", "Score": 60, "Opportunity ID": 3},
+        }
+        updated = await client.update_screening_results(mapping=mapping)
+        assert updated == 3
+        # — 并发峰值 = 1(串行)。如果是 asyncio.gather,峰值会是 3。
+        assert max(concurrent_peaks) == 1, (
+            f"update_screening_results not serial! peak={max(concurrent_peaks)}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_update_screening_results_records_metric_on_failure(
+    sqlite_session: Any, fake_bitable: _FakeBitableClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """失败的 update_record → 调 ``record_external_error`` 一次。"""
+    fake_bitable._records = [
+        {"record_id": "rec_x", "table_id": "tb_data",
+         "fields": {"Source": "github:gx", "Title": "x"}},
+    ]
+    fake_bitable._records_for_list = fake_bitable._records
+
+    from app.services.feishu.content_client import FeishuContentError
+    from app.services.feishu.data_table import DataTableClient
+
+    client = DataTableClient(app_client=_FakeAppClient(settings=__import__(
+        "app.config", fromlist=["get_settings"]
+    ).get_settings()))
+    client._bitable = fake_bitable  # type: ignore[assignment]
+    client._bitable._session = sqlite_session  # type: ignore[attr-defined]
+
+    import unittest.mock
+
+    async def _boom(self: Any, **kwargs: Any) -> dict[str, Any]:
+        raise FeishuContentError("feishu 1254291 write conflict")
+
+    metric_calls: list[tuple[str, str]] = []
+
+    def _spy_record(provider: str, kind: str) -> None:
+        metric_calls.append((provider, kind))
+
+    monkeypatch.setattr(
+        "app.metrics.record_external_error", _spy_record
+    )
+
+    with unittest.mock.patch.object(
+        type(client._bitable), "update_record", _boom
+    ):
+        mapping = {"github:gx": {"Category": "x", "Score": 80, "Opportunity ID": 1}}
+        updated = await client.update_screening_results(mapping=mapping)
+        # — update 失败 → 返回 0,但 metric 被记
+        assert updated == 0
+        assert ("feishu_data_table", "update_record_failed") in metric_calls
+
+
+@pytest.mark.asyncio
+async def test_update_screening_results_no_metric_on_success(
+    sqlite_session: Any, fake_bitable: _FakeBitableClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """全部成功 → 不调 record_external_error(避免 metric 噪音)。"""
+    fake_bitable._records = [
+        {"record_id": "rec_y", "table_id": "tb_data",
+         "fields": {"Source": "github:gy", "Title": "y"}},
+    ]
+    fake_bitable._records_for_list = fake_bitable._records
+
+    from app.services.feishu.data_table import DataTableClient
+
+    client = DataTableClient(app_client=_FakeAppClient(settings=__import__(
+        "app.config", fromlist=["get_settings"]
+    ).get_settings()))
+    client._bitable = fake_bitable  # type: ignore[assignment]
+    client._bitable._session = sqlite_session  # type: ignore[attr-defined]
+
+    metric_calls: list[tuple[str, str]] = []
+
+    def _spy_record(provider: str, kind: str) -> None:
+        metric_calls.append((provider, kind))
+
+    monkeypatch.setattr("app.metrics.record_external_error", _spy_record)
+
+    mapping = {"github:gy": {"Category": "y", "Score": 80, "Opportunity ID": 1}}
+    updated = await client.update_screening_results(mapping=mapping)
+    assert updated == 1
+    assert metric_calls == []

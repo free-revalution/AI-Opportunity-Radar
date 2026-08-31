@@ -444,15 +444,37 @@ class DataTableClient:
                 )
                 return False
 
-        results = await asyncio.gather(
-            *[_one(src, payload) for src, payload in mapping.items()]
-        )
-        updated = sum(1 for ok in results if ok)
+        # Phase 32 PR-32-A: serial (not concurrent) updates.
+        #
+        # 飞书 Bitable 多维表格底层串行处理同一文档的写接口 — ``asyncio.gather``
+        # 并发 N 个 ``update_record`` 会触发 ``code=1254291 "Write conflict"``。
+        # 改成顺序 for 循环,每行单独 ``try/except``,update 失败计数记 metric。
+        # 实际耗时:`Screening` 一次 /run 写 ~10-30 行,串行开销 ~300-900ms,
+        # 但避免了并发冲突的 hard fail — 净收益。
+        updated = 0
+        failed = 0
+        for src_key, payload in mapping.items():
+            ok = await _one(src_key, payload)
+            if ok:
+                updated += 1
+            else:
+                failed += 1
         logger.info(
             "feishu_data_table_backfilled",
             updated=updated,
+            failed=failed,
             requested=len(mapping),
         )
+        # Prometheus counter — 用 ``record_external_error(provider='feishu', ...)``
+        # 走现成标签轴,运营可在 ``/metrics`` 看 ``radar_external_service_errors_total``
+        # 是否突然飙升(踩 1254291 的早期信号)。
+        if failed:
+            from app.metrics import record_external_error
+
+            record_external_error(
+                provider="feishu_data_table",
+                kind="update_record_failed",
+            )
         return updated
 
     # ------------------------------------------------------------------
