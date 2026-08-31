@@ -230,44 +230,42 @@ async def test_rss_mock_returns_items():
 async def test_rss_live_parses_payload():
     rss_body = b"""<?xml version='1.0'?>
     <rss version='2.0'><channel>
-      <title>OpenAI Blog</title>
+      <title>OpenAI News</title>
       <item>
         <title>Announcement</title>
-        <link>https://openai.com/blog/announcement</link>
+        <link>https://openai.com/news/announcement</link>
         <description>Body</description>
         <pubDate>Mon, 01 Jan 2026 00:00:00 GMT</pubDate>
         <guid>announcement</guid>
       </item>
     </channel></rss>
     """
+    # Phase 29 — use the current DEFAULT_FEEDS manifest so the test
+    # stays aligned if a future operator swaps more URLs.
+    from app.services.ingestion.rss import DEFAULT_FEEDS
     with respx.mock() as mock:
-        for _, url in [
-            ("OpenAI Blog", "https://openai.com/blog/rss.xml"),
-            ("Anthropic News", "https://www.anthropic.com/news/rss.xml"),
-            ("Google AI Blog", "https://blog.google/technology/ai/rss/"),
-            ("Hacker News Frontpage", "https://news.ycombinator.com/rss"),
-            ("Lobsters", "https://lobste.rs/rss"),
-        ]:
+        for _name, url, _category in DEFAULT_FEEDS:
             mock.get(url).mock(return_value=Response(200, content=rss_body))
         result = await RSSConnector(mock=False).fetch()
         _assert_sane_result(result, expected_source="rss")
-        # 5 feeds × 1 item each = 5 items.
-        assert len(result.items) == 5
+        assert len(result.items) == len(DEFAULT_FEEDS)
         assert all(item.title == "Announcement" for item in result.items)
 
 
 async def test_rss_handles_feed_failure_gracefully():
+    # Phase 29 — pick a real feed from the current manifest instead of
+    # the removed OpenAI Blog URL.
+    from app.services.ingestion.rss import DEFAULT_FEEDS
+    failing_name, failing_url, _ = DEFAULT_FEEDS[0]
     with respx.mock() as mock:
-        mock.get("https://openai.com/blog/rss.xml").mock(return_value=Response(500))
-        for _, url in [
-            ("Anthropic News", "https://www.anthropic.com/news/rss.xml"),
-            ("Google AI Blog", "https://blog.google/technology/ai/rss/"),
-            ("Hacker News Frontpage", "https://news.ycombinator.com/rss"),
-            ("Lobsters", "https://lobste.rs/rss"),
-        ]:
+        mock.get(failing_url).mock(return_value=Response(500))
+        for _name, url, _category in DEFAULT_FEEDS[1:]:
             mock.get(url).mock(return_value=Response(200, content=b"<rss><channel></channel></rss>"))
         result = await RSSConnector(mock=False).fetch()
-        assert any("500" in e for e in result.errors)
+        assert any("500" in e for e in result.errors), (
+            f"expected one error containing '500' for {failing_name!r}, "
+            f"got errors={result.errors}"
+        )
         # Other feeds should still contribute items (empty here, but no crash).
         assert result.items == []
 

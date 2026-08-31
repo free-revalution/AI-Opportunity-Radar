@@ -275,6 +275,30 @@ class IngestionService:
         from datetime import datetime, timezone
 
         source_row.last_success_at = datetime.now(timezone.utc)
+
+        # Phase 29 fix — stamp the curated compliance default on any
+        # Source row that has never been reviewed
+        # (``last_compliance_check IS NULL``). Without this, freshly
+        # upserted rows stayed at the conservative ``compliance_level='E'``
+        # and the pre-fetch gate blocked the very next fetch. Existing
+        # rows with a real review timestamp are left untouched —
+        # operators may have already manually adjusted them.
+        if source_row.last_compliance_check is None:
+            from app.services.ingestion.source_compliance import (
+                SOURCE_COMPLIANCE_DEFAULTS,
+            )
+
+            default = SOURCE_COMPLIANCE_DEFAULTS.get(source_slug)
+            if default is not None:
+                source_row.compliance_level = default.compliance_level
+                source_row.access_method = default.access_method
+                source_row.commercial_use_status = default.commercial_use_status
+                source_row.terms_url = default.terms_url
+                source_row.robots_url = default.robots_url
+                if default.rate_limit is not None:
+                    source_row.rate_limit = default.rate_limit
+                source_row.last_compliance_check = datetime.now(timezone.utc)
+
         await self.session.flush()
 
         inserted = 0

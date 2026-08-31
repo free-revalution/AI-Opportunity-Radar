@@ -17,42 +17,60 @@ from app.services.ingestion.base import SourceConnector, SourceConnectorResult
 from app.services.ingestion.raw_item import RawItem
 
 
-# Default feeds — Phase 25 v2.1 expansion.
+# Default feeds — Phase 25 v2.1 expansion, refreshed Phase 29.
 #
 # Three tiers, in priority order:
-#   1. AI official blogs (OpenAI / Anthropic / Google) — the original
-#      MVP surface; kept verbatim for source-health continuity.
-#   2. Tech press (Hacker News / Lobsters) — dev community signal.
-#   3. Phase 25 v2.1 expansion — business / finance / e-commerce / hot
+#   1. AI official blogs (OpenAI / Google AI / HuggingFace / GitHub)
+#      — original MVP surface + Phase 29 replacements; kept for
+#      source-health continuity.
+#   2. Tech press (Hacker News / Lobsters / The Verge / Ars Technica
+#      / TechCrunch / LWN / Simon Willison / Stratechery).
+#   3. Phase 25 v2.1 expansion — Chinese financial / e-commerce / hot
 #      topics. The user's brief was "any kind of hotspot, filter on
 #      the Feishu layer later", so we deliberately mix mainstream
-#      tech, Chinese financial press, e-commerce trade sites, and a
-#      few generalist international feeds.
+#      tech, English financial press, and a few generalist
+#      international feeds.
+#
+# Phase 29 fix — six legacy URLs returned 404 / 307 / ConnectError
+# during the real-mode /run audit (2026-08-31). They were:
+#   * OpenAI Blog           (307 redirect → /news/rss.xml)
+#   * Anthropic News        (404 — Anthropic disabled their RSS feed)
+#   * 财富中文网             (404)
+#   * 华尔街见闻             (404)
+#   * 36氪 / 虎嗅 / 亿邦动力 (ConnectError — these CN sites block
+#                             bots without a CN residential proxy)
+#   * 投资界 / pedaily.cn    (404)
+#   * Reuters               (301 → reutersagency.com is also stale)
+# Each was probed and replaced with a working alternative that
+# returns 200 + ≥10 entries on a vanilla Mozilla User-Agent. If a
+# future operator wants to re-enable any of them they can edit
+# ``DEFAULT_FEEDS`` in place — the connector swallows per-feed
+# errors so a single 404 no longer fails the run.
 #
 # Each entry: (display_name, url, category). The category is a
 # free-form label propagated to ``RawItem.metadata["category"]`` so
 # downstream scoring / digest rendering can highlight (or filter)
 # by topic — Phase 25 v2.1 leaves the filtering on the Feishu side.
 DEFAULT_FEEDS: tuple[tuple[str, str, str], ...] = (
-    # --- original MVP surface ---
-    ("OpenAI Blog", "https://openai.com/blog/rss.xml", "tech/ai"),
-    ("Anthropic News", "https://www.anthropic.com/news/rss.xml", "tech/ai"),
+    # --- AI official blogs ---
+    ("OpenAI News", "https://openai.com/news/rss.xml", "tech/ai"),
     ("Google AI Blog", "https://blog.google/technology/ai/rss/", "tech/ai"),
+    ("HuggingFace Blog", "https://huggingface.co/blog/feed.xml", "tech/ai"),
+    ("GitHub Blog", "https://github.blog/feed/", "tech/ai"),
+    # --- Tech press ---
     ("Hacker News Frontpage", "https://news.ycombinator.com/rss", "tech/community"),
     ("Lobsters", "https://lobste.rs/rss", "tech/community"),
-    # --- Phase 25 v2.1 — Chinese financial / business press ---
-    ("财富中文网", "https://www.fortunechina.com/rss.xml", "finance/cn"),
-    ("华尔街见闻", "https://wallstreetcn.com/rss", "finance/cn"),
-    ("FT 中文网", "https://www.ftchinese.com/rss/feed", "finance/cn"),
-    # --- Phase 25 v2.1 — start-ups / e-commerce trade ---
-    ("36氪", "https://36kr.com/feed", "ecommerce/cn"),
-    ("虎嗅", "https://www.huxiu.com/rss/0.xml", "ecommerce/cn"),
-    ("亿邦动力", "https://www.ebrun.com/rss", "ecommerce/cn"),
-    ("投资界", "https://www.pedaily.cn/rss", "finance/cn"),
-    # --- Phase 25 v2.1 — international mainstream (operator proxy) ---
-    ("CNBC Top News", "https://www.cnbc.com/id/100003114/device/rss/rss.html", "finance/global"),
-    ("Reuters", "https://www.reutersagency.com/feed/?best-topics=top-news", "finance/global"),
     ("The Verge", "https://www.theverge.com/rss/index.xml", "tech/global"),
+    ("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index", "tech/global"),
+    ("TechCrunch", "https://techcrunch.com/feed/", "tech/global"),
+    ("LWN", "https://lwn.net/headlines/rss", "tech/global"),
+    # --- Operators / analysts ---
+    ("Simon Willison", "https://simonwillison.net/atom/everything/", "tech/operators"),
+    ("Stratechery", "https://stratechery.com/feed/", "tech/operators"),
+    # --- Chinese financial press (FT 中文网 kept — others removed Phase 29) ---
+    ("FT 中文网", "https://www.ftchinese.com/rss/feed", "finance/cn"),
+    # --- International mainstream (operator proxy) ---
+    ("CNBC Top News", "https://www.cnbc.com/id/100003114/device/rss/rss.html", "finance/global"),
 )
 
 
@@ -136,42 +154,42 @@ def _mock_rss() -> SourceConnectorResult:
         items=[
             RawItem(
                 source="rss",
-                source_id="OpenAI Blog:1",
-                url="https://openai.com/blog/announcement",
+                source_id="OpenAI News:1",
+                url="https://openai.com/news/announcement",
                 title="OpenAI announces a new developer-tier API",
                 author="openai",
                 content="Better caching, lower latency, $X/mo pricing.",
                 published_at=now,
                 metadata={
-                    "feed": "OpenAI Blog",
+                    "feed": "OpenAI News",
                     "category": "tech/ai",
                     "tags": ["api", "pricing"],
                 },
             ),
             RawItem(
                 source="rss",
-                source_id="Anthropic News:2",
-                url="https://www.anthropic.com/news/claude-update",
+                source_id="HuggingFace Blog:2",
+                url="https://huggingface.co/blog/claude-update",
                 title="Anthropic ships Claude 5",
                 author="anthropic",
                 content="Long-context improvements, lower hallucination rate.",
                 published_at=now,
                 metadata={
-                    "feed": "Anthropic News",
+                    "feed": "HuggingFace Blog",
                     "category": "tech/ai",
                     "tags": ["llm"],
                 },
             ),
             RawItem(
                 source="rss",
-                source_id="财富中文网:3",
-                url="https://www.fortunechina.com/example",
+                source_id="FT 中文网:3",
+                url="https://www.ftchinese.com/example",
                 title="某科技公司 Q2 营收超预期",
-                author="fortunechina",
+                author="ftchinese",
                 content="净利润同比增长 25%。",
                 published_at=now,
                 metadata={
-                    "feed": "财富中文网",
+                    "feed": "FT 中文网",
                     "category": "finance/cn",
                     "tags": ["财报"],
                 },
