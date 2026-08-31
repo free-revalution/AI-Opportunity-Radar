@@ -27,7 +27,7 @@ Bot 职责:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
 from sqlalchemy import select
@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings, get_settings
 from app.models import DailyDigestDoc
 from app.services.feishu.content_client import FeishuContentError, FeishuDriveClient
+from app.services.redis_client import get_redis
 from app.utils import get_logger
 
 logger = get_logger(__name__)
@@ -53,6 +54,26 @@ SECTION_DAILY = "📁 每日报告"
 SECTION_HOME = "📌 首页"        # DEPRECATED — Phase 30, no longer in tree
 SECTION_TODAY = "📅 今日"       # DEPRECATED — Phase 30, no longer in tree
 SECTION_SOURCES = "📚 信息源"   # DEPRECATED — Phase 30, no longer in tree
+
+# Redis key prefix for the day-folder token cache. TTL = until next
+# midnight (UTC); 飞书云盘 folder token 当天不会变,跨天缓存失效。
+# Phase 33 PR-33-C: 详情 docx 按钮点击 hot path 缓存,避免每次
+# ensure_folder_path 走 2-4 次 list_children HTTP roundtrip。
+DAY_FOLDER_CACHE_PREFIX = "radar:drive:day_folder:"
+
+
+def _seconds_until_midnight_utc(*, now: Optional[datetime] = None) -> int:
+    """返回 ``now`` 到下一个 UTC 00:00:00 的秒数。
+
+    用于 Redis TTL — 让 day_folder 缓存自动跨天失效。
+    """
+    now = now or datetime.now(tz=timezone.utc)
+    tomorrow = (now + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    delta = tomorrow - now
+    # 至少 60s — 防止极端边缘(now 本身就是 23:59:59.x)
+    return max(int(delta.total_seconds()), 60)
 
 
 @dataclass(slots=True)
@@ -217,6 +238,11 @@ class DriveOrgService:
         """返回 ``📁 每日报告/{YYYY-MM-DD}/`` 的 folder_token(不存在则建)。
 
         给 detail_docx.py 复用 — 详情 docx 必须落在当天目录下。
+
+        Phase 33 PR-33-C: Redis 缓存 day_folder token 到当天 23:59:59。
+        原本每次都走 ensure_folder_path(2-4 次 list_children + find_child),
+        即 folder 已存在也要重走。命中 cache 后只 1 次 Redis GET,
+        /run 按钮点击首响延迟 ~600ms-1s → ~50ms。
         """
         if not self.drive.is_configured:
             raise FeishuContentError(
@@ -224,12 +250,46 @@ class DriveOrgService:
                 "(set FEISHU_DRIVE_ROOT_FOLDER_TOKEN)"
             )
         day_str = day.strftime("%Y-%m-%d")
+        cache_key = f"{DAY_FOLDER_CACHE_PREFIX}{day_str}"
+
+        # 1) Redis GET — 命中直接返回(fail-open:Redis 不可用时 None)
+        redis = await get_redis()
+        if redis is not None:
+            try:
+                cached = await redis.get(cache_key)
+                if cached:
+                    logger.debug(
+                        "drive_day_folder_cache_hit", day=day_str
+                    )
+                    return str(cached)
+            except Exception as exc:  # noqa: BLE001 — fail-open
+                logger.warning(
+                    "drive_day_folder_cache_read_failed",
+                    day=day_str,
+                    error=str(exc)[:200],
+                )
+
+        # 2) miss / Redis down → 走原始 ensure_folder_path
         daily_root = await self.drive.ensure_folder_path(
             parent_token=self.drive.folder_token, path=[SECTION_DAILY]
         )
-        return await self.drive.ensure_folder_path(
+        folder_token = await self.drive.ensure_folder_path(
             parent_token=daily_root, path=[day_str]
         )
+
+        # 3) SET cache — TTL 到第二天 00:00 UTC(飞书 folder token 跨天会失效)
+        if redis is not None:
+            try:
+                ttl = _seconds_until_midnight_utc()
+                await redis.set(cache_key, folder_token, ex=ttl)
+            except Exception as exc:  # noqa: BLE001 — fail-open
+                logger.warning(
+                    "drive_day_folder_cache_write_failed",
+                    day=day_str,
+                    error=str(exc)[:200],
+                )
+
+        return folder_token
 
     # ------------------------------------------------------------------
     # Per-day digest writing

@@ -316,5 +316,126 @@ async def test_get_daily_doc_missing_returns_none(sqlite_session: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Phase 33 PR-33-C — Drive day folder Redis 缓存
+# ---------------------------------------------------------------------------
+class _FakeRedis:
+    """Minimal in-memory Redis 替身 — get/set/ping."""
+
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+        self.get_calls = 0
+        self.set_calls = 0
+
+    async def get(self, key: str) -> str | None:
+        self.get_calls += 1
+        return self.store.get(key)
+
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
+        self.set_calls += 1
+        self.store[key] = value
+
+    async def ping(self) -> bool:
+        return True
+
+
+@pytest.mark.asyncio
+async def test_day_folder_uses_redis_cache_on_second_call() -> None:
+    """PR-33-C 回归: 第二次 get_or_create_day_folder 应该命中 Redis,
+    不再调 ensure_folder_path。
+    """
+    from app.services import redis_client
+
+    fake = _FakeRedis()
+    redis_client.set_redis_for_tests(fake)
+
+    drive = FakeDriveClient()
+    # Pre-create folder 让 ensure_folder_path 能找到
+    service = DriveOrgService(drive=drive)
+
+    day = date(2026, 8, 31)
+    # 1st call — miss → ensure_folder_path → 写 cache
+    folder_walk_calls_1 = {"n": 0}
+    real_ensure = drive.ensure_folder_path
+
+    async def _counting_ensure(**kwargs: Any) -> str:
+        folder_walk_calls_1["n"] += 1
+        return await real_ensure(**kwargs)
+
+    with patch.object(drive, "ensure_folder_path", side_effect=_counting_ensure):
+        first = await service.get_or_create_day_folder(day=day)
+    assert folder_walk_calls_1["n"] >= 1
+    assert fake.set_calls == 1  # cache 写入
+
+    # 2nd call — 应该命中 cache,不调 ensure_folder_path
+    folder_walk_calls_2 = {"n": 0}
+
+    async def _counting_ensure_2(**kwargs: Any) -> str:
+        folder_walk_calls_2["n"] += 1
+        return await real_ensure(**kwargs)
+
+    with patch.object(drive, "ensure_folder_path", side_effect=_counting_ensure_2):
+        second = await service.get_or_create_day_folder(day=day)
+    assert first == second
+    assert folder_walk_calls_2["n"] == 0, (
+        f"2nd call made {folder_walk_calls_2['n']} ensure_folder_path — "
+        "PR-33-C 回归:Redis cache 没生效?"
+    )
+
+
+@pytest.mark.asyncio
+async def test_day_folder_falls_back_when_redis_down() -> None:
+    """PR-33-C 回归: Redis 不可用时 (None) 走原路径,功能不变。"""
+    from app.services import redis_client
+
+    redis_client.set_redis_for_tests(None)  # Redis 挂
+
+    drive = FakeDriveClient()
+    service = DriveOrgService(drive=drive)
+    day = date(2026, 8, 31)
+    folder_token = await service.get_or_create_day_folder(day=day)
+    # 仍能正确返回 token(不抛异常)
+    assert folder_token.startswith("fld_")
+
+
+@pytest.mark.asyncio
+async def test_day_folder_per_day_keys() -> None:
+    """PR-33-C 回归: 不同 day 用不同 cache key — 不会跨天拿到旧 token。"""
+    from app.services import redis_client
+
+    fake = _FakeRedis()
+    redis_client.set_redis_for_tests(fake)
+
+    drive = FakeDriveClient()
+    service = DriveOrgService(drive=drive)
+    d1 = date(2026, 8, 30)
+    d2 = date(2026, 8, 31)
+
+    t1 = await service.get_or_create_day_folder(day=d1)
+    t2 = await service.get_or_create_day_folder(day=d2)
+    # 不同 day 应有不同 cache key
+    cache_keys = list(fake.store.keys())
+    assert any("2026-08-30" in k for k in cache_keys)
+    assert any("2026-08-31" in k for k in cache_keys)
+    # 不同 day → 不同 folder token
+    assert t1 != t2
+
+
+@pytest.mark.asyncio
+async def test_seconds_until_midnight_utc_basic() -> None:
+    """PR-33-C 辅助函数: TTL 算到下个 UTC 00:00。"""
+    from app.services.feishu.drive_org import _seconds_until_midnight_utc
+
+    # 当天 12:00 → 12h 到午夜
+    from datetime import datetime, timezone
+    noon = datetime(2026, 8, 31, 12, 0, 0, tzinfo=timezone.utc)
+    assert _seconds_until_midnight_utc(now=noon) == 12 * 3600
+
+    # 当天 23:59:30 → 30s 到午夜,但最小 60s(防极端边缘)
+    late = datetime(2026, 8, 31, 23, 59, 30, tzinfo=timezone.utc)
+    secs = _seconds_until_midnight_utc(now=late)
+    assert secs == 60  # 30s 不到 → 兜底 60s
+
+
+# ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
