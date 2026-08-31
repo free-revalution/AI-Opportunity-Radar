@@ -253,6 +253,20 @@ async def handle_feishu_event(
         )
         return {}
 
+    # 2c. — Phase 30 PR-4b: card.action.trigger_v1 (button click).
+    # ``parse_event`` returns the raw body dict for this event type —
+    # delegate to :func:`handle_card_action_trigger` which knows how
+    # to pull action.value / operator / context.
+    event_type = str(
+        (body.get("header") or {}).get("event_type") or ""
+    )
+    if event_type == "card.action.trigger_v1":
+        return await _handle_card_action(
+            body=body,
+            settings=settings,
+            session=session,
+        )
+
     # 3. — Message event: route the command.
     event: FeishuEvent = parsed
     if not event.is_command:
@@ -408,6 +422,101 @@ async def handle_feishu_event(
         # because the router's Drive/Bitable siblings already use
         # the same httpx client during `route()` and the client
         # was being torn down before the explicit send_message here.
+        await app_client.aclose()
+
+    return {"code": 0, "msg": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Phase 30 PR-4b — card.action.trigger_v1 dispatch
+# ---------------------------------------------------------------------------
+async def _handle_card_action(
+    *,
+    body: dict[str, Any],
+    settings: Any,
+    session: Any,
+) -> dict[str, Any]:
+    """Click handler for interactive-card buttons.
+
+    Runs :func:`app.services.feishu.card_actions.handle_card_action_trigger`
+    which knows how to interpret ``action.value`` (e.g. the
+    ``write_detail_docx`` click on the /run Top-N card) and POSTs the
+    resulting chat card back to the originating chat.
+
+    Idempotency
+    -----------
+
+    Unlike ``im.message.receive_v1``, button clicks have a ``user_action``
+    context but no stable ``event_id`` worth dedup-ing in Redis. We rely
+    on :class:`DetailDocxService`'s per-opportunity SETNX cache to
+    suppress duplicate docx writes (24h window) — see
+    :func:`app.services.feishu.detail_docx.write_to_drive`.
+
+    Feishu retries the action event up to 3 times on timeouts; the
+    response window is generous (~30s) and DetailDocxService keeps the
+    call well under that for cached hits. Fresh writes cost ~2-3s on
+    Feishu's side.
+    """
+    from app.services.feishu.card_actions import (
+        handle_card_action_trigger,
+    )
+    from app.services.feishu.app_client import FeishuAppClient
+    from app.services.feishu.app_client import FeishuAppError
+
+    event_id = str((body.get("header") or {}).get("event_id") or "")
+    action_name, value = (None, None)  # for logging
+    try:
+        card_reply = await handle_card_action_trigger(
+            event_payload=body,
+            settings=settings,
+            session=session,
+        )
+    except Exception as exc:  # noqa: BLE001 — never bubble up to Feishu
+        logger.error(
+            "card_action_handler_crashed",
+            event_id=event_id,
+            error=str(exc)[:200],
+            exc_info=True,
+        )
+        return {"code": 0, "msg": "ok"}
+
+    # — Unrecognised action → ack-and-skip.
+    if card_reply is None:
+        return {"code": 0, "msg": "ok"}
+
+    # — Extract chat_id from the event context so we know where to reply.
+    from app.services.feishu.card_actions import extract_chat_id
+
+    chat_id = extract_chat_id(body)
+    if not chat_id:
+        logger.warning(
+            "card_action_no_chat_id",
+            event_id=event_id,
+        )
+        return {"code": 0, "msg": "ok"}
+
+    # — Send the card reply. We use a fresh AppClient (rather than the
+    # shared one created for message-event routes) because this branch
+    # doesn't go through the router.
+    app_client = FeishuAppClient(settings=settings)
+    try:
+        try:
+            await app_client.send_message(
+                receive_id=chat_id,
+                receive_id_type="chat_id",
+                msg_type="interactive",
+                content=card_reply,
+                session=session,
+                compliance_context="card_action:write_detail_docx",
+            )
+            await session.commit()
+        except FeishuAppError as exc:
+            logger.warning(
+                "card_action_reply_send_failed",
+                event_id=event_id,
+                error=str(exc)[:200],
+            )
+    finally:
         await app_client.aclose()
 
     return {"code": 0, "msg": "ok"}

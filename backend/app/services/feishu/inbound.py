@@ -197,6 +197,11 @@ def parse_event(
 
     header = body.get("header") or {}
     event_type = header.get("event_type") or ""
+    if event_type == "card.action.trigger_v1":
+        # — Phase 30 PR-4b: card button clicks (e.g. /run 的「生成报告」)
+        # have a different shape — return as-is so the handler in
+        # feishu_inbound.py can pull `event.action.value.action` directly.
+        return body
     if event_type != "im.message.receive_v1":
         # Not a message event — ack and move on.
         return None
