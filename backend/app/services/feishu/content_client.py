@@ -353,12 +353,18 @@ class FeishuDriveClient(_TokenMixin):
     ) -> str:
         """Create a new folder under ``parent_token`` (or the root).
 
-        ``POST /open-apis/drive/v1/files`` — body
-        ``{"folder_token": "<parent>", "name": "<name>", "type": "folder"}``.
+        ``POST /open-apis/drive/v1/files/create_folder`` — body
+        ``{"folder_token": "<parent>", "name": "<name>"}``.
 
-        Phase 27 — earlier versions put ``type=folder`` in the query
-        string (``?type=folder``). That path returns 404; Feishu
-        expects ``type`` as a body field.
+        Phase 29 fix — the previous code posted to
+        ``/drive/v1/files`` (no ``/create_folder`` suffix). That path
+        returns 404 "page not found" on every call because Feishu's
+        file-upload endpoint lives at the bare ``/files`` URL; folder
+        creation requires the explicit ``/create_folder`` action.
+        Symptom reported by the user: "既然 /run 是真实运行的,为什么
+        云盘中内容没有任何更新？" — even with ``write_docx=True`` the
+        per-day folder creation step 404'd and the docx never made it
+        into Drive.
 
         Returns the new folder's ``token``. The folder name is
         idempotent at the API level (Feishu will create a duplicate
@@ -377,22 +383,21 @@ class FeishuDriveClient(_TokenMixin):
         body = {
             "folder_token": parent,
             "name": name.strip()[:200],
-            "type": "folder",
         }
         response = await self._request(
             method="POST",
-            path="/drive/v1/files",
+            path="/drive/v1/files/create_folder",
             json_body=body,
         )
         if response.get("code") != 0:
             raise FeishuContentError(
-                f"drive/v1/files create_folder failed: "
+                f"drive/v1/files/create_folder failed: "
                 f"code={response.get('code')} msg={response.get('msg')}"
             )
         token = (response.get("data") or {}).get("token") or ""
         if not token:
             raise FeishuContentError(
-                f"drive/v1/files create_folder returned no token: {response!r}"
+                f"drive/v1/files/create_folder returned no token: {response!r}"
             )
         logger.info(
             "feishu_drive_folder_created",

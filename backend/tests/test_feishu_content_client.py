@@ -193,6 +193,74 @@ def test_drive_create_docx_raises_when_folder_token_unset() -> None:
         asyncio.run(drive.create_docx_from_markdown(title="T", markdown="# body"))
 
 
+# --- Phase 29 regression — folder creation endpoint ---
+@pytest.mark.asyncio
+async def test_drive_create_folder_posts_to_create_folder_endpoint() -> None:
+    """The previous code POSTed to ``/drive/v1/files`` (the file-upload
+    endpoint), which Feishu returns 404 for when the body has no file
+    content. The correct endpoint is
+    ``POST /drive/v1/files/create_folder``. Confirmed via live API
+    smoke test 2026-08-31 — bare ``/files`` → HTTP 404 page not
+    found; ``/files/create_folder`` → HTTP 200 with ``{data:{token,...}}``.
+
+    Symptom reported by the user: "既然 /run 是真实运行的,为什么
+    云盘中内容没有任何更新？" — the per-day folder walk 404'd and
+    the docx write never reached the import_tasks step.
+    """
+    s = _settings_with_app()
+    captured: list[httpx.Request] = []
+
+    class _Transport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            if request.url.path.endswith("/auth/v3/tenant_access_token/internal"):
+                return httpx.Response(
+                    200, json=_ok(tenant_access_token="tok-folder", expire=7200), request=request
+                )
+            if request.method == "POST" and request.url.path.endswith(
+                "/drive/v1/files/create_folder"
+            ):
+                body = json.loads(request.content)
+                # — Body must NOT carry the stale ``type: "folder"``
+                # field (Feishu rejected it during the Phase 27 fix);
+                # only ``folder_token`` + ``name`` are required.
+                assert body == {"folder_token": "ROOT_TOK", "name": "每日报告"}
+                return httpx.Response(
+                    200,
+                    json=_ok(data={"token": "NEW_FOLDER_TOK", "url": "https://x.feishu.cn/drive/folder/NEW_FOLDER_TOK"}),
+                    request=request,
+                )
+            return httpx.Response(404, json=_ok(999), request=request)
+
+    app_client, drive, _ = _make_clients(_Transport(), folder_token="ROOT_TOK")
+    try:
+        token = await drive.create_folder(name="每日报告")
+        assert token == "NEW_FOLDER_TOK"
+        # — Exactly one POST to the /create_folder endpoint.
+        folder_calls = [
+            r for r in captured
+            if r.method == "POST"
+            and r.url.path.endswith("/drive/v1/files/create_folder")
+        ]
+        assert len(folder_calls) == 1, (
+            f"expected 1 POST to /drive/v1/files/create_folder, got "
+            f"{[r.method + ' ' + r.url.path for r in folder_calls]}"
+        )
+        # — And ZERO POSTs to the bare /drive/v1/files endpoint (the
+        # 404-returning one).
+        bare_calls = [
+            r for r in captured
+            if r.method == "POST"
+            and r.url.path.endswith("/drive/v1/files")
+        ]
+        assert not bare_calls, (
+            f"bare /drive/v1/files must NOT be called — it returns 404. "
+            f"Got {[r.method + ' ' + r.url.path for r in bare_calls]}"
+        )
+    finally:
+        await app_client.aclose()
+
+
 def test_drive_create_docx_uses_root_folder_token_from_settings() -> None:
     """The settings attr is reflected on the request body."""
     s = _settings_with_app()
