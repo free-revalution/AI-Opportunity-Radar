@@ -163,3 +163,51 @@ async def test_source_upsert(sqlite_session):
     )
     assert again.id == src.id
     assert again.enabled is False
+
+
+async def test_source_upsert_idempotent_for_names_with_spaces(sqlite_session):
+    """Phase 28 regression — names like ``"Hacker News"`` contain a space
+    so the old ``Source.url.contains(slug)`` lookup never matched and
+    every pipeline run appended a new row. The fix queries by
+    ``Source.name.ilike(slug)`` so the second upsert returns the same
+    row instead of creating a duplicate.
+    """
+    repo = SourceRepository(sqlite_session)
+    first = await repo.upsert(
+        name="Hacker News", type="api",
+        url="https://example.com/hackernews", enabled=True,
+    )
+    second = await repo.upsert(
+        name="Hacker News", type="api",
+        url="https://example.com/hackernews", enabled=False,
+    )
+    assert second.id == first.id
+    assert second.enabled is False
+
+
+async def test_source_get_by_slug_uses_name_not_url(sqlite_session):
+    """Direct check on :meth:`SourceRepository.get_by_slug`.
+
+    The bug fix changed the lookup from ``Source.url.contains(slug)``
+    to ``Source.name.ilike(slug)``. We seed one row with name
+    ``"Product Hunt"`` and url ``"https://example.com/producthunt"``
+    and verify ``get_by_slug`` finds it by name, not by URL.
+    """
+    repo = SourceRepository(sqlite_session)
+    seeded = await repo.upsert(
+        name="Product Hunt", type="api",
+        url="https://example.com/producthunt", enabled=True,
+    )
+    found = await repo.get_by_slug("product hunt")
+    assert found is not None
+    assert found.id == seeded.id
+    # — negative case: looking up by URL substring must NOT pick up
+    # unrelated rows whose URL contains the same substring.
+    other = await repo.upsert(
+        name="Wikipedia", type="rss",
+        url="https://example.com/producthunt-alt", enabled=True,
+    )
+    again = await repo.get_by_slug("product hunt")
+    assert again is not None
+    assert again.id == seeded.id  # — name match wins, not URL match
+    assert again.id != other.id

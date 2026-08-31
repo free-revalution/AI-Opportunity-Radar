@@ -15,7 +15,20 @@ class SourceRepository:
         self.session = session
 
     async def get_by_slug(self, slug: str) -> Optional[Source]:
-        result = await self.session.execute(select(Source).where(Source.url.contains(slug)))
+        """Look up a Source row by its (case-insensitive) name.
+
+        Phase 28 fix — the previous implementation searched
+        ``Source.url.contains(slug)`` which only worked for sources
+        whose name equals the URL slug (``"GitHub"`` / ``"Reddit"``).
+        Names with spaces (``"Hacker News"`` / ``"Product Hunt"`` /
+        ``"Generic RSS"``) never matched, so :meth:`upsert` always
+        created a brand-new row on every :func:`pipeline` call — the
+        ``sources`` table ballooned from 12 to 26 rows after a few
+        runs, breaking the ``/sources`` bot reply (26 / 0 healthy).
+        """
+        result = await self.session.execute(
+            select(Source).where(Source.name.ilike(slug))
+        )
         return result.scalar_one_or_none()
 
     async def get_by_id(self, source_id: int) -> Optional[Source]:

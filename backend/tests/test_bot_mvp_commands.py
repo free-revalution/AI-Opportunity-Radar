@@ -324,7 +324,11 @@ async def test_router_sources_lists_enabled_sources():
         if request.url.path == "/api/internal/sources/healthy":
             return _ok_json(
                 {
-                    "count": 5,
+                    # — Phase 28 fix: real /api/internal/sources/healthy
+                    # returns "total" (set by `_source_health_snapshot`).
+                    # The fixture used to read "count" which made the
+                    # bot show "0 / N healthy".
+                    "total": 5,
                     "healthy": 4,
                     "items": [
                         {

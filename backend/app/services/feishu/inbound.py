@@ -933,7 +933,9 @@ class FeishuCommandRouter:
             lines.append(f"{mark} {it.get('name')} ({it.get('type')}) — {last}")
         lines.append("")
         lines.append(
-            f"状态: {result.get('healthy', 0)} / {result.get('count', 0)} healthy"
+            # — Phase 28 fix: the snapshot returns "total" (not "count");
+            # the old key read back 0 and rendered "26 / 0 healthy".
+            f"状态: {result.get('healthy', 0)} / {result.get('total', 0)} healthy"
         )
         return CommandReply(
             text="\n".join(lines),
