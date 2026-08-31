@@ -1258,6 +1258,10 @@ async def _write_data_table(
 
     选择窗口: ``fetched_at >= run.started_at``。
     容错: 任何异常由 caller ``run_pipeline`` catch 后只记录,不阻塞 run。
+
+    Phase 31 fix: ORM ``RawItem`` 没有 ``.source`` 属性(dataclass 才有)。
+    改走 ``DataTableClient.bulk_insert_orm_raw_items``,内部自动 JOIN
+    ``Source.name`` 拼主键。
     """
     from sqlalchemy import select as _sa_select
 
@@ -1268,21 +1272,23 @@ async def _write_data_table(
     run = await session.get(_Run, run_id)
     started_at = run.started_at if run else None
     if started_at is None:
-        return {"inserted": 0, "skipped_duplicate": 0, "error": "run has no started_at"}
+        return {
+            "inserted": 0,
+            "skipped_duplicate": 0,
+            "skipped_orphan": 0,
+            "error": "run has no started_at",
+        }
 
     stmt = _sa_select(RawItem).where(RawItem.fetched_at >= started_at)
     raw_items = list((await session.execute(stmt)).scalars().all())
     if not raw_items:
-        return {"inserted": 0, "skipped_duplicate": 0}
+        return {"inserted": 0, "skipped_duplicate": 0, "skipped_orphan": 0}
 
     app_client = FeishuAppClient(settings=settings)
-    try:
-        client = DataTableClient(app_client=app_client, settings=settings)
-        result = await client.bulk_insert_raw_items(items=raw_items, run_id=run_id)
-        return dict(result)
-    finally:
-        # FeishuAppClient 不一定暴露 close;保持构造即用、用完 GC。
-        pass
+    client = DataTableClient(app_client=app_client, settings=settings)
+    return await client.bulk_insert_orm_raw_items(
+        items=raw_items, run_id=run_id, session=session
+    )
 
 
 async def _backfill_data_table_screening(
