@@ -382,6 +382,14 @@ async def run_pipeline(
             new_count=new_count,
             signal_count=signal_count,
         )
+        # Phase 29 fix — finish_success() flushes row updates, but
+        # without an explicit commit() the AsyncSession rolls back on
+        # close and the runs table never reflects the result. Symptom:
+        # every /run returned 200 + status:"success" yet
+        # ``SELECT status, finished_at FROM runs`` still showed
+        # 'running' / NULL, which made the bot's ``/status`` reply
+        # report "Last Run: 运行中" forever.
+        await session.commit()
         return {
             "run_id": run.id,
             "status": "success",
@@ -399,6 +407,10 @@ async def run_pipeline(
         }
     except Exception as exc:  # noqa: BLE001 — record and re-raise
         await runs.finish_failed(run, error=str(exc))
+        # Same commit fix as the success branch — without it
+        # finish_failed writes are rolled back and the row stays
+        # "running" indefinitely.
+        await session.commit()
         raise
 
 

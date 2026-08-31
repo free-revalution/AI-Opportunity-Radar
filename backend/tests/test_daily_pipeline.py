@@ -255,3 +255,99 @@ async def test_pipeline_run_with_write_docx_only_does_not_crash(client, monkeypa
     # configured" branch). It may carry an error if DriveOrgService path
     # fails (depends on fixture), but the block must execute.
     assert body["docx"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Phase 29 regression — /api/internal/pipeline/run used to call
+# ``runs.finish_success(...)`` (and ``finish_failed(...)`` in the except
+# branch) but never ``await session.commit()``. Each request gets a
+# fresh AsyncSession via the ``get_session`` dependency; once the request
+# ends, the ``async with`` block in the dependency tears down the session
+# and rolls back any uncommitted writes. Symptom: every /run returned 200
+# with ``status: "success"`` yet ``SELECT status, finished_at FROM runs``
+# still showed ``running`` / NULL — the bot's ``/status`` reply therefore
+# rendered "Last Run: 运行中" forever. Both tests below pin the
+# before-and-after behaviour.
+# ---------------------------------------------------------------------------
+async def test_pipeline_run_persists_run_row_status_to_db(client, monkeypatch):
+    """A successful /run must produce a Run row whose ``status='success'``
+    and ``finished_at`` are committed (visible to a follow-up /status
+    read). The before-fix code flushed but never committed, so a
+    separate-session SELECT still saw ``status='running'``.
+    """
+    from dataclasses import dataclass, field
+
+    from app.services.research import ResearchService
+
+    @dataclass
+    class _R:
+        raw_count: int = 0
+        new_count: int = 0
+        signal_count: int = 0
+        errors: list = field(default_factory=list)
+
+        def as_dict(self):
+            return {
+                "raw_count": self.raw_count,
+                "new_count": self.new_count,
+                "signal_count": self.signal_count,
+                "errors": self.errors,
+            }
+
+    async def _fake_research(self):
+        return _R()
+
+    monkeypatch.setattr(ResearchService, "run_once", _fake_research)
+
+    response = client.post(
+        "/api/internal/pipeline/run",
+        json={"send_digest": False, "write_docx": False},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["finished_at"] is not None
+
+    # Independent read via /api/internal/status (which builds its own
+    # session from the same engine) must see the committed row.
+    status_resp = client.get("/api/internal/status")
+    assert status_resp.status_code == 200
+    last = status_resp.json()["last_run"]
+    assert last is not None
+    assert last["status"] == "success", (
+        "PipelineRun row was not committed — /status still sees "
+        "status='running'. Did the commit() in run_pipeline get "
+        "removed?"
+    )
+    assert last["finished_at"] is not None
+    assert last["raw_count"] is not None  # the count columns live too
+
+
+async def test_pipeline_run_failed_branch_commits_run_row(client, monkeypatch):
+    """The except branch must also commit — otherwise the Run row
+    stays at status='running' after a real failure and ``/status``
+    can't tell the user anything went wrong."""
+    from app.services.research import ResearchService
+
+    async def _boom(self):
+        raise RuntimeError("simulated research outage")
+
+    monkeypatch.setattr(ResearchService, "run_once", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated research outage"):
+        client.post(
+            "/api/internal/pipeline/run",
+            json={"send_digest": False},
+        )
+
+    # Independent read — same path the bot uses for /status.
+    status_resp = client.get("/api/internal/status")
+    assert status_resp.status_code == 200
+    last = status_resp.json()["last_run"]
+    assert last is not None
+    assert last["status"] == "failed", (
+        "Failure branch never committed — /status still sees "
+        "status='running' even though /run raised."
+    )
+    assert last["error"] is not None
+    assert "simulated research outage" in last["error"]

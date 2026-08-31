@@ -267,6 +267,14 @@ class IngestionService:
             url=f"https://example.com/{source_slug}",
             enabled=True,
         )
+        # Phase 29 fix — without this, ``sources.last_success_at``
+        # stayed NULL forever and the bot's ``/sources`` reply rendered
+        # "尚未采集" for every source after a successful /run. The
+        # /sources/healthy endpoint reads this column to render the
+        # "last collected at" timestamp.
+        from datetime import datetime, timezone
+
+        source_row.last_success_at = datetime.now(timezone.utc)
         await self.session.flush()
 
         inserted = 0
