@@ -288,15 +288,52 @@ async def run_pipeline(
             "research", research.run_once
         )
 
+        # Pre-compute per-stage counts BEFORE writing any docx so the
+        # docx block can reference raw_count / signal_count without a
+        # NameError. (Phase 28 fix: stage counts used to live below the
+        # docx block, leaving write_docx=True to crash with
+        # "name 'raw_count' is not defined".)
+        def _count(report: Any, *keys: str) -> int:
+            data = report.as_dict() if hasattr(report, "as_dict") else {}
+            for key in keys:
+                if key in data and data[key] is not None:
+                    try:
+                        return int(data[key])
+                    except (TypeError, ValueError):
+                        pass
+            return 0
+
+        raw_count = _count(d_report, "items_seen", "raw_count", "sources_attempted")
+        new_count = (
+            _count(c_report, "opportunities_created", "clusters_formed", "new_count")
+            + _count(s_report, "opportunities_scored", "new_count")
+        )
+        signal_count = (
+            _count(sc_report, "signals_created", "signal_count")
+            + _count(r_report, "reports_persisted", "signal_count")
+        )
+
         # 6. digest (+ optional Docx write — Phase 25 v2.1)
         digest_sent = False
         docx_ref: Optional[dict[str, Any]] = None
-        if body.send_digest:
+        digest_preview: str = ""
+        if body.send_digest or body.write_docx:
             from app.config import get_settings
 
-            service = NotificationService(session, settings=get_settings())
-            outcome = await service.send_digest()
-            digest_sent = bool(outcome.get("delivered"))
+            settings = get_settings()
+            service = NotificationService(session, settings=settings)
+            # — Always build the digest preview text once so both the
+            # `send_digest` branch and the `write_docx` branch can read
+            # it. Phase 28 fix: previous code called `.get()` on the
+            # DigestSendSummary dataclass — that raised AttributeError
+            # and the whole run 500'd. Also previous code only fetched
+            # preview when send_digest=True, leaving write_docx=True
+            # (with send_digest=False) writing an empty docx.
+            preview_obj = await service.build_digest_preview()
+            digest_preview = preview_obj.get("text", "") or ""
+            if body.send_digest:
+                outcome = await service.send_digest()
+                digest_sent = outcome.notifications_delivered > 0
 
         # 7. docx — Phase 25 v2.1: write 每日报告 Docx (Feishu 4 段结构)
         if body.write_docx:
@@ -315,9 +352,7 @@ async def run_pipeline(
                 try:
                     ref = await docx_service.write_daily_digest(
                         day=DateType.today(),
-                        markdown=outcome.get("preview", "")
-                        if isinstance(outcome, dict)
-                        else "",
+                        markdown=digest_preview,
                         run_id=run.id,
                         raw_count=raw_count,
                         signal_count=signal_count,
@@ -340,28 +375,6 @@ async def run_pipeline(
                 docx_ref = {
                     "error": "FEISHU_DRIVE_ROOT_FOLDER_TOKEN not configured"
                 }
-
-        # Extract per-stage counts from each report's ``as_dict()``
-        # (different services use different field names).
-        def _count(report: Any, *keys: str) -> int:
-            data = report.as_dict() if hasattr(report, "as_dict") else {}
-            for key in keys:
-                if key in data and data[key] is not None:
-                    try:
-                        return int(data[key])
-                    except (TypeError, ValueError):
-                        pass
-            return 0
-
-        raw_count = _count(d_report, "items_seen", "raw_count", "sources_attempted")
-        new_count = (
-            _count(c_report, "opportunities_created", "clusters_formed", "new_count")
-            + _count(s_report, "opportunities_scored", "new_count")
-        )
-        signal_count = (
-            _count(sc_report, "signals_created", "signal_count")
-            + _count(r_report, "reports_persisted", "signal_count")
-        )
 
         await runs.finish_success(
             run,
