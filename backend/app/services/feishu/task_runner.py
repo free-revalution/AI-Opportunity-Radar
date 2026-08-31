@@ -560,7 +560,21 @@ async def _execute_pipeline(*, record: TaskRecord, settings: Settings) -> None:
         headers["X-Radar-Webhook"] = webhook_secret
 
     pipeline_url = f"{base_url}/api/internal/pipeline/run"
-    payload = {"send_digest": True}
+    # Phase 29 fix — bot-initiated /run MUST write the daily docx to
+    # Feishu Drive. The previous payload only carried ``send_digest``,
+    # so the docx branch in ``internal.run_pipeline`` was SKIPPED and
+    # the user's 云盘 / 每日报告 stayed empty even when the pipeline
+    # itself ran cleanly (raw_count=200+, signal_count=27+). This was
+    # the root cause of "为什么云盘中内容没有任何更新？" — the bot's
+    # /run had no path to Drive.
+    payload = {"send_digest": True, "write_docx": True}
+    logger.info(
+        "feishu_async_run_pipeline_request",
+        task_id=record.task_id,
+        pipeline_url=pipeline_url,
+        write_docx=True,
+        send_digest=True,
+    )
 
     summary: dict[str, Any] = {}
     error_text: Optional[str] = None
@@ -597,6 +611,24 @@ async def _execute_pipeline(*, record: TaskRecord, settings: Settings) -> None:
             error=str(exc),
             exc_info=True,
         )
+
+    # Phase 29 fix — surface what the pipeline actually returned so
+    # future "why no /run reply / why no docx" investigations have a
+    # direct log to grep. Before this, the only signal was the eventual
+    # ``feishu_app_message_sent`` line, which was absent if the post-back
+    # failed silently.
+    logger.info(
+        "feishu_async_run_pipeline_response",
+        task_id=record.task_id,
+        http_status=getattr(response, "status_code", None),
+        run_id=summary.get("run_id"),
+        raw_count=summary.get("raw_count"),
+        new_count=summary.get("new_count"),
+        signal_count=summary.get("signal_count"),
+        digest_sent=summary.get("digest_sent"),
+        docx=summary.get("docx"),
+        error=summary.get("error") or error_text,
+    )
 
     record.finished_at = _now()
     if error_text is None:

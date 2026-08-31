@@ -84,7 +84,16 @@ services:
       - ./n8n/workflows:/n8n/workflows:ro
     ports:
       - "8000:8000"
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    # Phase 29 fix — `--reload` was the root cause of "bot's /run
+    # submitted but post-back never fired". ``asyncio.create_task`` lives
+    # in the uvicorn worker process; a worker restart (any .py file
+    # change in ./backend, *including* pytest runs that touch
+    # tests/*.py) terminates the in-flight ``_execute_pipeline`` task
+    # mid-run, leaving the user with a "submitted" reply but no
+    # follow-up card. Use `docker compose restart backend` to apply
+    # code changes instead — the trade-off is a few seconds of downtime
+    # for guaranteed /run completion.
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     healthcheck:
       test: ["CMD", "python", "-c", "import httpx,sys; sys.exit(0 if httpx.get('http://localhost:8000/api/health').status_code==200 else 1)"]
       interval: 15s

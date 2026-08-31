@@ -97,6 +97,19 @@ class Settings(BaseSettings):
     browser_use_api_key: str = ""
     browser_use_api_url: str = "https://api.browser-use.com"
 
+    # ---------- Phase 29 — Source-connector auth ----------
+    # GitHub's unauthenticated Search API caps at 10 req/min/IP and
+    # returns 401 once per-hour rate-limit windows close. A PAT lowers
+    # that to 30 req/min and unblocks the trending-repos query.
+    github_token: str = ""
+    # Reddit's public `.json` endpoint is gated behind OAuth since
+    # 2023-06 — without `client_id` + `client_secret` every subreddit
+    # returns 403 "Blocked". Setting both env vars enables OAuth2
+    # client-credentials flow in the Reddit connector.
+    reddit_client_id: str = ""
+    reddit_client_secret: str = ""
+    reddit_user_agent: str = "ai-opportunity-radar/0.1 (by operator)"
+
     # ---------- Deep Research ----------
     deep_research_max_urls: int = 20
     deep_research_max_depth: int = 3

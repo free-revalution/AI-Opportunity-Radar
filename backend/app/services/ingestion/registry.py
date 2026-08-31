@@ -140,12 +140,21 @@ def build_connector(slug: str, settings: Settings, *, mock: bool | None = None) 
     force_mock = mock if mock is not None else settings.mock_external_services
 
     if slug == "github":
+        # Phase 29 — use a dedicated `github_token` from .env, NOT
+        # the LLM provider key. The previous code passed
+        # `MiniMax_api_key` as a token, which sent a useless string
+        # to GitHub and triggered 401 Unauthorized for every request.
         return GitHubTrendingConnector(
-            token=settings.MiniMax_api_key or None,  # any non-empty token lowers rate limit
+            token=settings.github_token or None,
             mock=force_mock,
         )
     if slug == "reddit":
-        return RedditConnector(mock=force_mock)
+        return RedditConnector(
+            client_id=settings.reddit_client_id or None,
+            client_secret=settings.reddit_client_secret or None,
+            user_agent=settings.reddit_user_agent,
+            mock=force_mock,
+        )
     if slug == "hackernews":
         return HackerNewsConnector(mock=force_mock)
     if slug == "producthunt":

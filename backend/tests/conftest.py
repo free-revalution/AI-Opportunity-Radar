@@ -26,6 +26,12 @@ os.environ["RADAR_WEBHOOK_SECRET"] = ""
 os.environ["MOCK_EXTERNAL_SERVICES"] = "true"
 os.environ["TELEGRAM_BOT_TOKEN"] = ""
 os.environ["TELEGRAM_CHAT_ID"] = ""
+# Phase 29 fix — set dummy Feishu credentials so FeishuAppClient
+# construction in the bot async-runner path doesn't raise
+# ``feishu app not configured`` during tests. The transport is mocked,
+# so the credentials are never actually used to hit the real API.
+os.environ.setdefault("FEISHU_APP_ID", "cli_test_app_id")
+os.environ.setdefault("FEISHU_APP_SECRET", "test-app-secret-not-real")
 
 from app.config import get_settings  # noqa: E402
 from app.db import get_session  # noqa: E402

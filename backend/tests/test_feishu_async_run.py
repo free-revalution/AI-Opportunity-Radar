@@ -172,6 +172,32 @@ async def test_background_task_calls_pipeline_and_replies(monkey_httpx) -> None:
 
 
 @pytest.mark.asyncio
+async def test_bot_run_payload_includes_write_docx_true(monkey_httpx) -> None:
+    """Phase 29 regression — the bot's `/run` MUST send
+    ``{"send_digest": True, "write_docx": True}`` so the daily Docx
+    lands in the user's 飞书云盘 / 每日报告 /.
+
+    Before this fix the payload was ``{"send_digest": True}`` only —
+    the docx branch in ``internal.run_pipeline`` was skipped, so even
+    a perfectly-successful pipeline left the cloud drive empty.
+    Symptom reported by the user: "既然 /run 是真实运行的,为什么
+    云盘中内容没有任何更新？" — because /run had no path to Drive.
+    """
+    rec = await submit_pipeline_run(
+        chat_id="oc_docx", sender_open_id="ou_docx", settings=_settings()
+    )
+    assert rec._asyncio_task is not None
+    await rec._asyncio_task
+    assert len(monkey_httpx.pipeline_calls) == 1
+    body = json.loads(monkey_httpx.pipeline_calls[0].content.decode("utf-8"))
+    assert body.get("send_digest") is True
+    assert body.get("write_docx") is True, (
+        "bot /run payload must set write_docx=True so the daily docx "
+        "is written to the user's Feishu cloud drive"
+    )
+
+
+@pytest.mark.asyncio
 async def test_failure_path_records_failed_and_replies(monkeypatch) -> None:
     """Pipeline returns 5xx → record.status='failed' + warning card."""
 

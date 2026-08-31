@@ -184,6 +184,126 @@ async def test_reddit_live_parses_payload():
         assert result.items[0].title == "Test post"
 
 
+# --- Phase 29 — Reddit OAuth + GitHub token regression ---
+async def test_reddit_oauth_acquires_bearer_and_uses_it():
+    """When ``client_id`` + ``client_secret`` are configured, the
+    connector must exchange them for a bearer token at
+    ``/api/v1/access_token`` and send ``Authorization: Bearer …`` on
+    every subreddit request. Before this fix, Reddit returned 403
+    "Blocked" for every sub because we sent no auth."""
+    payload = {
+        "data": {
+            "children": [
+                {
+                    "data": {
+                        "id": "abc",
+                        "title": "OAuth post",
+                        "permalink": "/r/SaaS/comments/abc/oauth",
+                        "subreddit": "SaaS",
+                        "score": 10,
+                        "created_utc": 1_700_000_000.0,
+                    }
+                }
+            ]
+        }
+    }
+    with respx.mock() as mock:
+        token_route = mock.post("https://www.reddit.com/api/v1/access_token").mock(
+            return_value=Response(
+                200,
+                json={"access_token": "bearer-xyz", "expires_in": 3600},
+            )
+        )
+        # One subreddit only — the others return empty 200s.
+        mock.get("https://www.reddit.com/r/SaaS/hot.json").mock(
+            return_value=Response(200, json=payload)
+        )
+        for sub in ("LocalLLaMA", "Entrepreneur", "SideProject", "indiehackers", "startups", "artificial"):
+            mock.get(f"https://www.reddit.com/r/{sub}/hot.json").mock(
+                return_value=Response(200, json={"data": {"children": []}})
+            )
+
+        connector = RedditConnector(
+            client_id="id-1",
+            client_secret="sec-1",
+            mock=False,
+        )
+        result = await connector.fetch()
+
+    assert token_route.called, "expected OAuth token-exchange POST"
+    assert result.errors == []
+    assert len(result.items) == 1
+    assert result.items[0].title == "OAuth post"
+    # The token must be cached so a second fetch() doesn't re-exchange.
+    # We use `assert_all_called=False` so respx doesn't flag the unused
+    # token route — the whole point of this assertion is that it stays
+    # unused.
+    with respx.mock(assert_all_called=False) as mock2:
+        token_route2 = mock2.post(
+            "https://www.reddit.com/api/v1/access_token"
+        ).mock(side_effect=AssertionError("token must be cached, not re-fetched"))
+        mock2.get("https://www.reddit.com/r/SaaS/hot.json").mock(
+            return_value=Response(200, json=payload)
+        )
+        for sub in ("LocalLLaMA", "Entrepreneur", "SideProject", "indiehackers", "startups", "artificial"):
+            mock2.get(f"https://www.reddit.com/r/{sub}/hot.json").mock(
+                return_value=Response(200, json={"data": {"children": []}})
+            )
+        result2 = await connector.fetch()
+    assert result2.errors == []
+    assert len(result2.items) == 1
+    assert not token_route2.called, (
+        "cached OAuth token should have been reused; "
+        "second fetch must NOT re-exchange"
+    )
+
+
+async def test_reddit_oauth_token_failure_falls_back_to_no_auth():
+    """If the OAuth exchange returns 401, the connector must log and
+    continue with the public headers — surfacing 403s as 'errors' so
+    the operator knows to fix the creds."""
+    with respx.mock() as mock:
+        mock.post("https://www.reddit.com/api/v1/access_token").mock(
+            return_value=Response(401, text="bad client")
+        )
+        for sub in ("SaaS", "LocalLLaMA", "Entrepreneur", "SideProject", "indiehackers", "startups", "artificial"):
+            mock.get(f"https://www.reddit.com/r/{sub}/hot.json").mock(
+                return_value=Response(403, text="Blocked")
+            )
+        connector = RedditConnector(
+            client_id="bad-id",
+            client_secret="bad-sec",
+            mock=False,
+        )
+        result = await connector.fetch()
+
+    assert result.items == []
+    # All 7 subs record a 403 error.
+    assert len(result.errors) == 7
+    assert all("403" in e for e in result.errors)
+
+
+async def test_github_with_token_sends_bearer_header():
+    """When ``token`` is configured the connector must send
+    ``Authorization: Bearer …`` — Phase 29 fix for 401 Unauthorized
+    on real-mode /run (was passing ``MiniMax_api_key`` as the token,
+    which GitHub rejected)."""
+    payload = {"items": []}
+    with respx.mock(base_url="https://api.github.com") as mock:
+        route = mock.get("/search/repositories").mock(
+            return_value=Response(200, json=payload)
+        )
+        connector = GitHubTrendingConnector(token="ghp_real", mock=False)
+        result = await connector.fetch()
+
+    assert route.called
+    auth_header = route.calls.last.request.headers.get("Authorization")
+    assert auth_header == "Bearer ghp_real", (
+        f"GitHub connector must send Bearer token, got {auth_header!r}"
+    )
+    assert result.errors == []
+
+
 # ----------------- Product Hunt -----------------
 async def test_producthunt_mock_returns_items():
     result = await ProductHuntConnector(mock=True).fetch()
