@@ -82,9 +82,18 @@ def _ok(code: int = 0, **extra) -> dict[str, Any]:
 # Drive — Docx import
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_drive_create_docx_submits_import_and_polls() -> None:
-    """POST /drive/v1/import_tasks returns a ticket. Polling GET
-    completes the loop. The client returns `{doc_id, url}`."""
+async def test_drive_create_docx_via_docx_api() -> None:
+    """Phase 29 — ``create_docx_from_markdown`` now uses the Docx API:
+
+      1. ``POST /docx/v1/documents`` with ``{title, folder_token}``
+         → returns ``document_id``.
+      2. ``POST /docx/v1/documents/{id}/blocks/{id}/children`` with the
+         markdown split into Feishu blocks.
+
+    The previous flow used ``POST /drive/v1/import_tasks``, which
+    Feishu rejects with ``file_token is required`` for inline markdown
+    (confirmed live 2026-08-31).
+    """
     s = _settings_with_app()
     calls: list[tuple[str, str]] = []
 
@@ -92,86 +101,108 @@ async def test_drive_create_docx_submits_import_and_polls() -> None:
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
             calls.append((request.method, request.url.path))
             if request.url.path == "/open-apis/auth/v3/tenant_access_token/internal":
-                return httpx.Response(200, json=_ok(tenant_access_token="tok-1", expire=7200), request=request)
-            if request.method == "POST" and request.url.path.endswith("/drive/v1/import_tasks"):
-                body = json.loads(request.content)
-                assert body["file_name"].startswith("研究报告")
-                assert body["folder_token"] == "FOLDER123"
-                assert body["type"] == "docx"
-                # — Verify base64 content is well-formed.
-                decoded = base64.b64decode(body["file"]["content"]).decode("utf-8")
-                assert "执行摘要" in decoded or "Test" in decoded
-                return httpx.Response(200, json=_ok(data={"ticket": "TKT-1"}), request=request)
-            if request.method == "GET" and "/drive/v1/import_tasks/TKT-1" in request.url.path:
                 return httpx.Response(
                     200,
-                    json=_ok(data={"result": {"result": "success", "token": "DOC123", "url": "https://x.feishu.cn/docx/DOC123"}}),
+                    json=_ok(tenant_access_token="tok-1", expire=7200),
+                    request=request,
+                )
+            if request.method == "POST" and request.url.path.endswith(
+                "/docx/v1/documents"
+            ):
+                body = json.loads(request.content)
+                assert body["title"].startswith("研究报告")
+                assert body["folder_token"] == "FOLDER123"
+                return httpx.Response(
+                    200,
+                    json=_ok(
+                        data={
+                            "document": {
+                                "document_id": "DOC123",
+                                "revision_id": 1,
+                                "title": body["title"],
+                            }
+                        }
+                    ),
+                    request=request,
+                )
+            if request.method == "POST" and request.url.path.endswith(
+                "/docx/v1/documents/DOC123/blocks/DOC123/children"
+            ):
+                body = json.loads(request.content)
+                # — Body carries a list of blocks.
+                assert "children" in body
+                assert isinstance(body["children"], list)
+                assert len(body["children"]) >= 1
+                return httpx.Response(
+                    200,
+                    json=_ok(data={"children": body["children"]}),
                     request=request,
                 )
             return httpx.Response(404, json=_ok(999), request=request)
 
-    app_client, drive, _ = _make_clients(
-        _Transport(), folder_token="FOLDER123"
-    )
+    app_client, drive, _ = _make_clients(_Transport(), folder_token="FOLDER123")
     try:
         result = await drive.create_docx_from_markdown(
             title="研究报告 #1 · 测试",
-            markdown="# 测试\n\n执行摘要: 内容。",
+            markdown="# 测试\n\n- item 1\n- item 2\n\n执行摘要: 内容。",
         )
-        assert result == {"doc_id": "DOC123", "url": "https://x.feishu.cn/docx/DOC123"}
-        # — Calls: token-fetch (POST) + import_tasks (POST) + poll (GET)
+        assert result == {
+            "doc_id": "DOC123",
+            "url": "https://open.feishu.cn/docx/DOC123",
+        }
+        # — Calls: token-fetch (POST) + docx create (POST) + blocks append (POST)
         methods = [c[0] for c in calls]
-        assert methods.count("POST") == 2  # token + import_tasks
-        assert methods.count("GET") == 1   # poll
+        assert methods.count("POST") == 3
+        # — And ZERO calls to the legacy /drive/v1/import_tasks.
+        legacy = [
+            c for c in calls if "/drive/v1/import_tasks" in c[1]
+        ]
+        assert not legacy, (
+            f"create_docx_from_markdown must NOT call /drive/v1/import_tasks "
+            f"(400 file_token is required). Got {legacy}"
+        )
     finally:
         await app_client.aclose()
 
 
 @pytest.mark.asyncio
-async def test_drive_create_docx_polls_until_timeout_then_raises() -> None:
-    """Poll keeps coming back `pending` → FeishuContentError after the
-    configured timeout."""
+async def test_drive_create_docx_blocks_append_failure_surfaces() -> None:
+    """If the docx create succeeds but the blocks append fails, we
+    surface the error (don't silently return a doc with no content)."""
+    s = _settings_with_app()
 
     class _Transport(httpx.AsyncBaseTransport):
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
             if "/auth/v3/tenant_access_token" in request.url.path:
-                return httpx.Response(200, json=_ok(tenant_access_token="tok-1", expire=7200), request=request)
-            if request.method == "POST":
-                return httpx.Response(200, json=_ok(data={"ticket": "TKT"}), request=request)
-            return httpx.Response(200, json=_ok(data={"result": {"result": "pending"}}), request=request)
-
-    app_client, drive, _ = _make_clients(
-        _Transport(), poll_interval=0.01, poll_timeout=0.05, folder_token="F"
-    )
-    try:
-        with pytest.raises(FeishuContentError, match="timed out"):
-            await drive.create_docx_from_markdown(
-                title="T", markdown="# body"
-            )
-    finally:
-        await app_client.aclose()
-
-
-@pytest.mark.asyncio
-async def test_drive_create_docx_handles_failed_status() -> None:
-    """Feishu returns `result=failed` mid-poll → error."""
-
-    class _Transport(httpx.AsyncBaseTransport):
-        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-            if "/auth/v3/tenant_access_token" in request.url.path:
-                return httpx.Response(200, json=_ok(tenant_access_token="tok-1", expire=7200), request=request)
-            if request.method == "POST":
-                return httpx.Response(200, json=_ok(data={"ticket": "TKT"}), request=request)
-            return httpx.Response(
-                200,
-                json=_ok(data={"result": {"result": "failed", "msg": "import quota exceeded"}}),
-                request=request,
-            )
+                return httpx.Response(
+                    200,
+                    json=_ok(tenant_access_token="tok-1", expire=7200),
+                    request=request,
+                )
+            if request.method == "POST" and request.url.path.endswith(
+                "/docx/v1/documents"
+            ):
+                return httpx.Response(
+                    200,
+                    json=_ok(
+                        data={"document": {"document_id": "DOCX"}}
+                    ),
+                    request=request,
+                )
+            if request.method == "POST" and request.url.path.endswith(
+                "/blocks/DOCX/children"
+            ):
+                return httpx.Response(
+                    200,
+                    json=_ok(code=99992402, msg="block append rate-limited"),
+                    request=request,
+                )
+            return httpx.Response(404, json=_ok(999), request=request)
 
     app_client, drive, _ = _make_clients(_Transport(), folder_token="F")
     try:
-        with pytest.raises(FeishuContentError, match="quota exceeded"):
-            await drive.create_docx_from_markdown(title="T", markdown="# body")
+        with pytest.raises(FeishuContentError, match="blocks/children"):
+            await drive.create_docx_from_markdown(title="T", markdown="# hi")
     finally:
         await app_client.aclose()
 
@@ -576,16 +607,24 @@ async def test_token_mixin_refreshes_once_on_99991663() -> None:
                     json=_ok(tenant_access_token="tok-new", expire=7200),
                     request=request,
                 )
-            if request.method == "POST" and request.url.path.endswith("/drive/v1/import_tasks"):
+            if request.method == "POST" and request.url.path.endswith(
+                "/docx/v1/documents"
+            ):
                 # — First call: 99991663. Second call: success.
                 if auth == "Bearer tok-old":
-                    return httpx.Response(200, json=_ok(99991663, msg="token expired"), request=request)
-                return httpx.Response(200, json=_ok(data={"ticket": "T"}), request=request)
-            if "/drive/v1/import_tasks/T" in request.url.path:
+                    return httpx.Response(
+                        200, json=_ok(99991663, msg="token expired"), request=request
+                    )
                 return httpx.Response(
                     200,
-                    json=_ok(data={"result": {"result": "success", "token": "DOC", "url": "https://x/DOC"}}),
+                    json=_ok(data={"document": {"document_id": "DOC"}}),
                     request=request,
+                )
+            if request.method == "POST" and request.url.path.endswith(
+                "/docx/v1/documents/DOC/blocks/DOC/children"
+            ):
+                return httpx.Response(
+                    200, json=_ok(data={"children": []}), request=request
                 )
             return httpx.Response(404, json=_ok(999), request=request)
 

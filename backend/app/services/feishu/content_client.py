@@ -158,22 +158,171 @@ class _TokenMixin:
 
 
 # ---------------------------------------------------------------------------
+# Markdown → Feishu Docx blocks
+# ---------------------------------------------------------------------------
+# Minimal markdown-to-Feishu-blocks converter. We don't try to be
+# feature-complete — the goal is "the digest is readable in 飞书
+# Docx". Coverage:
+#   - ATX headings (#..######)        → block_type 3..8 (heading1..6)
+#   - fenced code blocks (``` ```)     → block_type 14 (code)
+#   - horizontal rules (--- / ***)     → block_type 6 (divider)
+#   - bulleted list items (- / *)      → block_type 12 (bullet)
+#   - numbered list items (1. / 2.)    → block_type 13 (ordered)
+#   - every other non-empty line       → block_type 2 (text)
+#   - blank lines collapse.
+_MAX_DOCX_BLOCKS = 500  # — Feishu's per-call block_append limit is 1000; we stay under.
+
+
+def _md_text_run(content: str) -> dict[str, Any]:
+    """A single text_run with no inline styling (Phase 29 — we
+    intentionally ignore bold / italic / code spans in the digest
+    markdown to keep the converter dependency-free)."""
+    return {"text_run": {"content": content[:2000]}}
+
+
+def _md_block_paragraph(content: str) -> dict[str, Any]:
+    return {
+        "block_type": 2,
+        "text": {"elements": [_md_text_run(content)]},
+    }
+
+
+def _md_block_heading(level: int, content: str) -> dict[str, Any]:
+    """ATX heading 1..6 → Feishu block_type 3..8."""
+    level = max(1, min(6, level))
+    field_name = f"heading{level}"
+    return {
+        "block_type": 2 + level,  # heading1 == 3, heading2 == 4, …
+        field_name: {"elements": [_md_text_run(content)]},
+    }
+
+
+def _md_block_bullet(content: str) -> dict[str, Any]:
+    return {
+        "block_type": 12,
+        "bullet": {"elements": [_md_text_run(content)]},
+    }
+
+
+def _md_block_ordered(content: str) -> dict[str, Any]:
+    return {
+        "block_type": 13,
+        "ordered": {"elements": [_md_text_run(content)]},
+    }
+
+
+def _md_block_code(content: str) -> dict[str, Any]:
+    return {
+        "block_type": 14,
+        "code": {
+            "elements": [_md_text_run(content)],
+            "style": {"language": 1},  # 1 = plain text
+        },
+    }
+
+
+def _md_block_divider() -> dict[str, Any]:
+    return {"block_type": 6, "divider": {}}
+
+
+def markdown_to_blocks(markdown: str) -> list[dict[str, Any]]:
+    """Convert ``markdown`` into a list of Feishu Docx block payloads.
+
+    Phase 29 helper — the legacy import_tasks flow accepted raw
+    markdown (it 404'd in practice; see the endpoint-note in
+    :meth:`FeishuDriveClient.create_docx_from_markdown`). The modern
+    Docx API only takes structured blocks, so we do the split here.
+    Output is capped at ``_MAX_DOCX_BLOCKS`` to stay under Feishu's
+    per-call limit.
+    """
+    blocks: list[dict[str, Any]] = []
+    lines = markdown.splitlines()
+    i = 0
+    n = len(lines)
+    while i < n and len(blocks) < _MAX_DOCX_BLOCKS:
+        raw = lines[i]
+        line = raw.rstrip()
+        stripped = line.strip()
+
+        # — Fenced code block.
+        if stripped.startswith("```"):
+            i += 1
+            buf: list[str] = []
+            while i < n and not lines[i].lstrip().startswith("```"):
+                buf.append(lines[i])
+                i += 1
+            if i < n:  # skip closing fence
+                i += 1
+            blocks.append(_md_block_code("\n".join(buf)))
+            continue
+
+        if not stripped:
+            i += 1
+            continue
+
+        # — ATX heading.
+        if stripped.startswith("#"):
+            hashes = 0
+            for ch in stripped:
+                if ch == "#":
+                    hashes += 1
+                else:
+                    break
+            if 1 <= hashes <= 6 and (len(stripped) > hashes and stripped[hashes] == " "):
+                content = stripped[hashes + 1 :].strip()
+                blocks.append(_md_block_heading(hashes, content))
+                i += 1
+                continue
+
+        # — Horizontal rule.
+        if stripped in ("---", "***", "___"):
+            blocks.append(_md_block_divider())
+            i += 1
+            continue
+
+        # — Unordered list.
+        if stripped[:2] in ("- ", "* "):
+            content = stripped[2:].strip()
+            blocks.append(_md_block_bullet(content))
+            i += 1
+            continue
+
+        # — Ordered list (1. 2. 10. — at least one digit).
+        if (
+            len(stripped) >= 3
+            and stripped[0].isdigit()
+            and stripped[: stripped.index(" ", 0) if " " in stripped else len(stripped)].endswith(".")
+        ):
+            cut = stripped.index(" ") if " " in stripped else len(stripped)
+            content = stripped[cut + 1 :].strip()
+            blocks.append(_md_block_ordered(content))
+            i += 1
+            continue
+
+        # — Fallback paragraph.
+        blocks.append(_md_block_paragraph(stripped))
+        i += 1
+
+    return blocks
+
+
+# ---------------------------------------------------------------------------
 # Drive — Docx import
 # ---------------------------------------------------------------------------
 class FeishuDriveClient(_TokenMixin):
-    """Async client for creating 飞书云文档 (Docx) via the import-task API.
+    """Async client for creating 飞书云文档 (Docx) via the Docx API.
 
-    The Feishu Drive import workflow is two-stage:
+    The supported flow (Phase 29) is:
 
-      1. `POST /drive/v1/import_tasks` with the markdown content
-         base64-encoded. Feishu returns a `ticket` synchronously.
-      2. Poll `GET /drive/v1/import_tasks/{ticket}` until
-         `result == "success"` (or `failed` / timeout).
+      1. ``POST /docx/v1/documents`` with ``{title, folder_token}``
+         → returns ``document_id``.
+      2. ``POST /docx/v1/documents/{document_id}/blocks/{document_id}/children``
+         with the markdown converted into heading / paragraph blocks.
 
-    Most imports complete in 1-3 seconds; the 60s default timeout is a
-    safety net for unusually large reports. Tests override
-    `_poll_interval_sec` and `_poll_timeout_sec` to keep the test
-    suite fast.
+    The legacy ``POST /drive/v1/import_tasks`` endpoint is for
+    re-importing an already-uploaded file; inline markdown is rejected
+    with ``file_token is required``. The Docx API is the supported way
+    to create a doc from scratch.
     """
 
     def __init__(
@@ -238,19 +387,31 @@ class FeishuDriveClient(_TokenMixin):
         markdown: str,
         folder_token: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Submit a markdown import and poll until done.
+        """Create a new Docx from ``markdown`` via the modern Docx API.
 
-        ``folder_token`` overrides the configured root for this
-        call (Phase 25 v2.1 — :class:`DriveOrgService` uses it to
-        write per-date Docx into ``每日报告/YYYY-MM-DD/`` instead
-        of the root folder). When omitted, falls back to
-        :attr:`folder_token` (the configured root).
+        Two-step flow:
+
+          1. ``POST /docx/v1/documents`` with ``{title, folder_token}``
+             → returns ``document_id``.
+          2. ``POST /docx/v1/documents/{document_id}/blocks/{document_id}/children``
+             with the markdown split into heading / paragraph blocks.
+
+        The legacy ``POST /drive/v1/import_tasks`` endpoint returns 400
+        ``file_token is required`` for inline markdown (it's for
+        re-importing an already-uploaded file). The Docx API is the
+        supported way to create a doc from scratch.
+
+        ``folder_token`` overrides the configured root for this call
+        (Phase 25 v2.1 — :class:`DriveOrgService` uses it to write
+        per-date Docx into ``每日报告/YYYY-MM-DD/`` instead of the
+        root folder). When omitted, falls back to
+        :attr:`folder_token`.
 
         Returns:
           `{"doc_id": "...", "url": "https://<tenant>.feishu.cn/docx/<id>"}`
 
         Raises:
-          FeishuContentError — on import failure, timeout, or
+          FeishuContentError — on create / append failure or
             configuration error.
         """
         if not self.is_configured:
@@ -270,77 +431,58 @@ class FeishuDriveClient(_TokenMixin):
                 "(set FEISHU_DRIVE_ROOT_FOLDER_TOKEN or pass folder_token)"
             )
 
-        encoded = base64.b64encode(markdown.encode("utf-8")).decode("ascii")
-        body = {
-            "file_name": title.strip()[:200],
-            "folder_token": target_folder,
-            "type": "docx",
-            "file": {"content": encoded, "mime_type": "text/markdown"},
-        }
-        submit = await self._request(
-            method="POST", path="/drive/v1/import_tasks", json_body=body
+        # 1. Create the document (returns document_id).
+        create_resp = await self._request(
+            method="POST",
+            path="/docx/v1/documents",
+            json_body={
+                "title": title.strip()[:200],
+                "folder_token": target_folder,
+            },
         )
-        if submit.get("code") != 0:
+        if create_resp.get("code") != 0:
             raise FeishuContentError(
-                f"drive/v1/import_tasks rejected: code={submit.get('code')} "
-                f"msg={submit.get('msg')}"
+                f"docx/v1/documents create failed: "
+                f"code={create_resp.get('code')} msg={create_resp.get('msg')}"
             )
-        ticket = ((submit.get("data") or {}).get("ticket") or "").strip()
-        if not ticket:
+        document = (create_resp.get("data") or {}).get("document") or {}
+        document_id = (document.get("document_id") or "").strip()
+        if not document_id:
             raise FeishuContentError(
-                "drive/v1/import_tasks returned no ticket"
+                f"docx/v1/documents returned no document_id: {create_resp!r}"
             )
 
-        # — Poll until the import is success / failed / timeout.
-        doc_id, doc_url = await self._poll_import(ticket)
+        # 2. Convert markdown → Feishu blocks and append as children of
+        # the document's root page block (block_id == document_id).
+        blocks = markdown_to_blocks(markdown)
+        if blocks:
+            append_resp = await self._request(
+                method="POST",
+                path=f"/docx/v1/documents/{document_id}/blocks/{document_id}/children",
+                json_body={"children": blocks},
+            )
+            if append_resp.get("code") != 0:
+                # — Docx created but blocks failed: surface so the
+                # caller can decide whether to delete the empty doc.
+                raise FeishuContentError(
+                    f"docx/v1/documents blocks/children failed: "
+                    f"code={append_resp.get('code')} msg={append_resp.get('msg')} "
+                    f"(document_id={document_id})"
+                )
+
+        # — The doc_url uses a tenant-specific host. We synthesise it
+        # from the tenant's API base host (open.feishu.cn → the tenant
+        # host is in the document response when we move to v2; for now
+        # we use the standard open.feishu.cn/docx/{id} which redirects
+        # to the tenant URL).
+        doc_url = f"https://open.feishu.cn/docx/{document_id}"
         logger.info(
-            "feishu_docx_imported",
-            doc_id=doc_id,
+            "feishu_docx_created",
+            document_id=document_id,
             title=title[:80],
-            ticket=ticket,
+            block_count=len(blocks),
         )
-        return {"doc_id": doc_id, "url": doc_url}
-
-    async def _poll_import(self, ticket: str) -> tuple[str, str]:
-        """Block until the import is success / failed / timeout.
-
-        Feishu returns `{result: "success"|"pending"|"failed", token, url}`.
-        """
-        deadline = asyncio.get_event_loop().time() + self._poll_timeout_sec
-        last_status = "pending"
-        while True:
-            response = await self._request(
-                method="GET", path=f"/drive/v1/import_tasks/{ticket}"
-            )
-            if response.get("code") != 0:
-                raise FeishuContentError(
-                    f"drive/v1/import_tasks/{ticket} poll failed: "
-                    f"code={response.get('code')} msg={response.get('msg')}"
-                )
-            payload = (response.get("data") or {}).get("result") or {}
-            last_status = payload.get("result") or "pending"
-
-            if last_status == "success":
-                doc_id = (payload.get("token") or "").strip()
-                doc_url = (payload.get("url") or "").strip()
-                if not doc_id or not doc_url:
-                    raise FeishuContentError(
-                        "drive/v1/import_tasks success without token/url"
-                    )
-                return doc_id, doc_url
-
-            if last_status == "failed":
-                raise FeishuContentError(
-                    f"drive/v1/import_tasks failed: {payload.get('msg') or 'unknown'}"
-                )
-
-            if asyncio.get_event_loop().time() >= deadline:
-                raise FeishuContentError(
-                    f"drive/v1/import_tasks poll timed out "
-                    f"(last_status={last_status})"
-                )
-
-            await asyncio.sleep(self._poll_interval_sec)
+        return {"doc_id": document_id, "url": doc_url}
 
     # ------------------------------------------------------------------
     # Phase 25 v2.1 — folder management (Drive Org surface)
