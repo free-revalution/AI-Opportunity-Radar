@@ -116,19 +116,24 @@ def _reset_redis_singleton() -> None:
 
     进一步问题: 真 Redis 上如果存在同名 key(如 batch1 PR-33-C 真实
     跑过写入的),测试会拿到残留。
+    Phase 34 PR-34-C fix: 之前硬编码 ``2026-08-30`` / ``2026-08-31`` 已
+    过期(今天是 2026-09-01)。改成动态算 today + yesterday — 任何
+    ``radar:drive:day_folder:*`` key 都被清掉。
 
     fix: 每次 test 前后清理真 Redis 上 day_folder 相关 key。
     test 自己的 monkeypatch 不动。
     """
     import asyncio as _aio
+    from datetime import date as _date, timedelta as _td
+
+    keys_to_clear = [
+        f"radar:drive:day_folder:{( _date.today()).isoformat()}",
+        f"radar:drive:day_folder:{( _date.today() - _td(days=1)).isoformat()}",
+    ]
     try:
         import redis.asyncio as _r
         _c = _r.from_url("redis://localhost:6379/0", decode_responses=True)
-        # Clear all day-folder keys (today + recent past) before test.
-        for k in (
-            "radar:drive:day_folder:2026-08-30",
-            "radar:drive:day_folder:2026-08-31",
-        ):
+        for k in keys_to_clear:
             _aio.run(_c.delete(k))
     except Exception:
         pass
@@ -138,10 +143,7 @@ def _reset_redis_singleton() -> None:
     # After-test cleanup too: a test that wrote to real Redis leaves
     # residue for the next test.
     try:
-        for k in (
-            "radar:drive:day_folder:2026-08-30",
-            "radar:drive:day_folder:2026-08-31",
-        ):
+        for k in keys_to_clear:
             _aio.run(_c.delete(k))
     except Exception:
         pass
