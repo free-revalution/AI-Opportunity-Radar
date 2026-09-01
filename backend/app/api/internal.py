@@ -278,8 +278,41 @@ async def run_pipeline(
             "scoring", scoring.run_once
         )
 
-        # 4. screening
-        screening = ScreeningService(session)
+        # 4. screening — Phase 33 PR-33-F: emit (raw_item, payload) 给
+        # callback,pipeline 在 screening 阶段累加 mapping,消 _backfill
+        # 的二次 SELECT Signal JOIN JOIN。
+        screening_mapping: dict[str, dict[str, Any]] = {}
+
+        from sqlalchemy import select as _sa_select_for_cb
+        from app.models import Source as _SourceForCb
+
+        async def _capture_screening_mapping(
+            raw_item: Any, payload: dict[str, Any]
+        ) -> None:
+            # ORM RawItem 没 .source 属性 — 用一次 lightweight SELECT
+            # 拿 Source.name 作 Data 表主键 slug。N+1 但 screening 阶段
+            # session 已 flush,这一查询基本无成本(已加载 buffer)。
+            try:
+                src_row = await session.execute(
+                    _sa_select_for_cb(_SourceForCb.name).where(
+                        _SourceForCb.id == raw_item.source_id
+                    )
+                )
+                source_name = src_row.scalar_one_or_none() or ""
+            except Exception:
+                source_name = ""
+            external_id = getattr(raw_item, "external_id", "") or ""
+            pk = f"{source_name}:{external_id}" if source_name else ""
+            if not pk or pk.endswith(":"):
+                return
+            # 同主键只写一次(选最大 Score — screening 不一定按序)
+            existing = screening_mapping.get(pk)
+            if existing is None or payload["Score"] > int(existing.get("Score", 0)):
+                screening_mapping[pk] = payload
+
+        screening = ScreeningService(
+            session, emit_screening_callback=_capture_screening_mapping
+        )
         sc_report = await record_pipeline_run(
             "screening", screening.run_once
         )
@@ -344,12 +377,14 @@ async def run_pipeline(
             data_sink = {"inserted": 0, "skipped_duplicate": 0, "error": str(exc)[:200]}
 
         # 4.5 Screening 后回填 Data 表的 Category / Score / Opportunity ID
+        # PR-33-F: 直接用 screening 阶段累加的 mapping,不走二次 JOIN。
         try:
             backfilled = await _retry_async(
                 _backfill_data_table_screening,
                 session=session,
                 settings=_phase30_settings,
                 run_id=run.id,
+                pre_built_mapping=screening_mapping,
                 max_attempts=_max_retries,
                 base_delay=_base_delay,
                 op_name="pipeline.backfill_data_table",
@@ -1417,22 +1452,36 @@ async def _backfill_data_table_screening(
     session: AsyncSession,
     settings: Any,
     run_id: int,
+    pre_built_mapping: Optional[dict[str, dict[str, Any]]] = None,
 ) -> int:
     """回填本次 /run 新生成 Signal 对应 Data 表行的 Category / Score / Opportunity ID。
 
-    思路:
-      1. 找本次 run 新建的 Signal(signal_type='screening', created_at >= run.started_at)
-      2. JOIN RawItem 拿 source + external_id
-      3. JOIN Opportunity 拿 total_score
-      4. 组成 ``{primary_key: {Category, Score, Opportunity ID}}`` 调 update_screening_results
+    两种路径:
+      * **PR-33-F 快速路径** (``pre_built_mapping`` 非空):
+        screening 阶段 emit callback 已累加 {pk: payload} mapping,
+        直接调 DataTableClient.update_screening_results。
+      * **回退路径** (mapping 空):走原 ``SELECT Signal JOIN JOIN``
+        查询(冷启动 / 单步 screening 等无 callback 上下文场景)。
+
+    返回实际回填的 Data 表行数。
     """
+    from app.services.feishu.app_client import FeishuAppClient
+    from app.services.feishu.data_table import DataTableClient
+
+    # --- PR-33-F 快速路径 -----------------------------------------
+    if pre_built_mapping:
+        app_client = FeishuAppClient(settings=settings)
+        client = DataTableClient(app_client=app_client, settings=settings)
+        return await client.update_screening_results(
+            mapping=pre_built_mapping
+        )
+
+    # --- 回退路径(JOIN-based)------------------------------------
     from sqlalchemy import select as _sa_select
 
     from app.models import Opportunity as _Opportunity
     from app.models import Run as _Run
     from app.models import Signal as _Signal
-    from app.services.feishu.app_client import FeishuAppClient
-    from app.services.feishu.data_table import DataTableClient
 
     run = await session.get(_Run, run_id)
     started_at = run.started_at if run else None
@@ -1477,9 +1526,8 @@ async def _backfill_data_table_screening(
     return await client.update_screening_results(mapping=mapping)
 
 
-# TODO(Phase 30): 在 _apply screening 完成时直接 emit raw_item→screening 映射,
-# 当前实现通过 ``SELECT Signal JOIN RawItem JOIN Opportunity`` 二次查询实现,
-# 足够简单且不需要改 ScreeningService 的接口。后续 Phase 31 可优化。
+# Phase 33 PR-33-F: emit-callback 快速路径已上线,此 fallback 仅用于
+# 单步 /screening/run 等不带 callback 上下文的入口(冷启动)。
 
 
 # ===========================================================================

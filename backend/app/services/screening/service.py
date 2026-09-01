@@ -21,8 +21,9 @@ opportunities — we record it in `errors` and continue. Status moves to
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
+from typing import Any, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -73,12 +74,21 @@ class ScreeningService:
         provider: LLMProvider | None = None,
         limit: int = 50,
         max_snippets: int = 6,
+        emit_screening_callback: Optional[
+            Callable[[Any, dict[str, Any]], Awaitable[None]]
+        ] = None,
     ) -> None:
         self.session = session
         self.settings = settings or get_settings()
         self.provider = provider or build_llm_provider(self.settings)
         self.limit = limit
         self.max_snippets = max_snippets
+        # Phase 33 PR-33-F: pipeline 传一个 async callback,
+        # _apply 在写入 sub-scores 后 emit (raw_item, payload) 给 caller。
+        # 取代 _backfill_data_table_screening 的二次 SELECT Signal JOIN JOIN。
+        # 传 raw_item 而非主键 — caller 自己解析 source_slug
+        # (ORM RawItem 没 .source 属性,要 JOIN Source.name)。
+        self._emit_screening_callback = emit_screening_callback
 
     # ------------------------------------------------------------------
     # public API
@@ -220,6 +230,25 @@ class ScreeningService:
                 relevance_score=1.0 if result.is_business_relevant else 0.0,
             )
         await self.session.flush()
+
+        # Phase 33 PR-33-F: emit (raw_item, payload) 给 callback。
+        # caller (run_pipeline) 自己解析 source_slug — ORM RawItem 没
+        # .source 属性,这一层不查 DB。
+        if self._emit_screening_callback is not None:
+            payload = {
+                "Category": result.category or opp.category or "",
+                "Score": int(round(float(opp.total_score or 0))),
+                "Opportunity ID": int(opp.id),
+            }
+            for item in raw_items:
+                try:
+                    await self._emit_screening_callback(item, payload)
+                except Exception as exc:  # noqa: BLE001 — emit 失败不阻塞 screening
+                    logger.warning(
+                        "screening_emit_callback_failed",
+                        opportunity_id=opp.id,
+                        error=str(exc)[:200],
+                    )
 
     @staticmethod
     def _engagement_for(item: RawItem) -> float:
