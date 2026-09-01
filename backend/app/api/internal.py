@@ -28,7 +28,7 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Body, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -656,6 +656,85 @@ async def get_sources_healthy(
 ) -> dict[str, Any]:
     snap = await _source_health_snapshot(session)
     return snap
+
+
+# ---------------------------------------------------------------------------
+# Phase 35 PR-35-C: n8n HTTP 入口 — Data 表同步 + task status
+# ---------------------------------------------------------------------------
+class DataTableSyncRequest(BaseModel):
+    """n8n Schedule Trigger → HTTP Request 调用的 body schema。
+
+    ``since`` 用 ISO8601 字符串(支持 ``Z`` 后缀),内部解析成
+    ``datetime``;失败 → 400 invalid since。
+    """
+
+    since: Optional[str] = None
+    chunk_size: int = 500
+    chat_id: Optional[str] = None
+    sender_open_id: Optional[str] = None
+    trigger: Optional[str] = "n8n"
+
+
+@router.get(
+    "/task/{task_id}",
+    summary="Phase 35 PR-35-C: Poll background task status",
+)
+async def get_task_status(
+    task_id: str,
+    _actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    """Public status of a background task(由 submit_*_task 提交)。
+
+    n8n 用此 polling task_id 的 progress_inserted / progress_total。
+    任务不存在(过期被 GC 或 ID 错)→ 返回 ``{"status": 404, ...}``。
+    """
+    from app.services.feishu.task_runner import get_status
+
+    rec = await get_status(task_id)
+    if rec is None:
+        return {"status": 404, "error": "task not found (or expired)"}
+    return rec
+
+
+@router.post(
+    "/data_table/sync",
+    summary="Phase 35 PR-35-C: Trigger a background Data 表 sync (n8n entry)",
+)
+async def post_data_table_sync(
+    body: Optional[DataTableSyncRequest] = Body(default=None),
+    _actor: str = Depends(require_admin),
+) -> dict[str, Any]:
+    """n8n Schedule Trigger → HTTP Request 调此 endpoint,触发后台任务。
+
+    返回 ``{"task_id": ..., "status": "running"}``;n8n 拿 task_id 后
+    polling ``GET /api/internal/task/{task_id}`` 看 progress_inserted /
+    progress_total,直到 status="success" / "failed"。
+
+    与 ``submit_pipeline_run`` 不抢 pipeline semaphore — Data sync 是周期
+    后台任务,跟 /run 并行不冲突。
+    """
+    from app.services.feishu.task_runner import submit_data_table_sync_task
+
+    body = body or DataTableSyncRequest()
+    since: Optional[datetime] = None
+    if body.since:
+        try:
+            since = datetime.fromisoformat(
+                body.since.replace("Z", "+00:00")
+            )
+        except ValueError:
+            return {
+                "status": 400,
+                "error": "invalid since (need ISO8601)",
+            }
+    rec = await submit_data_table_sync_task(
+        since=since,
+        chunk_size=body.chunk_size,
+        chat_id=body.chat_id,
+        sender_open_id=body.sender_open_id,
+        trigger=body.trigger or "n8n",
+    )
+    return {"task_id": rec.task_id, "status": rec.status}
 
 
 # ===========================================================================

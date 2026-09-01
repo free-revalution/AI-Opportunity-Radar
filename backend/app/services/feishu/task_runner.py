@@ -39,6 +39,7 @@ import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Optional
 
 import httpx
@@ -49,7 +50,8 @@ from app.utils import get_logger
 logger = get_logger(__name__)
 
 
-_TASK_RETENTION_SEC = 300  # keep finished task records for 5 min so /status can show them
+_TASK_RETENTION_SEC = 1800  # Phase 35 PR-35-C: 30 分钟 — n8n 一次 30 分钟
+# backfill 期间需要 polling status,5 分钟不够。
 _MAX_CONCURRENT_TASKS = 4  # bound resource use; 4 in-flight pipelines is plenty for /run spam
 # Phase 33 PR-33-E: 限流改成 bounded wait-queue — 第 5 个 /run
 # 等信号量 30s,期间 reply 不报错。超时报错"⏳ 流水线正在排队中…",
@@ -102,6 +104,10 @@ class TaskRecord:
 
     Stored in ``_TASKS`` so the inbound handler can read the state
     (e.g. for the reply text) and so /status can mention recent ones.
+
+    Phase 35 PR-35-C 加 ``trigger`` / ``params`` / ``progress_inserted``
+    / ``progress_total``:n8n HTTP 触发 Data 表同步需要 polling status;
+    progress 字段让 /task/<id> 可以增量汇报 "scanned=N / total=N"。
     """
 
     task_id: str
@@ -114,6 +120,11 @@ class TaskRecord:
     status: str = "running"  # running | success | failed
     result_summary: dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
+    # Phase 35 PR-35-C: 扩展字段,向后兼容(都有默认值)
+    trigger: str = "user"  # "user" | "n8n"
+    params: dict[str, Any] = field(default_factory=dict)
+    progress_inserted: Optional[int] = None
+    progress_total: Optional[int] = None
     _asyncio_task: Optional[asyncio.Task[Any]] = None
 
     def to_public_dict(self) -> dict[str, Any]:
@@ -129,6 +140,10 @@ class TaskRecord:
             "status": self.status,
             "result_summary": self.result_summary,
             "error": self.error,
+            "trigger": self.trigger,
+            "params": self.params,
+            "progress_inserted": self.progress_inserted,
+            "progress_total": self.progress_total,
         }
 
 
@@ -259,6 +274,173 @@ def _log_task_done(asyncio_task: asyncio.Task[Any]) -> None:
             error=str(exc),
             exc_info=exc,
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 35 PR-35-C: Data 表同步(n8n 入口)
+# ---------------------------------------------------------------------------
+async def submit_data_table_sync_task(
+    *,
+    since: Optional[datetime] = None,
+    chunk_size: int = 500,
+    chat_id: Optional[str] = None,
+    sender_open_id: Optional[str] = None,
+    trigger: str = "n8n",
+    settings: Optional[Settings] = None,
+) -> TaskRecord:
+    """Schedule a background Data 表 sync; return immediately with a task_id.
+
+    跟 ``submit_pipeline_run`` 不一样:
+      * **不带 pipeline semaphore** — Data sync 是周期后台任务,不该
+        占用 /run 的并发 slot 跟 /run 抢资源。
+      * chat_id=None → n8n 触发,完成后不发卡片
+      * chat_id set → manual /sync(预留),完成后发 "✅ Data sync done" / "❌ ..."
+
+    Args:
+      since: ISO8601 datetime,只回填 fetched_at >= since 的 RawItem
+      chunk_size: 每批 Feishu batch_create 上限(默认 500)
+      chat_id: 可选 — manual 模式下,完成后向此 chat_id 发卡片
+      sender_open_id: 可选,bot 触发时记录
+      trigger: "user" | "n8n"
+    """
+    settings = settings or get_settings()
+    task_id = uuid.uuid4().hex[:12]
+    record = TaskRecord(
+        task_id=task_id,
+        submitted_at=_now(),
+        chat_id=chat_id or "",
+        sender_open_id=sender_open_id or "",
+        command_kind="data_table_sync",
+        receive_id_type="chat_id",
+        trigger=trigger,
+        params={
+            "since": since.isoformat() if since else None,
+            "chunk_size": int(chunk_size),
+        },
+    )
+    async with _TASKS_LOCK:
+        _TASKS[task_id] = record
+
+    async def _run() -> None:
+        try:
+            record.status = "running"
+            await _execute_data_table_sync(
+                record=record, since=since,
+                chunk_size=chunk_size, settings=settings,
+            )
+        except Exception as exc:  # noqa: BLE001 — 防御兜底,_execute 自己已 log
+            record.status = "failed"
+            record.error = f"{type(exc).__name__}: {exc}"
+            logger.exception(
+                "feishu_async_data_sync_unhandled", task_id=task_id,
+            )
+        finally:
+            record.finished_at = _now()
+
+    record._asyncio_task = asyncio.create_task(
+        _run(), name=f"feishu-data-sync-{task_id}"
+    )
+    record._asyncio_task.add_done_callback(_log_task_done)
+    asyncio.create_task(_gc_old_tasks())
+
+    logger.info(
+        "feishu_async_data_sync_submitted",
+        task_id=task_id,
+        trigger=trigger,
+        since=since.isoformat() if since else None,
+    )
+    return record
+
+
+async def _execute_data_table_sync(
+    *,
+    record: TaskRecord,
+    since: Optional[datetime],
+    chunk_size: int,
+    settings: Settings,
+) -> None:
+    """Background body for :func:`submit_data_table_sync_task`.
+
+    自建 FeishuAppClient + DataTableClient(不通过 HTTP)— 跟
+    ``_execute_docs_tree`` Phase 27 同一模式。失败 → record.error,
+    不抛给 caller(``_run`` finally 兜底)。
+    """
+    from app.db import get_sessionmaker
+    from app.services.feishu.app_client import FeishuAppClient
+    from app.services.feishu.data_table import DataTableClient
+
+    app_client = FeishuAppClient(settings=settings)
+
+    async def _on_progress(inserted: int, total: int) -> None:
+        async with _TASKS_LOCK:
+            record.progress_inserted = int(inserted)
+            record.progress_total = int(total)
+        # 周期性 log; 整数倍的 50 触发或收尾
+        if total and (inserted % 50 == 0 or inserted == total):
+            logger.info(
+                "feishu_async_data_sync_progress",
+                task_id=record.task_id,
+                inserted=inserted, total=total,
+            )
+
+    sessionmaker = get_sessionmaker()
+    try:
+        async with sessionmaker() as session:
+            client = DataTableClient(
+                app_client=app_client, settings=settings
+            )
+            try:
+                result = await client.bulk_insert_raw_items_unbounded(
+                    session=session,
+                    since=since,
+                    chunk_size=chunk_size,
+                    run_id_label=0,
+                    on_progress=_on_progress,
+                )
+                record.status = "success"
+                record.result_summary = dict(result)
+                logger.info(
+                    "feishu_async_data_sync_done",
+                    task_id=record.task_id,
+                    **result,
+                )
+            except Exception as exc:  # noqa: BLE001
+                record.status = "failed"
+                record.error = f"{type(exc).__name__}: {exc}"
+                logger.exception(
+                    "feishu_async_data_sync_failed",
+                    task_id=record.task_id,
+                )
+    finally:
+        try:
+            await app_client.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 可选 post-back 到 chat(manual /sync 用)
+    if record.chat_id:
+        try:
+            if record.status == "success":
+                inserted = int(record.result_summary.get("inserted", 0))
+                skipped = int(record.result_summary.get("skipped_duplicate", 0))
+                scanned = int(record.result_summary.get("scanned", 0))
+                msg_text = (
+                    f"✅ Data sync done "
+                    f"({inserted} new, {skipped} dup, {scanned} scanned)"
+                )
+            else:
+                msg_text = f"❌ Data sync failed: {record.error}"
+            await FeishuAppClient(settings=settings).send_message(
+                receive_id=record.chat_id,
+                msg_type="text",
+                content={"text": msg_text},
+                receive_id_type=record.receive_id_type,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "feishu_async_data_sync_postback_failed",
+                task_id=record.task_id, error=str(exc),
+            )
 
 
 async def get_status(task_id: str) -> Optional[dict[str, Any]]:

@@ -24,6 +24,7 @@ from app.services.feishu.task_runner import (
     get_status,
     list_recent,
     submit_pipeline_run,
+    submit_data_table_sync_task,
     _TASKS,
     _TASKS_LOCK,
 )
@@ -418,4 +419,97 @@ async def test_pipeline_async_run_uses_long_timeout(monkeypatch, monkey_httpx) -
     assert captured_timeouts[0] >= 600.0, (
         f"task_runner httpx timeout too short: {captured_timeouts[0]}s — "
         f"bot /run will keep timing out on real runs."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 35 PR-35-C: n8n HTTP 入口 — Data 表同步 + task status
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_submit_data_table_sync_returns_record_immediately(
+    monkeypatch,
+) -> None:
+    """PR-35-C: submit_data_table_sync_task 立即返回,record.status=running。
+
+    不调 Feishu(走 bulk_insert_raw_items_unbounded 的 stub);验证 record
+    字段全。
+    """
+    from app.services.feishu import data_table as data_table_mod
+
+    async def _fake_unbounded(self, *, session, since=None, chunk_size=500,
+                              run_id_label=0, on_progress=None):
+        if on_progress:
+            await on_progress(10, 50)
+        return {
+            "inserted": 10, "skipped_duplicate": 0,
+            "skipped_orphan": 0, "scanned": 50,
+        }
+
+    monkeypatch.setattr(
+        data_table_mod.DataTableClient,
+        "bulk_insert_raw_items_unbounded",
+        _fake_unbounded,
+    )
+
+    rec = await submit_data_table_sync_task(
+        since=None, chunk_size=500, trigger="n8n",
+    )
+    assert rec.task_id and len(rec.task_id) == 12
+    assert rec.status == "running"
+    assert rec.command_kind == "data_table_sync"
+    assert rec.trigger == "n8n"
+    assert rec.params == {"since": None, "chunk_size": 500}
+
+    # 等 background task 跑完
+    if rec._asyncio_task is not None:
+        try:
+            await asyncio.wait_for(rec._asyncio_task, timeout=3.0)
+        except (asyncio.TimeoutError, Exception):
+            pass
+
+    # task 已结束 → status=success,progress_total=50
+    final = await get_status(rec.task_id)
+    assert final is not None
+    assert final["status"] == "success"
+    assert final["progress_inserted"] == 10
+    assert final["progress_total"] == 50
+    assert final["result_summary"]["inserted"] == 10
+
+
+@pytest.mark.asyncio
+async def test_submit_data_table_sync_records_failure(monkeypatch) -> None:
+    """PR-35-C: sync 失败 → record.status="failed", error 非空,任务结束。"""
+    from app.services.feishu import data_table as data_table_mod
+
+    async def _boom_unbounded(self, *, session, since=None, chunk_size=500,
+                              run_id_label=0, on_progress=None):
+        raise RuntimeError("simulated feishu 502")
+
+    monkeypatch.setattr(
+        data_table_mod.DataTableClient,
+        "bulk_insert_raw_items_unbounded",
+        _boom_unbounded,
+    )
+
+    rec = await submit_data_table_sync_task(trigger="n8n")
+    if rec._asyncio_task is not None:
+        try:
+            await asyncio.wait_for(rec._asyncio_task, timeout=3.0)
+        except (asyncio.TimeoutError, Exception):
+            pass
+
+    final = await get_status(rec.task_id)
+    assert final is not None
+    assert final["status"] == "failed"
+    assert final["error"] is not None
+    assert "simulated feishu 502" in final["error"]
+
+
+def test_task_retention_extended_to_30_minutes() -> None:
+    """PR-35-C: retention 由 300s → 1800s,n8n 30-min 周期内 polling 不丢。"""
+    from app.services.feishu import task_runner as task_runner_mod
+
+    assert task_runner_mod._TASK_RETENTION_SEC == 1800, (
+        f"retention 应为 1800s(n8n 30-min),实为 "
+        f"{task_runner_mod._TASK_RETENTION_SEC}"
     )

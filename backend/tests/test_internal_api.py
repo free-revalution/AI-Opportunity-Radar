@@ -125,3 +125,57 @@ async def test_resolve_data_view_url_caches_result(monkeypatch):
     # 第一次 ensure_table 被调,第二次走 cache(0 增量)
     assert call_count["n"] == 1
     internal_mod._DATA_VIEW_URL_CACHE.clear()
+
+
+# ---------------------------------------------------------------------------
+# Phase 35 PR-35-C: n8n HTTP 入口 — POST /data_table/sync + GET /task/<id>
+# ---------------------------------------------------------------------------
+async def test_post_data_table_sync_returns_task_id(client, monkeypatch):
+    """PR-35-C: POST /api/internal/data_table/sync 返回 task_id。"""
+    from app.services.feishu import data_table as data_table_mod
+
+    async def _fake_unbounded(self, *, session, since=None, chunk_size=500,
+                              run_id_label=0, on_progress=None):
+        return {
+            "inserted": 0, "skipped_duplicate": 0,
+            "skipped_orphan": 0, "scanned": 0,
+        }
+
+    monkeypatch.setattr(
+        data_table_mod.DataTableClient,
+        "bulk_insert_raw_items_unbounded",
+        _fake_unbounded,
+    )
+
+    response = client.post(
+        "/api/internal/data_table/sync",
+        json={"chunk_size": 100, "trigger": "n8n"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "task_id" in body
+    assert body["status"] == "running"
+
+    # 等 background task 跑完 — 不堵下一个 test
+    import asyncio as _aio
+    await _aio.sleep(0.5)
+
+
+async def test_post_data_table_sync_invalid_since_returns_400(client):
+    """PR-35-C: since 非 ISO8601 → 400 invalid since。"""
+    response = client.post(
+        "/api/internal/data_table/sync",
+        json={"since": "not-a-date"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == 400
+    assert "invalid since" in body["error"]
+
+
+async def test_get_task_status_404_for_unknown(client):
+    """PR-35-C: GET /api/internal/task/<unknown> → 404 status。"""
+    response = client.get("/api/internal/task/nonexistent_id_xxx")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == 404
