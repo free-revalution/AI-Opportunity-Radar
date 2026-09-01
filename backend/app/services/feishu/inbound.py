@@ -967,6 +967,12 @@ class FeishuCommandRouter:
             # the old key read back 0 and rendered "26 / 0 healthy".
             f"状态: {result.get('healthy', 0)} / {result.get('total', 0)} healthy"
         )
+        # Phase 35 PR-35-B: 顶层 data_view_url — 飞书 Data 表直接入口,
+        # 运营可以在飞书表里按 Source Name / Source Type 筛选(PR-35-A)。
+        data_url = result.get("data_view_url")
+        if data_url:
+            lines.append("")
+            lines.append(f"📋 Data 视图: {data_url}")
         return CommandReply(
             text="\n".join(lines),
             metadata={"command": "sources", "count": len(items)},

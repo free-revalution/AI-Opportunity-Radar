@@ -1300,9 +1300,12 @@ def _serialize_run(run: Any) -> dict[str, Any]:
     }
 
 
-async def _source_health_snapshot(session: AsyncSession) -> dict[str, Any]:
+async def _source_health_snapshot(
+    session: AsyncSession, *, include_data_view_url: bool = True
+) -> dict[str, Any]:
     from sqlalchemy import select
 
+    from app.config import get_settings
     from app.models import Source
 
     rows = (await session.execute(select(Source))).scalars().all()
@@ -1323,11 +1326,61 @@ async def _source_health_snapshot(session: AsyncSession) -> dict[str, Any]:
         }
         for s in rows
     ]
-    return {
+    out: dict[str, Any] = {
         "total": len(items),
         "healthy": sum(1 for i in items if i["healthy"]),
         "items": items,
     }
+    # Phase 35 PR-35-B: 顶层 data_view_url 单一 URL(不是 per-source —
+    # Feishu 不支持按 Source 字段深链过滤)。lazy 解析,失败静默。
+    if include_data_view_url:
+        out["data_view_url"] = await _resolve_data_view_url(get_settings())
+    else:
+        out["data_view_url"] = None
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Phase 35 PR-35-B: Data 表视图 URL — 顶层 lazy 解析 + 模块级 TTL 缓存
+# ---------------------------------------------------------------------------
+import time as _time_mod
+
+_DATA_VIEW_URL_CACHE: dict[str, Any] = {"url": None, "expires_at": 0.0}
+_DATA_VIEW_URL_TTL_SEC = 300  # 5 分钟
+
+
+async def _resolve_data_view_url(settings: Any) -> Optional[str]:
+    """Resolve Feishu Data 表视图 URL,带 5 分钟 TTL 缓存。
+
+    URL 形如 ``https://feishu.cn/base/<app_token>?table=<table_id>``。
+    首次调用会触发 ``DataTableClient.ensure_table``(可能打飞书),后续
+    5 分钟内复用。任何异常 log warning,返回 None — 主流程不依赖。
+    """
+    now = _time_mod.time()
+    cached_url = _DATA_VIEW_URL_CACHE.get("url")
+    expires_at = _DATA_VIEW_URL_CACHE.get("expires_at") or 0.0
+    if cached_url and now < expires_at:
+        return cached_url
+    try:
+        from app.services.feishu.app_client import FeishuAppClient
+        from app.services.feishu.data_table import DataTableClient
+
+        app_client = FeishuAppClient(settings=settings)
+        dtc = DataTableClient(app_client=app_client, settings=settings)
+        app_token, table_id = await dtc.ensure_table()
+        token = (
+            getattr(settings, "feishu_bitable_data_app_token", "") or ""
+        ).strip()
+        if token and table_id:
+            url = f"https://feishu.cn/base/{token}?table={table_id}"
+            _DATA_VIEW_URL_CACHE["url"] = url
+            _DATA_VIEW_URL_CACHE["expires_at"] = now + _DATA_VIEW_URL_TTL_SEC
+            return url
+    except Exception as exc:  # noqa: BLE001 — /sources 不能因为飞书 down 而 500
+        logger.warning(
+            "feishu_data_view_url_resolve_failed", error=str(exc)
+        )
+    return None
 
 
 async def _signal_total(session: AsyncSession) -> int:

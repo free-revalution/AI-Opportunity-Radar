@@ -368,6 +368,11 @@ async def test_router_sources_lists_enabled_sources():
                     # bot show "0 / N healthy".
                     "total": 5,
                     "healthy": 4,
+                    # Phase 35 PR-35-B: 顶层 data_view_url — bot 卡片
+                    # 末尾追加 "📋 Data 视图: <url>" 行。
+                    "data_view_url": (
+                        "https://feishu.cn/base/abc123?table=tblData"
+                    ),
                     "items": [
                         {
                             "id": 1,
@@ -410,6 +415,8 @@ async def test_router_sources_lists_enabled_sources():
     assert "✓ Hacker News" in reply.text
     assert "✗ Broken" in reply.text
     assert "状态: 4 / 5 healthy" in reply.text
+    assert "📋 Data 视图:" in reply.text
+    assert "https://feishu.cn/base/abc123?table=tblData" in reply.text
 
 
 async def test_router_sources_handles_no_enabled_sources():
