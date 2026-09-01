@@ -281,26 +281,21 @@ async def run_pipeline(
         # 4. screening — Phase 33 PR-33-F: emit (raw_item, payload) 给
         # callback,pipeline 在 screening 阶段累加 mapping,消 _backfill
         # 的二次 SELECT Signal JOIN JOIN。
-        screening_mapping: dict[str, dict[str, Any]] = {}
-
+        # Phase 34 PR-34-A: 一次 SELECT 所有 sources → dict lookup,消 callback
+        # 内 N+1 SELECT Source.name(/run 50 opps × ~5 raw_items ≈ 250 SELECTs)。
         from sqlalchemy import select as _sa_select_for_cb
         from app.models import Source as _SourceForCb
+
+        src_rows = await session.execute(_sa_select_for_cb(_SourceForCb.id, _SourceForCb.name))
+        source_name_by_id: dict[int, str] = {row[0]: row[1] for row in src_rows.all()}
+
+        screening_mapping: dict[str, dict[str, Any]] = {}
 
         async def _capture_screening_mapping(
             raw_item: Any, payload: dict[str, Any]
         ) -> None:
-            # ORM RawItem 没 .source 属性 — 用一次 lightweight SELECT
-            # 拿 Source.name 作 Data 表主键 slug。N+1 但 screening 阶段
-            # session 已 flush,这一查询基本无成本(已加载 buffer)。
-            try:
-                src_row = await session.execute(
-                    _sa_select_for_cb(_SourceForCb.name).where(
-                        _SourceForCb.id == raw_item.source_id
-                    )
-                )
-                source_name = src_row.scalar_one_or_none() or ""
-            except Exception:
-                source_name = ""
+            # ORM RawItem 没 .source 属性 — 走 PR-34-A dict 查
+            source_name = source_name_by_id.get(int(raw_item.source_id), "")
             external_id = getattr(raw_item, "external_id", "") or ""
             pk = f"{source_name}:{external_id}" if source_name else ""
             if not pk or pk.endswith(":"):

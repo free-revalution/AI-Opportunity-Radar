@@ -319,7 +319,11 @@ class ResearchService:
 
     async def _seed_urls_from_opp(self, opp: Opportunity) -> list[str]:
         link_repo = OpportunitySourceRepository(self.session)
-        raw_items = await link_repo.list_raw_items_for_opportunity(Opportunity.id)
+        # PR-34-D fix: was ``Opportunity.id`` (SQLAlchemy InstrumentedAttribute
+        # 被 .where() 当列),产生 ``... JOIN opportunity_sources, opportunities
+        # WHERE opp_id = opportunities.id`` cross-join,返回**所有** raw_items
+        # (含其它 opp 的)。改成 ``opp.id``。
+        raw_items = await link_repo.list_raw_items_for_opportunity(opp.id)
         urls: list[str] = []
         for item in raw_items:
             if item.url:

@@ -356,3 +356,146 @@ async def test_run_pipeline_uses_pre_built_mapping_fast_path(
     # 关键差异: pre_built_mapping path 不发 JOIN SQL
     # 通过 init_calls 数量 > 0 即可证明快速路径被构造
     assert len(cb_inits) >= 1
+
+
+async def test_screening_callback_uses_dict_lookup_no_per_item_select(
+    client, sqlite_session, monkeypatch
+) -> None:
+    """PR-34-A 回归: screening emit callback **不**触发 per-item SELECT Source.name。
+
+    修前: callback 内 await session.execute(SELECT Source WHERE id=?),50 opps ×
+    ~5 raw_items ≈ 250 SELECTs。
+    修后: pipeline 顶部一次 SELECT id, name FROM sources → dict lookup,
+          callback 内 0 SELECT Source.name。
+    """
+    import hashlib as _hl
+    from sqlalchemy import select as _sel_for_spy
+    from app.services.feishu import data_table as data_table_mod
+    from app.services.research import ResearchService
+    from app.services.ingestion import IngestionService
+    from app.services.llm import LLMProvider
+    from app.services import llm as llm_mod
+    from app.services.screening import service as screening_service_mod
+    from app.models import Source, RawItem, Opportunity, OpportunitySource
+    from app.db import get_session
+
+    # 拦截 dependency override 的 session — spy execute 找 "FROM sources" 单列 select
+    per_item_source_selects: list[str] = []
+    real_get_session = client.app.dependency_overrides[get_session]
+
+    async def _spied_session_gen():
+        async for s in real_get_session():
+            real_execute = s.execute
+
+            async def _spy_execute(stmt, *args, real=real_execute, sess=s, **kwargs):
+                try:
+                    sql = str(stmt.compile(dialect=sess.bind.dialect))
+                except Exception:
+                    sql = str(stmt)
+                # per-item: FROM sources + WHERE sources.id = ?
+                if (
+                    "FROM sources" in sql
+                    and "WHERE" in sql
+                    and "sources.id = " in sql
+                ):
+                    per_item_source_selects.append(sql[:200])
+                return await real(stmt, *args, **kwargs)
+
+            s.execute = _spy_execute  # type: ignore[method-assign]
+            yield s
+
+    client.app.dependency_overrides[get_session] = _spied_session_gen
+
+    # Stub DataTableClient — 避免 Feishu 调用
+    class _FakeDataTableClient:
+        def __init__(self, *, app_client=None, settings=None) -> None:
+            pass
+
+        async def update_screening_results(self, *, mapping):
+            return len(mapping)
+
+    monkeypatch.setattr(data_table_mod, "DataTableClient", _FakeDataTableClient)
+
+    # stub LLM
+    class _StubProvider(LLMProvider):
+        async def complete_json(self, **kwargs):
+            return _FakeLLMProvider().payload
+
+        async def complete_text(self, **kwargs):
+            return "{}"
+
+    def _build(settings):
+        return _StubProvider()
+
+    monkeypatch.setattr(llm_mod, "build_llm_provider", _build)
+    monkeypatch.setattr(screening_service_mod, "build_llm_provider", _build)
+
+    @dataclass
+    class _FakeReport:
+        raw_count: int = 0
+        new_count: int = 0
+        signal_count: int = 0
+        errors: list = field(default_factory=list)
+
+        def as_dict(self):
+            return {
+                "raw_count": self.raw_count,
+                "new_count": self.new_count,
+                "signal_count": self.signal_count,
+                "errors": self.errors,
+            }
+
+    async def _fake_research(self):
+        return _FakeReport()
+
+    monkeypatch.setattr(ResearchService, "run_once", _fake_research)
+
+    # Stub IngestionService
+    async def _stub_ingest(self):
+        stmt = _sel_for_spy(Source).where(Source.name == "github")
+        src = (await sqlite_session.execute(stmt)).scalar_one_or_none()
+        if src is None:
+            src = Source(
+                name="github",
+                type="api",
+                url="https://api.github.com",
+                enabled=True,
+                crawl_interval=3600,
+            )
+            sqlite_session.add(src)
+            await sqlite_session.flush()
+        for i in range(5):
+            ri = RawItem(
+                source_id=src.id,
+                external_id=f"PR34A-{i}",
+                title=f"t{i}",
+                url=f"https://e.com/{i}",
+                content="c" * 300,
+                author=None,
+                published_at=None,
+                metadata_json={},
+                content_hash=_hl.sha256(f"PR34A-{i}".encode()).hexdigest(),
+            )
+            sqlite_session.add(ri)
+        await sqlite_session.commit()
+
+        from app.services.ingestion.service import IngestionReport
+
+        return IngestionReport(items_seen=5, items_inserted=5, errors=[])
+
+    monkeypatch.setattr(IngestionService, "run_once", _stub_ingest)
+
+    # 跑 pipeline
+    per_item_source_selects.clear()
+    r = client.post(
+        "/api/internal/pipeline/run",
+        json={"send_digest": False, "write_docx": False},
+    )
+    assert r.status_code == 200, r.text
+
+    # 关键断言: 没有 per-item SELECT Source.name (单条 WHERE id=?)
+    assert len(per_item_source_selects) == 0, (
+        f"PR-34-A regression: 仍有 {len(per_item_source_selects)} 次 per-item "
+        "SELECT Source.name — callback 应走 dict lookup:\n"
+        + "\n".join(per_item_source_selects[:3])
+    )
