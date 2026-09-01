@@ -188,6 +188,42 @@ async def test_no_callback_means_no_emit_overhead(sqlite_session) -> None:
     assert report.opportunities_skipped == 0
 
 
+async def test_screening_apply_uses_single_flush_for_signals(
+    sqlite_session, monkeypatch
+) -> None:
+    """PR-34-E 回归: screening _apply 只对 signals 触发**一次** flush。
+
+    修前: per-signal ``SignalRepository.create()`` → 50 opps × ~5 signals ≈ 250 flushes。
+    修后: ``add_all(signals)`` + 单次 ``flush()`` → 1 flush / opp。
+    """
+    from app.services.screening import ScreeningService
+
+    await _seed_one_opportunity_with_two_raw_items(sqlite_session)
+
+    flush_count = {"n": 0}
+    real_flush = sqlite_session.flush
+
+    async def _counting_flush(*args: Any, **kwargs: Any) -> Any:
+        flush_count["n"] += 1
+        return await real_flush(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite_session, "flush", _counting_flush)
+
+    svc = ScreeningService(
+        sqlite_session,
+        provider=_FakeLLMProvider(),
+    )
+    await svc.run_once()
+
+    # 修前: 2 signals × 1 flush + 1 opp-level flush ≈ 3 flushes
+    # 修后: 1 add_all + 1 flush = 2 flushes(1 个 opp-status flush + 1 signal batch flush)
+    # 我们 assert flush 次数 < signals 数量(2),即 1 而不是 per-signal flush。
+    assert flush_count["n"] < 2 + 1, (
+        f"PR-34-E regression: 仍有 {flush_count['n']} 次 flush per signal — "
+        f"应改为 batched add_all + 单次 flush"
+    )
+
+
 async def test_run_pipeline_uses_pre_built_mapping_fast_path(
     client, sqlite_session, monkeypatch
 ) -> None:

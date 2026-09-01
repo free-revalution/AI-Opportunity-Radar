@@ -28,11 +28,10 @@ from typing import Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
-from app.models import Opportunity, RawItem
+from app.models import Opportunity, RawItem, Signal
 from app.repositories import (
     OpportunityRepository,
     OpportunitySourceRepository,
-    SignalRepository,
 )
 from app.services.llm import LLMProvider, build_llm_provider
 from app.services.screening.parsers import ScreeningResult, parse_screening_response
@@ -218,17 +217,28 @@ class ScreeningService:
 
         await self.session.flush()
 
-        signal_repo = SignalRepository(self.session)
-        for item in raw_items:
-            await signal_repo.create(
+        # Phase 34 PR-34-E: batched insert — 一次 add_all + 一次 flush,
+        # 取代 per-signal create+flush (50 opps × ~5 signals = 250 flushes)。
+        # row-level error 仍由 run_once 的 except Exception 接住,不会
+        # 影响其它 opp。
+        keyword = (result.keywords[0] if result.keywords else None)
+        category = result.category or None
+        velocity = float(result.trend_strength)
+        relevance = 1.0 if result.is_business_relevant else 0.0
+        signals_to_add = [
+            Signal(
                 raw_item_id=item.id,
                 signal_type="screening",
-                keyword=(result.keywords[0] if result.keywords else None),
-                category=result.category or None,
-                velocity_score=float(result.trend_strength),
+                keyword=keyword,
+                category=category,
+                velocity_score=velocity,
                 engagement_score=self._engagement_for(item),
-                relevance_score=1.0 if result.is_business_relevant else 0.0,
+                relevance_score=relevance,
             )
+            for item in raw_items
+        ]
+        if signals_to_add:
+            self.session.add_all(signals_to_add)
         await self.session.flush()
 
         # Phase 33 PR-33-F: emit (raw_item, payload) 给 callback。
