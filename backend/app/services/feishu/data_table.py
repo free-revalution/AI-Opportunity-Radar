@@ -54,9 +54,13 @@ OnProgress = Callable[[int, int], Awaitable[None]]
 # Data 表 schema(plan §3.1)。``ensure_table`` 首次创建时一次性写入。
 #   type 1 = Text, type 2 = Number, type 5 = DateTime
 # Source 列标记为 is_primary=True,作为 list_records 预查的主键。
+# Phase 35 PR-35-A: 加 "Source Name" / "Source Type" 两列冗余派生列,
+# 运营手工按信息源名 / 种类筛选时不用解析 "source:external_id" 主键。
 _DATA_FIELDS: list[dict[str, Any]] = [
     {"field_name": "Run ID",          "type": 2},                 # Number
     {"field_name": "Source",          "type": 1, "is_primary": True},  # Text primary
+    {"field_name": "Source Name",     "type": 1},                 # Text 派生
+    {"field_name": "Source Type",     "type": 1},                 # Text 派生
     {"field_name": "External ID",     "type": 1},
     {"field_name": "Title",           "type": 1},
     {"field_name": "URL",             "type": 1},
@@ -140,10 +144,13 @@ def _row_for(
     item: RawItem,
     run_id: int,
     source_name: Optional[str] = None,
+    source_type: Optional[str] = None,
 ) -> dict[str, Any]:
     """把 RawItem 序列化为 Data 表一行。
 
     ``item``: dataclass 或 ORM 实例。ORM 路径必须传 source_name。
+    Phase 35 PR-35-A: source_type 可选;Source Name / Source Type 是冗余
+    派生列,运营侧手工按信息源名 / 种类筛选时不用解析主键。
     """
     fields: dict[str, Any] = {
         "Run ID": run_id,
@@ -156,6 +163,10 @@ def _row_for(
         "Content Hash": getattr(item, "content_hash", "") or "",
         "Fetched At": int((item.fetched_at or datetime.utcnow()).timestamp() * 1000),
     }
+    if source_name:
+        fields["Source Name"] = source_name[:128]
+    if source_type:
+        fields["Source Type"] = source_type[:32]
     if item.author:
         fields["Author"] = item.author[:255]
     if item.published_at:
@@ -188,7 +199,13 @@ class DataTableClient:
     # Lifecycle (委托给 FeishuBitableClient,保持一处实现)
     # ------------------------------------------------------------------
     async def ensure_table(self) -> tuple[str, str]:
-        """确保 Data 表存在;返回 (app_token, table_id)。"""
+        """确保 Data 表存在;返回 (app_token, table_id)。
+
+        Phase 35 PR-35-A: 表已存在时,做 field backfill — ``list_fields``
+        拉现状,与 ``_DATA_FIELDS`` 求差集,逐个 POST 缺失字段。完全幂等,
+        第二次跑 ``have`` 覆盖 ``_DATA_FIELDS`` → 跳过。Feishu 调用失败
+        → log warning,不阻塞主流程。
+        """
         # ensure_table 走的是 Phase 7 的 _OPP_FIELDS,不是我们的 _DATA_FIELDS。
         # 我们在此绕开:先 ensure_app(自动建 app),再自己 list+create table,
         # 然后单独建字段,避免被 Phase 7 默认字段污染。
@@ -201,6 +218,10 @@ class DataTableClient:
             if (table.get("name") or "").strip() == self._bitable._table_name:  # noqa: SLF001
                 tid = (table.get("table_id") or "").strip()
                 if tid:
+                    # PR-35-A: backfill 缺失字段。try/except 包裹,失败 log warning。
+                    await self._backfill_missing_fields(
+                        app_token=app_token, table_id=tid
+                    )
                     return app_token, tid
 
         # 创建表(空表,字段稍后单独建)
@@ -238,6 +259,49 @@ class DataTableClient:
             table_id=tid,
         )
         return app_token, tid
+
+    async def _backfill_missing_fields(
+        self, *, app_token: str, table_id: str
+    ) -> None:
+        """PR-35-A: 已有表 → diff list_fields vs _DATA_FIELDS,POST 缺失字段。
+
+        失败 → log warning,不抛(主流程 /sources / /run 不依赖 backfill)。
+        完全幂等:第二次跑 ``have`` 覆盖 ``_DATA_FIELDS`` → 跳过。
+        """
+        try:
+            existing = await self._bitable.list_fields(
+                app_token=app_token, table_id=table_id
+            )
+        except FeishuContentError as exc:
+            logger.warning(
+                "feishu_data_table_list_fields_failed",
+                table_id=table_id, error=str(exc),
+            )
+            return
+        have = {
+            (f.get("field_name") or "").strip() for f in existing
+        }
+        for spec in _DATA_FIELDS:
+            fname = spec["field_name"]
+            if fname in have:
+                continue
+            try:
+                await self._bitable.create_field(
+                    app_token=app_token,
+                    table_id=table_id,
+                    field_name=fname,
+                    field_type=spec["type"],
+                    is_primary=bool(spec.get("is_primary")),
+                )
+                logger.info(
+                    "feishu_data_table_field_backfilled",
+                    field_name=fname, table_id=table_id,
+                )
+            except FeishuContentError as exc:
+                logger.warning(
+                    "feishu_data_table_field_backfill_failed",
+                    field_name=fname, error=str(exc),
+                )
 
     # ------------------------------------------------------------------
     # Dedup + bulk insert
@@ -334,15 +398,16 @@ class DataTableClient:
     async def bulk_insert_raw_items(
         self,
         *,
-        items: list[tuple[RawItem, Optional[str]]],
+        items: list[tuple[RawItem, Optional[str], Optional[str]]],
         run_id: int,
     ) -> dict[str, int]:
         """把一批 RawItem 写入 Data 表。
 
         Args:
-          items: list of ``(item, source_name)`` tuples。
-                 - dataclass path: ``(item, None)`` — connector 产出,``item.source`` 已有 slug
-                 - ORM path: ``(item, source_name)`` — DB 读出,caller 必须预 JOIN 拿到 ``Source.name``
+          items: list of ``(item, source_name, source_type)`` tuples。
+                 - dataclass path: ``(item, None, None)`` — connector 产出,``item.source`` 已有 slug
+                 - ORM path: ``(item, source_name, source_type)`` — DB 读出,caller 必须预 JOIN
+                  拿到 ``Source.name`` / ``Source.type``
 
         Returns:
           ``{"inserted": N, "skipped_duplicate": M}``。
@@ -352,12 +417,12 @@ class DataTableClient:
 
         # 预查去重(主键 = source_slug:external_id)
         primary_keys = [
-            _primary_key_for(it, source_name=sn) for it, sn in items
+            _primary_key_for(it, source_name=sn) for it, sn, _st in items
         ]
         existing = await self.existing_sources(primary_keys)
 
         new_pairs = [
-            (it, sn) for (it, sn), pk in zip(items, primary_keys)
+            (it, sn, st) for (it, sn, st), pk in zip(items, primary_keys)
             if pk and pk not in existing
         ]
         skipped = len(items) - len(new_pairs)
@@ -376,8 +441,13 @@ class DataTableClient:
             return {"inserted": 0, "skipped_duplicate": skipped}
 
         records = [
-            {"fields": _row_for(item=it, run_id=run_id, source_name=sn)}
-            for it, sn in new_pairs
+            {
+                "fields": _row_for(
+                    item=it, run_id=run_id,
+                    source_name=sn, source_type=st,
+                )
+            }
+            for it, sn, st in new_pairs
         ]
         try:
             inserted = await self._bitable.batch_create_records(
@@ -533,9 +603,11 @@ class DataTableClient:
         if not items:
             return {"inserted": 0, "skipped_duplicate": 0, "skipped_orphan": 0}
 
-        # ORM 对象需要预 JOIN 拿到 slug;这里做单次批量查询。
+        # ORM 对象需要预 JOIN 拿到 slug + type;这里做单次批量查询。
         source_ids = list({it.source_id for it in items if it.source_id is not None})
-        source_name_by_id: dict[int, str] = {}
+        # Phase 35 PR-35-A: lookup 从 ``str`` 升到 ``(name, type)``,把
+        # Source.type 也透传给 _row_for → "Source Type" 列。
+        source_meta_by_id: dict[int, tuple[str, str]] = {}
         if source_ids:
             if session is None:
                 # 退路:从 ORM 实例拿 session。访问 _sa_instance_state
@@ -543,22 +615,25 @@ class DataTableClient:
                 if hasattr(items[0], "_sa_instance_state"):
                     session = items[0]._sa_instance_state.session  # type: ignore[assignment]
             if session is not None:
-                stmt = _sa_select(ORMSource.id, ORMSource.name).where(
-                    ORMSource.id.in_(source_ids)
-                )
+                stmt = _sa_select(
+                    ORMSource.id, ORMSource.name, ORMSource.type
+                ).where(ORMSource.id.in_(source_ids))
                 rows = (await session.execute(stmt)).all()
-                source_name_by_id = {sid: name for sid, name in rows}
+                source_meta_by_id = {
+                    sid: (name, typ or "")
+                    for sid, name, typ in rows
+                }
             else:
                 logger.warning(
                     "feishu_data_table_orm_path_no_session",
                     n=len(items),
                 )
 
-        pairs: list[tuple[ORMRawItem, Optional[str]]] = []
+        pairs: list[tuple[ORMRawItem, Optional[str], Optional[str]]] = []
         orphan = 0
         for it in items:
-            sn = source_name_by_id.get(it.source_id)
-            if sn is None:
+            meta = source_meta_by_id.get(it.source_id)
+            if meta is None:
                 orphan += 1
                 logger.warning(
                     "feishu_data_table_orphan_skipped",
@@ -566,7 +641,7 @@ class DataTableClient:
                     source_id=it.source_id,
                 )
                 continue
-            pairs.append((it, sn))
+            pairs.append((it, meta[0], meta[1]))
 
         if not pairs:
             return {
@@ -632,8 +707,10 @@ class DataTableClient:
         while True:
             # LEFT JOIN Source — 没有 Source 的孤儿显式 ``None`` 而不是被过滤,
             # 这样 ``skipped_orphan`` 才有意义(否则会被 INNER JOIN 静默吃掉)。
+            # Phase 35 PR-35-A: SELECT 多带 ``ORMSource.type`` → 透传到
+            # ``_row_for`` 的 ``source_type`` 形参 → "Source Type" 列。
             stmt = (
-                _sa_select(ORMRawItem, ORMSource.name)
+                _sa_select(ORMRawItem, ORMSource.name, ORMSource.type)
                 .outerjoin(ORMSource, ORMSource.id == ORMRawItem.source_id)
                 .where(ORMRawItem.id > last_id)
                 .order_by(ORMRawItem.id.asc())
@@ -645,8 +722,8 @@ class DataTableClient:
             if not rows:
                 break
 
-            pairs: list[tuple[ORMRawItem, Optional[str]]] = [
-                (raw, name) for raw, name in rows if name
+            pairs: list[tuple[ORMRawItem, Optional[str], Optional[str]]] = [
+                (raw, name, typ) for raw, name, typ in rows if name
             ]
             orphan = len(rows) - len(pairs)
             skipped_orphan_total += orphan

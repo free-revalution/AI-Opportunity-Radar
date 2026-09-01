@@ -41,6 +41,27 @@ class _FakeBitableClient:
         self._cached_app_token: Optional[str] = "fake_app_token"
         self._cached_table_id: Optional[str] = "tb_data"
         self._table_name: str = "Data"
+        # Phase 35 PR-35-A: field backfill 测试需要 list_fields/create_field
+        # 默认字段表 = 12 老字段。测试里改成 14 或 8 都行,_FakeBitableClient
+        # 只关心字段名集合。
+        self._fields: list[dict[str, Any]] = [
+            {"field_name": spec["field_name"], "type": spec["type"]}
+            for spec in [
+                {"field_name": "Run ID", "type": 2},
+                {"field_name": "Source", "type": 1},
+                {"field_name": "External ID", "type": 1},
+                {"field_name": "Title", "type": 1},
+                {"field_name": "URL", "type": 1},
+                {"field_name": "Author", "type": 1},
+                {"field_name": "Published At", "type": 5},
+                {"field_name": "Category", "type": 1},
+                {"field_name": "Score", "type": 2},
+                {"field_name": "Opportunity ID", "type": 2},
+                {"field_name": "Content Hash", "type": 1},
+                {"field_name": "Fetched At", "type": 5},
+            ]
+        ]
+        self._create_field_calls: list[dict[str, Any]] = []
 
     async def ensure_app(self) -> str:
         self._cached_app_token = self._app_token
@@ -50,6 +71,33 @@ class _FakeBitableClient:
         self, *, app_token: Optional[str] = None
     ) -> list[dict[str, Any]]:
         return [{"table_id": self._table_id, "name": "Data"}]
+
+    async def list_fields(
+        self,
+        *,
+        app_token: Optional[str] = None,
+        table_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        return list(self._fields)
+
+    async def create_field(
+        self,
+        *,
+        field_name: str,
+        field_type: int,
+        app_token: Optional[str] = None,
+        table_id: Optional[str] = None,
+        is_primary: bool = False,
+        **extra: Any,
+    ) -> str:
+        self._create_field_calls.append(
+            {"field_name": field_name, "type": field_type,
+             "is_primary": is_primary, **extra}
+        )
+        # 幂等:已存在同名就不重复加
+        if not any(f["field_name"] == field_name for f in self._fields):
+            self._fields.append({"field_name": field_name, "type": field_type})
+        return f"fld_{len(self._fields):03d}"
 
     async def list_records(
         self,
@@ -702,3 +750,162 @@ async def test_update_screening_results_uses_single_lookup(
         f"update_screening_results made {call_count['n']} list_records — "
         "PR-33-B 回归:有人改回 per-source 查?"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 35 PR-35-A: Data 表字段 backfill + Source Name/Type 透传
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_ensure_table_backfills_missing_fields(
+    sqlite_session: Any, fake_bitable: _FakeBitableClient
+) -> None:
+    """PR-35-A: 已有表少 Source Name / Source Type → ensure_table 自动补。
+
+    模拟操作员手上 Data 表是 12 列老 schema(没有 Phase 35 的两列)。
+    第一次 ensure_table: 2 次 create_field,补齐 2 个字段。
+    第二次 ensure_table: 0 次 create_field(幂等)。
+    """
+    # 12 老字段 — 故意去掉 Source Name / Source Type
+    fake_bitable._fields = [
+        {"field_name": name, "type": t}
+        for name, t in [
+            ("Run ID", 2),
+            ("Source", 1),
+            ("External ID", 1),
+            ("Title", 1),
+            ("URL", 1),
+            ("Author", 1),
+            ("Published At", 5),
+            ("Category", 1),
+            ("Score", 2),
+            ("Opportunity ID", 2),
+            ("Content Hash", 1),
+            ("Fetched At", 5),
+        ]
+    ]
+    fake_bitable._create_field_calls = []
+
+    from app.services.feishu.data_table import DataTableClient
+
+    client = DataTableClient(app_client=_FakeAppClient(settings=__import__(
+        "app.config", fromlist=["get_settings"]
+    ).get_settings()))
+    client._bitable = fake_bitable  # type: ignore[assignment]
+
+    # 1st ensure_table — 应补齐 Source Name + Source Type
+    app_token, tid = await client.ensure_table()
+    assert app_token == "fake_app_token"
+    assert tid == "tb_data"
+    backfilled_names = {c["field_name"] for c in fake_bitable._create_field_calls}
+    assert backfilled_names == {"Source Name", "Source Type"}, (
+        f"first backfill 漏字段: {backfilled_names}"
+    )
+
+    # 2nd ensure_table — 幂等,不再 POST
+    fake_bitable._create_field_calls.clear()
+    await client.ensure_table()
+    assert fake_bitable._create_field_calls == [], (
+        f"second ensure_table 仍 create_field,非幂等: "
+        f"{fake_bitable._create_field_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_table_backfill_swallows_list_fields_failure(
+    sqlite_session: Any, fake_bitable: _FakeBitableClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR-35-A: list_fields 失败 → log warning,不阻塞 ensure_table 返回。"""
+    from app.services.feishu.content_client import FeishuContentError
+    from app.services.feishu.data_table import DataTableClient
+
+    async def _boom_list_fields(self: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        raise FeishuContentError("feishu down")
+
+    client = DataTableClient(app_client=_FakeAppClient(settings=__import__(
+        "app.config", fromlist=["get_settings"]
+    ).get_settings()))
+    client._bitable = fake_bitable  # type: ignore[assignment]
+
+    import unittest.mock
+    with unittest.mock.patch.object(
+        type(client._bitable), "list_fields", _boom_list_fields
+    ):
+        # 不应抛;list_fields 失败被吞,返回 (app_token, table_id)
+        app_token, tid = await client.ensure_table()
+    assert app_token == "fake_app_token"
+    assert tid == "tb_data"
+
+
+@pytest.mark.asyncio
+async def test_data_table_flow_end_to_end_with_source_metadata(
+    sqlite_session: Any,
+    seeded_raw_items: list[ORMRawItem],
+    fake_bitable: _FakeBitableClient,
+) -> None:
+    """用户硬要求 PR-35-D: 证明数据能从 DB 流到 Data 表,带 source 元数据。
+
+    跑完整链路: ensure_table backfill → bulk_insert_raw_items_unbounded
+    → batch_create_records,断言 6 行(或这里 3 行)全部带 Source Name +
+    Source Type 字段。
+    """
+    # 把 fake_bitable 的字段表重置成老 12 列,触发 1 次 backfill
+    fake_bitable._fields = [
+        {"field_name": name, "type": t}
+        for name, t in [
+            ("Run ID", 2), ("Source", 1), ("External ID", 1),
+            ("Title", 1), ("URL", 1), ("Author", 1),
+            ("Published At", 5), ("Category", 1), ("Score", 2),
+            ("Opportunity ID", 2), ("Content Hash", 1), ("Fetched At", 5),
+        ]
+    ]
+    fake_bitable._create_field_calls = []
+    fake_bitable._records = []
+
+    from app.services.feishu.data_table import DataTableClient
+
+    client = DataTableClient(app_client=_FakeAppClient(settings=__import__(
+        "app.config", fromlist=["get_settings"]
+    ).get_settings()))
+    client._bitable = fake_bitable  # type: ignore[assignment]
+    client._bitable._session = sqlite_session  # type: ignore[attr-defined]
+
+    result = await client.bulk_insert_raw_items_unbounded(
+        session=sqlite_session, chunk_size=500
+    )
+
+    # 1. backfill 触发了
+    backfilled = {c["field_name"] for c in fake_bitable._create_field_calls}
+    assert backfilled == {"Source Name", "Source Type"}, (
+        f"端到端 backfill 漏字段: {backfilled}"
+    )
+
+    # 2. 3 行 raw_item 全部落 Data 表
+    assert result["inserted"] == 3
+    assert len(fake_bitable._records) == 3
+
+    # 3. 每行都有 Source Name / Source Type,值与 seed 一致
+    by_source = {r["fields"]["Source"]: r["fields"] for r in fake_bitable._records}
+    assert "github:gh-1" in by_source
+    assert "github:gh-2" in by_source
+    assert "reddit:rd-1" in by_source
+    for pk, fields in by_source.items():
+        assert "Source Name" in fields, f"{pk} 缺 Source Name"
+        assert "Source Type" in fields, f"{pk} 缺 Source Type"
+        assert fields["Source Name"]  # 非空
+        assert fields["Source Type"]  # 非空
+
+    # 4. github 两行 Source Type 都是 "api"(seed 时 source fixture 用 type='api')
+    assert by_source["github:gh-1"]["Source Name"] == "github"
+    assert by_source["github:gh-2"]["Source Name"] == "github"
+    assert by_source["github:gh-1"]["Source Type"] == "api"
+    assert by_source["reddit:rd-1"]["Source Name"] == "reddit"
+    assert by_source["reddit:rd-1"]["Source Type"] == "api"
+
+    # 5. 幂等 — 再跑一次 → insert=0, source metadata 行数不增
+    records_before = len(fake_bitable._records)
+    second = await client.bulk_insert_raw_items_unbounded(
+        session=sqlite_session, chunk_size=500
+    )
+    assert second["inserted"] == 0
+    assert second["skipped_duplicate"] == 3
+    assert len(fake_bitable._records) == records_before

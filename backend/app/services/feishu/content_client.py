@@ -1388,6 +1388,80 @@ class FeishuBitableClient(_TokenMixin):
             total += len(chunk)
         return total
 
+    # ------------------------------------------------------------------
+    # Phase 35 PR-35-A: field schema backfill helpers
+    # ------------------------------------------------------------------
+    async def list_fields(
+        self,
+        *,
+        app_token: Optional[str] = None,
+        table_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """列出表的所有字段。
+
+        ``GET /bitable/v1/apps/{app_token}/tables/{table_id}/fields``,
+        返回 ``data.items`` 列表(每项含 ``field_name`` / ``type`` /
+        ``is_primary`` / ``field_id`` 等)。
+
+        Raises:
+            FeishuContentError: 飞书 code != 0 时。
+        """
+        token = (app_token or "").strip() or await self.ensure_app()
+        tid = (table_id or "").strip()
+        if not tid:
+            raise FeishuContentError("list_fields: table_id required")
+        response = await self._request(
+            method="GET",
+            path=f"/bitable/v1/apps/{token}/tables/{tid}/fields",
+        )
+        if response.get("code") != 0:
+            raise FeishuContentError(
+                f"bitable list_fields rejected: "
+                f"code={response.get('code')} msg={response.get('msg')}"
+            )
+        return list((response.get("data") or {}).get("items") or [])
+
+    async def create_field(
+        self,
+        *,
+        field_name: str,
+        field_type: int,
+        app_token: Optional[str] = None,
+        table_id: Optional[str] = None,
+        is_primary: bool = False,
+        **extra: Any,
+    ) -> str:
+        """创建单个字段,返回 field_id。
+
+        ``POST /bitable/v1/apps/{app_token}/tables/{table_id}/fields``,
+        body 为 ``{"field_name": ..., "type": ..., "is_primary"?: ..., ...}``。
+
+        Raises:
+            FeishuContentError: 飞书 code != 0 时。
+        """
+        token = (app_token or "").strip() or await self.ensure_app()
+        tid = (table_id or "").strip()
+        if not tid or not field_name:
+            raise FeishuContentError(
+                "create_field: table_id and field_name required"
+            )
+        body: dict[str, Any] = {"field_name": field_name, "type": field_type}
+        if is_primary:
+            body["is_primary"] = True
+        body.update(extra)
+        response = await self._request(
+            method="POST",
+            path=f"/bitable/v1/apps/{token}/tables/{tid}/fields",
+            json_body=body,
+        )
+        if response.get("code") != 0:
+            raise FeishuContentError(
+                f"bitable create_field rejected: name={field_name!r} "
+                f"code={response.get('code')} msg={response.get('msg')}"
+            )
+        data = response.get("data") or {}
+        return (data.get("field") or {}).get("field_id", "") or ""
+
 
 def _opp_to_bitable_fields(
     opp: dict[str, Any], base_url: str

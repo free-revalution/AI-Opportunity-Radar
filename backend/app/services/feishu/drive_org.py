@@ -262,6 +262,11 @@ class DriveOrgService:
                         "drive_day_folder_cache_hit", day=day_str
                     )
                     return str(cached)
+                else:
+                    logger.debug(
+                        "drive_day_folder_cache_miss", day=day_str,
+                        client_type=type(redis).__name__,
+                    )
             except Exception as exc:  # noqa: BLE001 — fail-open
                 logger.warning(
                     "drive_day_folder_cache_read_failed",
