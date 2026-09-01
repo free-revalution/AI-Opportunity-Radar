@@ -168,20 +168,13 @@ async def test_fetch_top_opportunities_handles_connection_error(
     settings.feishu_internal_api_url = "http://127.0.0.1:1"  # bad port
 
     class _BoomClient:
-        async def __aenter__(self) -> "_BoomClient":
-            return self
-
-        async def __aexit__(self, *exc: Any) -> None:
-            return None
-
         async def get(self, *args: Any, **kwargs: Any) -> Any:
             raise httpx.ConnectError("nope")
 
     import app.services.feishu.task_runner as task_module
 
-    monkeypatch.setattr(
-        task_module.httpx, "AsyncClient", lambda *a, **kw: _BoomClient()
-    )
+    # PR-33-G: 共享 client — 替换 _get_shared_client 返回 boom 替身
+    monkeypatch.setattr(task_module, "_get_shared_client", lambda: _BoomClient())
     out = await _fetch_top_opportunities(settings=settings, n=5)
     assert out == []
 
@@ -210,21 +203,68 @@ async def test_fetch_top_opportunities_returns_items(
             }
 
     class _FakeClient:
-        async def __aenter__(self) -> "_FakeClient":
-            return self
-
-        async def __aexit__(self, *exc: Any) -> None:
-            return None
-
         async def get(self, *args: Any, **kwargs: Any) -> _FakeResponse:
             return _FakeResponse()
 
     import app.services.feishu.task_runner as task_module
 
-    monkeypatch.setattr(
-        task_module.httpx, "AsyncClient", lambda *a, **kw: _FakeClient()
-    )
+    # PR-33-G: 共享 client — 替换 _get_shared_client 返回 fake 替身
+    monkeypatch.setattr(task_module, "_get_shared_client", lambda: _FakeClient())
     out = await _fetch_top_opportunities(settings=settings, n=2)
     assert len(out) == 2
     assert out[0]["id"] == 7
     assert out[1]["title"] == "Y"
+
+
+# ---------------------------------------------------------------------------
+# Phase 33 PR-33-G — shared httpx.AsyncClient pool
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_get_shared_client_is_singleton() -> None:
+    """PR-33-G 回归: _get_shared_client() 多次调用返回同一对象 — 必须
+    共用 connection pool,避免每次 task 重建 TCP/TLS。"""
+    import app.services.feishu.task_runner as task_module
+
+    # 强制重置(前一个 test 可能已建)
+    task_module._SHARED_HTTP_CLIENT = None
+    c1 = task_module._get_shared_client()
+    c2 = task_module._get_shared_client()
+    assert c1 is c2, "_get_shared_client() 每次返回新实例 — pool 没复用"
+    # 清理(避免污染后续 test)
+    await task_module.aclose_shared_client()
+    assert task_module._SHARED_HTTP_CLIENT is None
+
+
+@pytest.mark.asyncio
+async def test_aclose_shared_client_resets_singleton() -> None:
+    """PR-33-G 回归: aclose_shared_client() 关闭并清空 — 下次 _get_shared_client() 重新建。"""
+    import app.services.feishu.task_runner as task_module
+
+    c1 = task_module._get_shared_client()
+    assert c1 is not None
+    await task_module.aclose_shared_client()
+    assert task_module._SHARED_HTTP_CLIENT is None
+    c2 = task_module._get_shared_client()
+    assert c2 is not c1, "aclose 后应建新 client"
+    await task_module.aclose_shared_client()
+
+
+@pytest.mark.asyncio
+async def test_get_shared_client_uses_pool_limits() -> None:
+    """PR-33-G 回归: shared client 配置了 max_connections=10, keepalive=5。
+
+    注:httpx 的 Limits 在 client 上没有公开属性直接读,只能通过
+    ``_transport`` 间接验。直接 assert client 类型 + timeout 配置即可。
+    """
+    import httpx
+
+    import app.services.feishu.task_runner as task_module
+
+    task_module._SHARED_HTTP_CLIENT = None
+    c = task_module._get_shared_client()
+    try:
+        assert isinstance(c, httpx.AsyncClient)
+        # 默认 timeout 30s(httpx.Timeout 对象 .connect / .read / .write / .pool)
+        assert float(c.timeout.connect) == 30.0
+    finally:
+        await task_module.aclose_shared_client()

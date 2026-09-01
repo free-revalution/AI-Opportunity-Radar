@@ -108,12 +108,13 @@ async def _reset_task_state():
 
 @pytest.fixture
 def monkey_httpx(monkeypatch):
-    """Replace httpx.AsyncClient *inside* task_runner with one using our transport.
+    """Replace httpx clients in task_runner + app_client with our transport.
 
-    The runner creates its own ``httpx.AsyncClient`` for the pipeline
-    call AND a fresh ``FeishuAppClient`` (with its own httpx client)
-    for the reply. We patch ``httpx.AsyncClient`` globally so both
-    use the same transport.
+    The runner creates a shared ``httpx.AsyncClient`` via
+    ``_get_shared_client()`` (PR-33-G) for the pipeline call AND a fresh
+    ``FeishuAppClient`` (with its own httpx client) for the reply.
+    We patch both the shared client and the module-level httpx so
+    both use the same transport.
     """
 
     transport = _PipelineEndpointTransport(pipeline_payload=_ok_payload())
@@ -130,6 +131,15 @@ def monkey_httpx(monkeypatch):
             kwargs["transport"] = transport
         return original_async_client(*args, **kwargs)
 
+    # PR-33-G: shared client 替换 — _get_shared_client() 返回带 transport 的 client
+    def _shared_with_transport() -> httpx.AsyncClient:
+        return original_async_client(transport=transport)
+
+    monkeypatch.setattr(
+        "app.services.feishu.task_runner._get_shared_client",
+        _shared_with_transport,
+    )
+    # 保留 module-level 兼容(可能仍有其他路径直接构造 client)
     monkeypatch.setattr("app.services.feishu.task_runner.httpx.AsyncClient", _factory)
     monkeypatch.setattr(
         "app.services.feishu.app_client.httpx.AsyncClient", _factory
@@ -353,25 +363,41 @@ async def test_queue_timeout_yields_friendly_error(
 # the timeout to 900s so the post-back carries the success summary.
 # ---------------------------------------------------------------------------
 async def test_pipeline_async_run_uses_long_timeout(monkeypatch, monkey_httpx) -> None:
-    """The httpx.AsyncClient the task_runner builds for the pipeline
-    POST must carry a timeout ≥ 600s, otherwise long real-mode runs
-    surface as ``pipeline request failed:`` to the bot user."""
+    """The httpx call the task_runner makes for the pipeline POST must
+    carry a timeout ≥ 600s, otherwise long real-mode runs surface as
+    ``pipeline request failed:`` to the bot user.
+
+    PR-33-G: 共享 client — 抓 ``.post(..., timeout=)`` 调用的 timeout。
+    """
     import app.services.feishu.task_runner as task_runner_module
     from app.services.feishu import task_runner
 
     captured_timeouts: list[float] = []
 
-    original_async_client = httpx.AsyncClient
+    # PR-33-G: shared client — replace _get_shared_client with one that
+    # records ``.post(timeout=)`` calls.
+    class _CapturingClient:
+        def __init__(self) -> None:
+            pass
 
-    def _capturing_client(*args, **kwargs):
-        # Capture the timeout kwarg (or default arg) used by the
-        # task_runner when it builds its pipeline HTTP client.
-        if "timeout" in kwargs and kwargs["timeout"] is not None:
-            captured_timeouts.append(float(kwargs["timeout"]))
-        return original_async_client(*args, **kwargs)
+        async def post(
+            self, *args: Any, **kwargs: Any
+        ) -> httpx.Response:  # noqa: D401
+            timeout = kwargs.get("timeout")
+            if timeout is not None:
+                captured_timeouts.append(float(timeout))
+            return httpx.Response(
+                200, json=_ok_payload(), request=httpx.Request("POST", args[0] if args else "")
+            )
 
-    monkeypatch.setattr(task_runner_module.httpx, "AsyncClient", _capturing_client)
-    monkeypatch.setattr(task_runner.httpx, "AsyncClient", _capturing_client)
+        async def get(self, *args: Any, **kwargs: Any) -> httpx.Response:  # pragma: no cover
+            return httpx.Response(200, json={})
+
+    monkeypatch.setattr(
+        task_runner_module,
+        "_get_shared_client",
+        lambda: _CapturingClient(),
+    )
 
     rec = await task_runner.submit_pipeline_run(
         chat_id="oc_timeout",
@@ -379,14 +405,14 @@ async def test_pipeline_async_run_uses_long_timeout(monkeypatch, monkey_httpx) -
         settings=_settings(),
     )
     # — Wait for the background task to actually run (it calls
-    # httpx.AsyncClient immediately inside _execute_pipeline).
+    # .post() immediately inside _execute_pipeline).
     if rec._asyncio_task is not None:
         try:
             await asyncio.wait_for(rec._asyncio_task, timeout=2.0)
         except (asyncio.TimeoutError, Exception):
             pass
 
-    assert captured_timeouts, "task_runner never built an httpx.AsyncClient"
+    assert captured_timeouts, "task_runner never called .post() on shared client"
     # — Real-mode /run is 8-12 min; we want at least 600s. The current
     # value is 900s.
     assert captured_timeouts[0] >= 600.0, (

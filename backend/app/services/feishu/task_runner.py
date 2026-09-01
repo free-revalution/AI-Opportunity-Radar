@@ -56,6 +56,44 @@ _MAX_CONCURRENT_TASKS = 4  # bound resource use; 4 in-flight pipelines is plenty
 # 比硬拒"too many concurrent runs"友好得多。
 _RUN_SEMAPHORE: asyncio.Semaphore | None = None
 _RUN_QUEUE_WAIT_SECONDS: float = 30.0
+# Phase 33 PR-33-G: 共享 httpx.AsyncClient pool,避免每次 task 都重建
+# connection pool (TCP/TLS handshake + connection: keep-alive 不复用)。
+# timeout 在每次 client.post/get() 时按需覆盖(client.timeout 是默认)。
+# Lazy 单例 — 第一次调用 _get_shared_client() 时建,FasAPI lifespan
+# shutdown 时 aclose。
+_SHARED_HTTP_CLIENT: Optional[httpx.AsyncClient] = None
+
+
+def _get_shared_client() -> httpx.AsyncClient:
+    """Lazy 共享 httpx.AsyncClient。
+
+    现有 2 个调用点:
+      * _execute_pipeline: POST /api/internal/pipeline/run,timeout=900s
+      * _fetch_top_opportunities: GET /api/internal/opportunities/top,timeout=30s
+    共用 client 节省 connection pool 重建;per-request timeout 通过
+    ``client.post(url, timeout=900)`` 覆盖。
+    """
+    global _SHARED_HTTP_CLIENT
+    if _SHARED_HTTP_CLIENT is None:
+        _SHARED_HTTP_CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0),
+            limits=httpx.Limits(
+                max_connections=10,
+                max_keepalive_connections=5,
+            ),
+        )
+    return _SHARED_HTTP_CLIENT
+
+
+async def aclose_shared_client() -> None:
+    """lifespan shutdown 调 — 释放连接池。"""
+    global _SHARED_HTTP_CLIENT
+    if _SHARED_HTTP_CLIENT is not None:
+        try:
+            await _SHARED_HTTP_CLIENT.aclose()
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            pass
+        _SHARED_HTTP_CLIENT = None
 
 
 @dataclass(slots=True)
@@ -615,23 +653,24 @@ async def _execute_pipeline(*, record: TaskRecord, settings: Settings) -> None:
         # even though the pipeline itself completed server-side. We
         # give 15 minutes here so the post-back carries the success
         # summary instead of the timeout.
-        async with httpx.AsyncClient(timeout=900.0) as client:
-            response = await client.post(
-                pipeline_url, json=payload, headers=headers
+        # PR-33-G: 用共享 httpx client,timeout 按需覆盖。
+        try:
+            response = await _get_shared_client().post(
+                pipeline_url, json=payload, headers=headers, timeout=900.0
             )
-        if response.status_code >= 400:
-            try:
-                detail = response.json()
-            except ValueError:
-                detail = {"error": response.text[:200]}
-            error_text = (
-                f"pipeline HTTP {response.status_code}: "
-                f"{str(detail.get('error') or detail)[:200]}"
-            )
-        else:
-            summary = response.json() if response.content else {}
-    except httpx.HTTPError as exc:
-        error_text = f"pipeline request failed: {exc}"
+            if response.status_code >= 400:
+                try:
+                    detail = response.json()
+                except ValueError:
+                    detail = {"error": response.text[:200]}
+                error_text = (
+                    f"pipeline HTTP {response.status_code}: "
+                    f"{str(detail.get('error') or detail)[:200]}"
+                )
+            else:
+                summary = response.json() if response.content else {}
+        except httpx.HTTPError as exc:
+            error_text = f"pipeline request failed: {exc}"
     except Exception as exc:  # noqa: BLE001 — capture, then send a friendly reply
         error_text = f"pipeline unexpected error: {exc}"
         logger.error(
@@ -935,8 +974,8 @@ async def _fetch_top_opportunities(
     url = f"{base_url}/api/internal/opportunities/top?n={n}"
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url, headers=headers)
+        # PR-33-G: 共享 client,timeout=30s 与 client 默认一致,显式标注。
+        response = await _get_shared_client().get(url, headers=headers, timeout=30.0)
     except httpx.HTTPError as exc:
         logger.warning(
             "feishu_topn_fetch_failed",

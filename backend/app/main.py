@@ -80,6 +80,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     logger.info("shutdown")
     await close_db()
+    # Phase 33 PR-33-G: 释放 task_runner 共享 httpx client
+    from app.services.feishu.task_runner import aclose_shared_client
+
+    await aclose_shared_client()
 
 
 def create_app() -> FastAPI:
