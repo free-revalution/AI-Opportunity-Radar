@@ -969,10 +969,21 @@ class FeishuCommandRouter:
         )
         # Phase 35 PR-35-B: 顶层 data_view_url — 飞书 Data 表直接入口,
         # 运营可以在飞书表里按 Source Name / Source Type 筛选(PR-35-A)。
-        data_url = result.get("data_view_url")
-        if data_url:
+        # Phase 35 PR-35-D: 多目标时优先用 data_view_urls 列表(每目标一行),
+        # 单目标或老版本服务返回 data_view_url 时回退到单 URL 模式。
+        data_urls = result.get("data_view_urls")
+        if not data_urls:
+            single = result.get("data_view_url")
+            if single:
+                data_urls = [single]
+        if data_urls:
             lines.append("")
-            lines.append(f"📋 Data 视图: {data_url}")
+            if len(data_urls) == 1:
+                lines.append(f"📋 Data 视图: {data_urls[0]}")
+            else:
+                lines.append(f"📋 Data 视图(共 {len(data_urls)} 张表):")
+                for idx, u in enumerate(data_urls, start=1):
+                    lines.append(f"  {idx}. {u}")
         return CommandReply(
             text="\n".join(lines),
             metadata={"command": "sources", "count": len(items)},

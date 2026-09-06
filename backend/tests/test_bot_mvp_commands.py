@@ -419,6 +419,87 @@ async def test_router_sources_lists_enabled_sources():
     assert "https://feishu.cn/base/abc123?table=tblData" in reply.text
 
 
+@pytest.mark.asyncio
+async def test_router_sources_renders_multiple_data_view_urls():
+    """Phase 35 PR-35-D: 多目标 — ``data_view_urls`` 是 list 时,bot 卡片
+    显示编号列表(每张表一行)。``data_view_url`` 单数字段缺省时自动降级。
+    """
+    from app.services.feishu.inbound import BotCommand
+
+    two_urls = [
+        "https://feishu.cn/base/AAAA?table=tblAAA",
+        "https://icn3947lr1ic.feishu.cn/base/BBBB?table=tblBBB",
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/internal/sources/healthy":
+            return _ok_json(
+                {
+                    "total": 1,
+                    "healthy": 1,
+                    # PR-35-D: 复数字段,两个目标
+                    "data_view_urls": two_urls,
+                    # 单数字段保留(向后兼容 — 第一条)
+                    "data_view_url": two_urls[0],
+                    "items": [
+                        {
+                            "id": 1, "name": "HN", "type": "hackernews",
+                            "url": "https://news.ycombinator.com",
+                            "healthy": True,
+                            "last_success_at": None, "last_error_at": None,
+                            "compliance_level": "A",
+                        },
+                    ],
+                }
+            )
+        return httpx.Response(404)
+
+    router = _make_router(handler)
+    reply = await router.route(BotCommand(kind="sources"))
+
+    # 两条 URL 都要出现
+    for u in two_urls:
+        assert u in reply.text, f"bot 卡片缺 URL: {u}\nreply:\n{reply.text}"
+    # 标题应是复数形式 "Data 视图(共 N 张表)"
+    assert "Data 视图(共 2 张表)" in reply.text
+    # 编号格式 1. / 2.
+    assert "1." in reply.text and "2." in reply.text
+
+
+@pytest.mark.asyncio
+async def test_router_sources_falls_back_to_single_data_view_url():
+    """PR-35-D 兼容: 旧 backend 只给 ``data_view_url``,``data_view_urls``
+    不存在 — bot 卡片降级为单 URL 模式,显示 "📋 Data 视图: <url>" 一行。
+    """
+    from app.services.feishu.inbound import BotCommand
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/internal/sources/healthy":
+            return _ok_json(
+                {
+                    "total": 1, "healthy": 1,
+                    "data_view_url": "https://feishu.cn/base/SOLO?table=tblSolo",
+                    "items": [
+                        {
+                            "id": 1, "name": "HN", "type": "hackernews",
+                            "url": "https://news.ycombinator.com",
+                            "healthy": True,
+                            "last_success_at": None, "last_error_at": None,
+                            "compliance_level": "A",
+                        },
+                    ],
+                }
+            )
+        return httpx.Response(404)
+
+    router = _make_router(handler)
+    reply = await router.route(BotCommand(kind="sources"))
+
+    assert "📋 Data 视图: https://feishu.cn/base/SOLO?table=tblSolo" in reply.text
+    # 不应有复数标题
+    assert "共" not in reply.text
+
+
 async def test_router_sources_handles_no_enabled_sources():
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/internal/sources/healthy":

@@ -75,6 +75,68 @@ _DATA_FIELDS: list[dict[str, Any]] = [
 _DATA_TABLE_NAME = "Data"
 
 
+def _parse_data_app_tokens(settings: Settings) -> list[str]:
+    """Phase 35 PR-35-D: 解析 ``FEISHU_BITABLE_DATA_APP_TOKEN`` 支持多个 token。
+
+    接受逗号分隔的 token 串(每个 token 是完整的 ``app_token``):
+      * ``"V3X0b56wIasW3MsJnY4cFFSQnze"`` → 单目标(向后兼容)
+      * ``"V3X0b56wIasW3MsJnY4cFFSQnze,KJynbSctXazjQns64Itc1P7ynAf"`` → 双目标
+      * ``""``(空) → 自动创建路径(Phase 30 行为),首次写入新 app 并落 token 到 settings
+
+    PR-35-D follow-up: 检测重复 token,只 warn 一次(按输入 fingerprint 缓存),
+    避免测试 / 每次 sync 都重复打日志。返回去重后的 token 列表(保持首次出现顺序)。
+    """
+    raw = (getattr(settings, "feishu_bitable_data_app_token", "") or "").strip()
+    if not raw:
+        return []
+    tokens = [t.strip() for t in raw.split(",") if t.strip()]
+    # PR-35-D follow-up: 重复 token — 静默去重但 warn(仅首次)
+    seen: set[str] = set()
+    deduped: list[str] = []
+    duplicates: list[str] = []
+    for t in tokens:
+        if t in seen:
+            duplicates.append(t)
+            continue
+        seen.add(t)
+        deduped.append(t)
+    if duplicates:
+        _warn_duplicate_tokens_once(raw, duplicates, deduped)
+    return deduped
+
+
+# PR-35-D follow-up: 模块级缓存 — 每个 raw 输入 fingerprint 只 warn 一次。
+# 多个 DataTableClient 实例 / 多个 sync 都共享同一份"已 warn"记录。
+_DUPLICATE_WARNED: set[str] = set()
+
+
+def _warn_duplicate_tokens_once(
+    raw: str, duplicates: list[str], deduped: list[str]
+) -> None:
+    """重复 token 时 warn 一次(按 raw fingerprint 去重)。
+
+    生产环境如果运营误把同一 token 写两次(像 .env 里的
+    ``V3X0b56wIasW3MsJnY4cFFSQnze,KJynbSctXazjQns64Itc1P7ynAf,
+    KJynbSctXazjQns64Itc1P7ynAf``),会无意义地给同一张表写两遍 — 静默
+    dedup 不够显眼,要 log 出来让他知道。
+    """
+    fingerprint = f"{raw}::{','.join(duplicates)}"
+    if fingerprint in _DUPLICATE_WARNED:
+        return
+    _DUPLICATE_WARNED.add(fingerprint)
+    logger.warning(
+        "feishu_data_table_duplicate_tokens",
+        duplicates=duplicates,
+        unique_targets=deduped,
+        n_unique=len(deduped),
+        n_duplicates=len(duplicates),
+        hint=(
+            "FEISHU_BITABLE_DATA_APP_TOKEN 含重复 token,已被去重。"
+            "检查 .env 是否手抖写了两遍同一张表。"
+        ),
+    )
+
+
 def _source_slug_for_item(
     *,
     item: RawItem,
@@ -177,7 +239,12 @@ def _row_for(
 
 
 class DataTableClient:
-    """Data 多维表格客户端(Phase 30)。"""
+    """Data 多维表格客户端(Phase 30)。
+
+    Phase 35 PR-35-D: 支持多目标广播写入 — ``FEISHU_BITABLE_DATA_APP_TOKEN``
+    现在接受逗号分隔的 token 串,每次写入会推到所有目标表(bot 空间 + 个人
+    空间各一份)。每个目标独立 ensure / dedup / insert,任一失败不影响其它。
+    """
 
     TOKEN_SETTING = "feishu_bitable_data_app_token"
 
@@ -188,9 +255,14 @@ class DataTableClient:
         settings: Optional[Settings] = None,
         table_name: str = _DATA_TABLE_NAME,
     ) -> None:
+        self._settings = settings or get_settings()
+        self._table_name = table_name
+        # Phase 35 PR-35-D: 解析多 token;空 = 走 auto-create 后单目标
+        self._target_tokens: list[str] = _parse_data_app_tokens(self._settings)
+        # 共享的 bitable 客户端(无 token 缓存,所有调用显式传 app_token)
         self._bitable = FeishuBitableClient(
             app_client=app_client,
-            settings=settings,
+            settings=self._settings,
             table_name=table_name,
             token_setting=self.TOKEN_SETTING,
         )
@@ -198,37 +270,77 @@ class DataTableClient:
     # ------------------------------------------------------------------
     # Lifecycle (委托给 FeishuBitableClient,保持一处实现)
     # ------------------------------------------------------------------
-    async def ensure_table(self) -> tuple[str, str]:
-        """确保 Data 表存在;返回 (app_token, table_id)。
+    async def ensure_table(self) -> list[tuple[str, str]]:
+        """确保所有目标 Data 表存在;返回 ``[(app_token, table_id), ...]``。
 
-        Phase 35 PR-35-A: 表已存在时,做 field backfill — ``list_fields``
-        拉现状,与 ``_DATA_FIELDS`` 求差集,逐个 POST 缺失字段。完全幂等,
-        第二次跑 ``have`` 覆盖 ``_DATA_FIELDS`` → 跳过。Feishu 调用失败
-        → log warning,不阻塞主流程。
+        Phase 35 PR-35-D: 多目标广播。
+          * ``_target_tokens`` 非空 → 对每个 token 调 ``_ensure_table_for_token``
+          * ``_target_tokens`` 为空(向后兼容 Phase 30)→ 走 ``ensure_app`` 自动
+            建一个 app,把新 token 持久化到 settings,后续广播走单目标
+
+        单个目标失败 → log warning + 跳过该目标(不影响其它目标)。如果**所有**
+        目标都失败,抛 :class:`FeishuContentError` 让 caller 走 fallback。
         """
-        # ensure_table 走的是 Phase 7 的 _OPP_FIELDS,不是我们的 _DATA_FIELDS。
-        # 我们在此绕开:先 ensure_app(自动建 app),再自己 list+create table,
-        # 然后单独建字段,避免被 Phase 7 默认字段污染。
-        await self._bitable.ensure_app()
-        app_token = self._bitable._cached_app_token  # noqa: SLF001 — 内部约定
-        if not app_token:
-            raise FeishuContentError("ensure_app did not populate app_token")
+        if not self._target_tokens:
+            # Legacy auto-create 路径(Phase 30 行为)
+            new_token = await self._bitable.ensure_app()
+            if not new_token:
+                raise FeishuContentError("ensure_app did not populate app_token")
+            try:
+                tid = await self._ensure_table_for_token(new_token)
+            except FeishuContentError as exc:
+                logger.warning(
+                    "feishu_data_table_ensure_failed",
+                    app_token=new_token, error=str(exc),
+                )
+                raise
+            # 缓存到 instance,避免下次重复 auto-create
+            self._target_tokens = [new_token]
+            return [(new_token, tid)]
+
+        out: list[tuple[str, str]] = []
+        for tok in self._target_tokens:
+            try:
+                tid = await self._ensure_table_for_token(tok)
+                out.append((tok, tid))
+            except FeishuContentError as exc:
+                logger.warning(
+                    "feishu_data_table_ensure_target_failed",
+                    app_token=tok, error=str(exc),
+                )
+        if not out:
+            raise FeishuContentError(
+                "ensure_table: all targets failed "
+                f"(n={len(self._target_tokens)})"
+            )
+        return out
+
+    async def _ensure_table_for_token(self, app_token: str) -> str:
+        """确保单个 ``(app_token)`` 下名为 ``self._table_name`` 的表存在,返回 table_id。
+
+        流程:
+          1. ``list_tables(app_token=...)`` 找同名表 → 命中:backfill + 返回
+          2. 未命中 → ``POST /bitable/v1/apps/{app_token}/tables`` 建空表
+          3. 逐字段 ``POST /bitable/v1/apps/{app_token}/tables/{tid}/fields``
+             (失败 log warning,不阻塞)
+
+        失败抛 :class:`FeishuContentError`,由 ``ensure_table`` 决定是否 swallow。
+        """
         tables = await self._bitable.list_tables(app_token=app_token)
         for table in tables:
-            if (table.get("name") or "").strip() == self._bitable._table_name:  # noqa: SLF001
+            if (table.get("name") or "").strip() == self._table_name:
                 tid = (table.get("table_id") or "").strip()
                 if tid:
-                    # PR-35-A: backfill 缺失字段。try/except 包裹,失败 log warning。
                     await self._backfill_missing_fields(
                         app_token=app_token, table_id=tid
                     )
-                    return app_token, tid
+                    return tid
 
         # 创建表(空表,字段稍后单独建)
         create_resp = await self._bitable._request(  # noqa: SLF001
             method="POST",
             path=f"/bitable/v1/apps/{app_token}/tables",
-            json_body={"table": {"name": self._bitable._table_name}},  # noqa: SLF001
+            json_body={"table": {"name": self._table_name}},
         )
         if create_resp.get("code") != 0:
             raise FeishuContentError(
@@ -258,7 +370,7 @@ class DataTableClient:
             app_token=app_token,
             table_id=tid,
         )
-        return app_token, tid
+        return tid
 
     async def _backfill_missing_fields(
         self, *, app_token: str, table_id: str
@@ -309,6 +421,7 @@ class DataTableClient:
     async def _fetch_records_by_sources(
         self,
         *,
+        app_token: str,
         table_id: str,
         wanted_sources: Optional[set[str]] = None,
         page_size: int = 500,
@@ -323,6 +436,7 @@ class DataTableClient:
         一次完整 fetch ~1-2s,即使 1 万行也只 ~3 次翻页。
 
         Args:
+          app_token: Phase 35 PR-35-D 必需 — 多目标时定位具体 bucket。
           table_id: Feishu Bitable table_id
           wanted_sources: 可选 — 若提供,只返回主键在此集合内的行
                           (避免把整张表都返回给 caller)
@@ -337,6 +451,7 @@ class DataTableClient:
         while True:
             try:
                 items, next_token = await self._bitable.list_records(
+                    app_token=app_token,
                     table_id=table_id,
                     page_size=page_size,
                     page_token=page_token,
@@ -369,76 +484,104 @@ class DataTableClient:
         return out
 
     async def existing_sources(self, sources: Iterable[str]) -> set[str]:
-        """预查 Data 表中已存在的主键集合。
+        """预查 Data 表中已存在的主键集合(跨所有目标的并集)。
 
         Phase 33 PR-33-B: 单次翻页整张表(本地 filter),不再 N 次串行 list_records。
+        Phase 35 PR-35-D: 跨多目标 union — 任一目标存在即视为已存在。
+
+        注意:这是给外部 caller 用的"快速预查"接口。``bulk_insert_raw_items``
+        内部做 **per-target** dedup,会用更精确的语义(每个 target 单独算);
+        所以二者并不冲突,各自维护自己的 dedup 路径。
         """
         sources_set = {s for s in sources if s}
         if not sources_set:
             return set()
         try:
-            _, table_id = await self.ensure_table()
+            targets = await self.ensure_table()
         except FeishuContentError as exc:
             logger.warning("feishu_data_table_ensure_failed_skip_dedup", error=str(exc))
             return set()
 
-        try:
-            record_by_source = await self._fetch_records_by_sources(
-                table_id=table_id, wanted_sources=sources_set
-            )
-        except FeishuContentError as exc:
-            logger.warning(
-                "feishu_data_table_existing_lookup_failed",
-                error=str(exc),
-            )
-            return set()
-        # 只返回 caller 关心的 source_key 集合,避免内部字典泄漏
-        return {k for k in record_by_source.keys() if k in sources_set}
+        union: set[str] = set()
+        for tok, tid in targets:
+            try:
+                record_by_source = await self._fetch_records_by_sources(
+                    app_token=tok, table_id=tid, wanted_sources=sources_set
+                )
+                union.update(k for k in record_by_source.keys() if k in sources_set)
+            except FeishuContentError as exc:
+                logger.warning(
+                    "feishu_data_table_existing_lookup_target_failed",
+                    app_token=tok, error=str(exc),
+                )
+                continue
+        return union
 
     async def bulk_insert_raw_items(
         self,
         *,
         items: list[tuple[RawItem, Optional[str], Optional[str]]],
         run_id: int,
-    ) -> dict[str, int]:
-        """把一批 RawItem 写入 Data 表。
+    ) -> dict[str, Any]:
+        """把一批 RawItem 写入所有目标 Data 表(广播)。
+
+        Phase 35 PR-35-D: 多目标广播写入。
+          * 每个 target 独立 dedup + 独立 batch_create
+          * 任一 target 失败 → log warning + 跳过该 target,不影响其它
+          * 返回 ``targets`` list 包含每个目标的统计
 
         Args:
           items: list of ``(item, source_name, source_type)`` tuples。
-                 - dataclass path: ``(item, None, None)`` — connector 产出,``item.source`` 已有 slug
+                 - dataclass path: ``(item, None, None)`` — connector 产出,``item.source`` 有 slug
                  - ORM path: ``(item, source_name, source_type)`` — DB 读出,caller 必须预 JOIN
-                  拿到 ``Source.name`` / ``Source.type``
+                 拿到 ``Source.name`` / ``Source.type``
 
         Returns:
-          ``{"inserted": N, "skipped_duplicate": M}``。
+          ``{
+            "inserted": N,                # unique items landed in ≥1 target
+            "inserted_rows": M,           # total rows broadcast across all targets
+            "skipped_duplicate": K,       # items not landed in any target
+            "targets": [                  # per-target stats
+              {"app_token": "...", "table_id": "...",
+               "inserted": N1, "skipped_duplicate": K1,
+               "error": None | "..."},
+              ...
+            ]
+          }``
         """
         if not items:
-            return {"inserted": 0, "skipped_duplicate": 0}
+            return {
+                "inserted": 0,
+                "inserted_rows": 0,
+                "skipped_duplicate": 0,
+                "targets": [],
+            }
 
-        # 预查去重(主键 = source_slug:external_id)
         primary_keys = [
             _primary_key_for(it, source_name=sn) for it, sn, _st in items
         ]
-        existing = await self.existing_sources(primary_keys)
-
-        new_pairs = [
-            (it, sn, st) for (it, sn, st), pk in zip(items, primary_keys)
-            if pk and pk not in existing
-        ]
-        skipped = len(items) - len(new_pairs)
-
-        if not new_pairs:
-            return {"inserted": 0, "skipped_duplicate": skipped}
 
         try:
-            _, table_id = await self.ensure_table()
+            targets = await self.ensure_table()
         except FeishuContentError as exc:
             logger.warning(
                 "feishu_data_table_ensure_failed_skip_insert",
                 error=str(exc),
-                n=len(new_pairs),
+                n=len(items),
             )
-            return {"inserted": 0, "skipped_duplicate": skipped}
+            return {
+                "inserted": 0,
+                "inserted_rows": 0,
+                "skipped_duplicate": len(items),
+                "targets": [],
+            }
+        if not targets:
+            return {
+                "inserted": 0,
+                "inserted_rows": 0,
+                "skipped_duplicate": len(items),
+                "targets": [],
+            }
 
         records = [
             {
@@ -447,27 +590,104 @@ class DataTableClient:
                     source_name=sn, source_type=st,
                 )
             }
-            for it, sn, st in new_pairs
+            for it, sn, st in items
         ]
-        try:
-            inserted = await self._bitable.batch_create_records(
-                table_id=table_id, records=records
-            )
-        except FeishuContentError as exc:
-            logger.error(
-                "feishu_data_table_bulk_insert_failed",
-                error=str(exc),
-                n=len(records),
-            )
-            return {"inserted": 0, "skipped_duplicate": skipped}
 
+        # PR-35-D: 每个 target 独立 dedup + 独立 insert
+        landed: set[str] = set()  # 主键集合 — 至少落到一个 target 的
+        target_stats: list[dict[str, Any]] = []
+        rows_broadcast = 0
+
+        for tok, tid in targets:
+            # Per-target dedup:这个 target 里已有 → 跳过
+            try:
+                existing_for_target = await self._fetch_records_by_sources(
+                    app_token=tok,
+                    table_id=tid,
+                    wanted_sources={pk for pk in primary_keys if pk},
+                )
+            except FeishuContentError as exc:
+                logger.warning(
+                    "feishu_data_table_per_target_dedup_failed",
+                    app_token=tok, table_id=tid, error=str(exc),
+                )
+                # dedup 失败 → 当作"全空"继续尝试 insert(可能重复,FAA)
+                existing_for_target = {}
+
+            existing_set = {
+                k for k in existing_for_target.keys() if k in set(primary_keys)
+            }
+            skipped_this_target = sum(
+                1 for pk in primary_keys if pk in existing_set
+            )
+
+            # 只 insert 不在该 target 里的
+            records_to_write = [
+                rec for rec, pk in zip(records, primary_keys)
+                if not pk or pk not in existing_set
+            ]
+            pks_to_write = [pk for pk in primary_keys if pk and pk not in existing_set]
+
+            if not records_to_write:
+                target_stats.append({
+                    "app_token": tok,
+                    "table_id": tid,
+                    "inserted": 0,
+                    "skipped_duplicate": skipped_this_target,
+                    "error": None,
+                })
+                continue
+
+            try:
+                inserted_n = await self._bitable.batch_create_records(
+                    app_token=tok,
+                    table_id=tid,
+                    records=records_to_write,
+                )
+                landed.update(pks_to_write)
+                rows_broadcast += inserted_n
+                target_stats.append({
+                    "app_token": tok,
+                    "table_id": tid,
+                    "inserted": inserted_n,
+                    "skipped_duplicate": skipped_this_target,
+                    "error": None,
+                })
+                logger.info(
+                    "feishu_data_table_target_inserted",
+                    app_token=tok, table_id=tid,
+                    inserted=inserted_n, skipped=skipped_this_target,
+                    run_id=run_id,
+                )
+            except FeishuContentError as exc:
+                logger.error(
+                    "feishu_data_table_target_insert_failed",
+                    app_token=tok, table_id=tid,
+                    error=str(exc), n=len(records_to_write),
+                )
+                target_stats.append({
+                    "app_token": tok,
+                    "table_id": tid,
+                    "inserted": 0,
+                    "skipped_duplicate": skipped_this_target,
+                    "error": str(exc),
+                })
+
+        skipped_duplicate = len(items) - len(landed)
         logger.info(
-            "feishu_data_table_inserted",
-            inserted=inserted,
-            skipped_duplicate=skipped,
+            "feishu_data_table_broadcast_done",
+            inserted=len(landed),
+            inserted_rows=rows_broadcast,
+            skipped_duplicate=skipped_duplicate,
+            n_targets=len(targets),
             run_id=run_id,
         )
-        return {"inserted": inserted, "skipped_duplicate": skipped}
+        return {
+            "inserted": len(landed),
+            "inserted_rows": rows_broadcast,
+            "skipped_duplicate": skipped_duplicate,
+            "targets": target_stats,
+        }
 
     # ------------------------------------------------------------------
     # Screening backfill
@@ -477,23 +697,26 @@ class DataTableClient:
         *,
         mapping: dict[str, dict[str, Any]],
     ) -> int:
-        """Screening 后回填。
+        """Screening 后回填到所有目标 Data 表(广播)。
+
+        Phase 35 PR-35-D: 多目标 — 每个 target 都更新一次,任一失败不影响其它。
+        返回 aggregate updated count(去重 — 一个 item 落在多个 target 也只算 1)。
 
         Args:
           mapping: ``{primary_key: {"Category": ..., "Score": ..., "Opportunity ID": ...}}``
                    主键 = ``"source:external_id"``(同 ``_primary_key_for``)。
 
         Returns:
-          实际更新的行数。
+          实际更新的目标表数 × 命中行数(去重后算 unique updates)。
 
         Notes:
           飞书 Bitable update_record 必须有 record_id,所以先 list_records
-          按主键查 → 再 update_record。一行一个调用,并发用 asyncio.gather。
+          按主键查 → 再 update_record。一行一个调用,**串行**(避免 1254291 写冲突)。
         """
         if not mapping:
             return 0
         try:
-            _, table_id = await self.ensure_table()
+            targets = await self.ensure_table()
         except FeishuContentError as exc:
             logger.warning(
                 "feishu_data_table_ensure_failed_skip_backfill",
@@ -501,77 +724,62 @@ class DataTableClient:
                 n=len(mapping),
             )
             return 0
+        if not targets:
+            return 0
 
-        # 按 Source 批量查 record_id。
-        # Phase 33 PR-33-B: 单次翻页整张表(本地 filter wanted_sources),
-        # 不再每主键一次 list_records。
-        try:
-            record_id_by_source = await self._fetch_records_by_sources(
-                table_id=table_id,
-                wanted_sources=set(mapping.keys()),
-            )
-        except FeishuContentError as exc:
-            logger.warning(
-                "feishu_data_table_lookup_for_update_failed",
-                error=str(exc),
-                n=len(mapping),
-            )
-            record_id_by_source = {}
+        # 跨所有 target 累计 unique updates
+        total_unique = 0
 
-        # 并发 update
-        import asyncio
-
-        async def _one(src_key: str, payload: dict[str, Any]) -> bool:
-            rid = record_id_by_source.get(src_key)
-            if not rid:
-                return False
+        for tok, tid in targets:
+            # Per-target: 按 Source 批量查 record_id
             try:
-                await self._bitable.update_record(
-                    table_id=table_id,
-                    record_id=rid,
-                    fields=payload,
+                record_id_by_source = await self._fetch_records_by_sources(
+                    app_token=tok,
+                    table_id=tid,
+                    wanted_sources=set(mapping.keys()),
                 )
-                return True
             except FeishuContentError as exc:
                 logger.warning(
-                    "feishu_data_table_update_record_failed",
-                    source_key=src_key,
-                    error=str(exc),
+                    "feishu_data_table_lookup_for_update_target_failed",
+                    app_token=tok, error=str(exc),
                 )
-                return False
+                continue
 
-        # Phase 32 PR-32-A: serial (not concurrent) updates.
-        #
-        # 飞书 Bitable 多维表格底层串行处理同一文档的写接口 — ``asyncio.gather``
-        # 并发 N 个 ``update_record`` 会触发 ``code=1254291 "Write conflict"``。
-        # 改成顺序 for 循环,每行单独 ``try/except``,update 失败计数记 metric。
-        # 实际耗时:`Screening` 一次 /run 写 ~10-30 行,串行开销 ~300-900ms,
-        # 但避免了并发冲突的 hard fail — 净收益。
-        updated = 0
-        failed = 0
-        for src_key, payload in mapping.items():
-            ok = await _one(src_key, payload)
-            if ok:
-                updated += 1
-            else:
-                failed += 1
-        logger.info(
-            "feishu_data_table_backfilled",
-            updated=updated,
-            failed=failed,
-            requested=len(mapping),
-        )
-        # Prometheus counter — 用 ``record_external_error(provider='feishu', ...)``
-        # 走现成标签轴,运营可在 ``/metrics`` 看 ``radar_external_service_errors_total``
-        # 是否突然飙升(踩 1254291 的早期信号)。
-        if failed:
-            from app.metrics import record_external_error
-
-            record_external_error(
-                provider="feishu_data_table",
-                kind="update_record_failed",
+            updated_target = 0
+            failed_target = 0
+            for src_key, payload in mapping.items():
+                rid = record_id_by_source.get(src_key)
+                if not rid:
+                    continue
+                try:
+                    await self._bitable.update_record(
+                        app_token=tok,
+                        table_id=tid,
+                        record_id=rid,
+                        fields=payload,
+                    )
+                    updated_target += 1
+                except FeishuContentError as exc:
+                    logger.warning(
+                        "feishu_data_table_update_record_failed",
+                        app_token=tok, source_key=src_key, error=str(exc),
+                    )
+                    failed_target += 1
+            total_unique += updated_target
+            logger.info(
+                "feishu_data_table_target_backfilled",
+                app_token=tok, table_id=tid,
+                updated=updated_target, failed=failed_target,
+                requested=len(mapping),
             )
-        return updated
+            if failed_target:
+                from app.metrics import record_external_error
+                record_external_error(
+                    provider="feishu_data_table",
+                    kind="update_record_failed",
+                )
+
+        return total_unique
 
     # ------------------------------------------------------------------
     # Phase 31 — ORM path + 全量回填
@@ -651,9 +859,11 @@ class DataTableClient:
             }
 
         result = await self.bulk_insert_raw_items(items=pairs, run_id=run_id)
+        # PR-35-D: result 现在含 inserted / inserted_rows / skipped_duplicate / targets。
+        # ORM 路径只关心 unique + skipped,丢弃 inserted_rows / targets 让外层看到干净结构。
         return {
-            "inserted": result["inserted"],
-            "skipped_duplicate": result["skipped_duplicate"],
+            "inserted": result.get("inserted", 0),
+            "skipped_duplicate": result.get("skipped_duplicate", 0),
             "skipped_orphan": orphan,
         }
 
@@ -665,7 +875,7 @@ class DataTableClient:
         chunk_size: int = 500,
         run_id_label: int = 0,
         on_progress: Optional[OnProgress] = None,
-    ) -> dict[str, int]:
+    ) -> dict[str, Any]:
         """全量(回填)把存量 RawItem 推 Data 表 — Phase 31 P31-A。
 
         与 ``_write_data_table``(只取 ``fetched_at >= run.started_at``)
@@ -673,11 +883,19 @@ class DataTableClient:
           * ``since`` 可选 — 不传 = 全部历史
           * 分批游标(按 id 升序)避免大表 OOM
           * ``on_progress(inserted_so_far, total)`` 异步回调,CLI 用来打进度
+          * Phase 35 PR-35-D:多目标广播 — 每个 chunk 写入所有目标表
 
-        主键去重仍走 ``existing_sources``,**幂等** — 重跑不重复。
+        主键去重仍走 per-target dedup,**幂等** — 重跑不重复。
 
         Returns:
-          ``{"inserted", "skipped_duplicate", "skipped_orphan", "scanned"}``
+          ``{
+            "inserted": N,                # unique items landed in ≥1 target
+            "inserted_rows": M,           # broadcast row sum across targets
+            "skipped_duplicate": K,
+            "skipped_orphan": O,
+            "scanned": S,
+            "targets": [...]              # per-target aggregate stats
+          }``
         """
         # 1. 估算总数(给进度用;SQLite 不支持 subquery count,简化:跑一次 SELECT id)
         count_stmt = _sa_select(ORMRawItem.id)
@@ -692,17 +910,22 @@ class DataTableClient:
             )
             return {
                 "inserted": 0,
+                "inserted_rows": 0,
                 "skipped_duplicate": 0,
                 "skipped_orphan": 0,
                 "scanned": 0,
+                "targets": [],
             }
 
         # 2. 分批游标(按 id 升序;chunk_size 默认 500,与 Feishu batch_create 上限一致)
         last_id = 0
         inserted_total = 0
+        inserted_rows_total = 0
         skipped_dup_total = 0
         skipped_orphan_total = 0
         scanned_total = 0
+        # PR-35-D: 跨 chunk 聚合 per-target 统计 — 用 app_token 当 key
+        target_aggregate: dict[str, dict[str, Any]] = {}
 
         while True:
             # LEFT JOIN Source — 没有 Source 的孤儿显式 ``None`` 而不是被过滤,
@@ -732,8 +955,27 @@ class DataTableClient:
                 result = await self.bulk_insert_raw_items(
                     items=pairs, run_id=run_id_label
                 )
-                inserted_total += result["inserted"]
-                skipped_dup_total += result["skipped_duplicate"]
+                inserted_total += result.get("inserted", 0)
+                inserted_rows_total += result.get("inserted_rows", 0)
+                skipped_dup_total += result.get("skipped_duplicate", 0)
+                # 聚合 per-target 统计 — 跨 chunk 累计 inserted / skipped_duplicate,
+                # 保留最后一次 error 消息(便于 task_runner 显示广播明细)。
+                # 单 chunk 场景下 == bulk_insert_raw_items 返回的 ts["error"] 直接透传。
+                for ts in result.get("targets", []):
+                    key = ts.get("app_token", "?")
+                    agg = target_aggregate.setdefault(key, {
+                        "app_token": key,
+                        "table_id": ts.get("table_id"),
+                        "inserted": 0,
+                        "skipped_duplicate": 0,
+                        "error": None,
+                    })
+                    agg["inserted"] += ts.get("inserted", 0)
+                    agg["skipped_duplicate"] += ts.get("skipped_duplicate", 0)
+                    chunk_error = ts.get("error")
+                    if chunk_error:
+                        # last-wins — 任何 chunk 失败都把最近一次错误消息记下
+                        agg["error"] = chunk_error
             scanned_total += len(rows)
 
             last_id = rows[-1][0].id
@@ -753,16 +995,20 @@ class DataTableClient:
         logger.info(
             "feishu_data_table_unbounded_done",
             inserted=inserted_total,
+            inserted_rows=inserted_rows_total,
             skipped_duplicate=skipped_dup_total,
             skipped_orphan=skipped_orphan_total,
             scanned=scanned_total,
+            n_targets=len(target_aggregate),
             since=since.isoformat() if since else None,
         )
         return {
             "inserted": inserted_total,
+            "inserted_rows": inserted_rows_total,
             "skipped_duplicate": skipped_dup_total,
             "skipped_orphan": skipped_orphan_total,
             "scanned": scanned_total,
+            "targets": list(target_aggregate.values()),
         }
 
 

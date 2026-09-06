@@ -1410,11 +1410,14 @@ async def _source_health_snapshot(
         "healthy": sum(1 for i in items if i["healthy"]),
         "items": items,
     }
-    # Phase 35 PR-35-B: 顶层 data_view_url 单一 URL(不是 per-source —
-    # Feishu 不支持按 Source 字段深链过滤)。lazy 解析,失败静默。
+    # Phase 35 PR-35-B: 顶层 data_view_url 单一 URL(向后兼容 — 取第一个 target)
+    # Phase 35 PR-35-D: 同时给 data_view_urls 列表,所有 target 都返回
     if include_data_view_url:
-        out["data_view_url"] = await _resolve_data_view_url(get_settings())
+        urls = await _resolve_data_view_urls(get_settings())
+        out["data_view_urls"] = urls
+        out["data_view_url"] = urls[0] if urls else None
     else:
+        out["data_view_urls"] = []
         out["data_view_url"] = None
     return out
 
@@ -1424,42 +1427,53 @@ async def _source_health_snapshot(
 # ---------------------------------------------------------------------------
 import time as _time_mod
 
-_DATA_VIEW_URL_CACHE: dict[str, Any] = {"url": None, "expires_at": 0.0}
+_DATA_VIEW_URL_CACHE: dict[str, Any] = {"urls": None, "expires_at": 0.0}
 _DATA_VIEW_URL_TTL_SEC = 300  # 5 分钟
 
 
-async def _resolve_data_view_url(settings: Any) -> Optional[str]:
-    """Resolve Feishu Data 表视图 URL,带 5 分钟 TTL 缓存。
+async def _resolve_data_view_urls(settings: Any) -> list[str]:
+    """Phase 35 PR-35-D: 解析所有目标 Data 表视图 URL(每个 target 一条)。
 
-    URL 形如 ``https://feishu.cn/base/<app_token>?table=<table_id>``。
+    每个 URL 形如 ``https://feishu.cn/base/<app_token>?table=<table_id>``。
     首次调用会触发 ``DataTableClient.ensure_table``(可能打飞书),后续
-    5 分钟内复用。任何异常 log warning,返回 None — 主流程不依赖。
+    5 分钟内复用。任何异常 log warning,返回 ``[]`` — 主流程不依赖。
+
+    Phase 35 PR-35-D: 返回 list — 多目标广播时,bot 卡片要展示每张表。
     """
     now = _time_mod.time()
-    cached_url = _DATA_VIEW_URL_CACHE.get("url")
+    cached = _DATA_VIEW_URL_CACHE.get("urls")
     expires_at = _DATA_VIEW_URL_CACHE.get("expires_at") or 0.0
-    if cached_url and now < expires_at:
-        return cached_url
+    if cached is not None and now < expires_at:
+        return list(cached)
     try:
         from app.services.feishu.app_client import FeishuAppClient
         from app.services.feishu.data_table import DataTableClient
 
         app_client = FeishuAppClient(settings=settings)
         dtc = DataTableClient(app_client=app_client, settings=settings)
-        app_token, table_id = await dtc.ensure_table()
-        token = (
-            getattr(settings, "feishu_bitable_data_app_token", "") or ""
-        ).strip()
-        if token and table_id:
-            url = f"https://feishu.cn/base/{token}?table={table_id}"
-            _DATA_VIEW_URL_CACHE["url"] = url
-            _DATA_VIEW_URL_CACHE["expires_at"] = now + _DATA_VIEW_URL_TTL_SEC
-            return url
+        targets = await dtc.ensure_table()  # list[(app_token, table_id)]
+        urls: list[str] = []
+        for tok, tid in targets:
+            if tok and tid:
+                urls.append(f"https://feishu.cn/base/{tok}?table={tid}")
+        _DATA_VIEW_URL_CACHE["urls"] = urls
+        _DATA_VIEW_URL_CACHE["expires_at"] = now + _DATA_VIEW_URL_TTL_SEC
+        return urls
     except Exception as exc:  # noqa: BLE001 — /sources 不能因为飞书 down 而 500
         logger.warning(
             "feishu_data_view_url_resolve_failed", error=str(exc)
         )
-    return None
+    return []
+
+
+async def _resolve_data_view_url(settings: Any) -> Optional[str]:
+    """Phase 35 PR-35-D: backward-compat 单 URL resolver。
+
+    等同 ``(_resolve_data_view_urls(settings) or [None])[0]`` — 旧 caller
+    (bot 卡片 / 单数字段)仍能拿到一个 URL。**新代码请用 ``_resolve_data_view_urls``**。
+    """
+    urls = await _resolve_data_view_urls(settings)
+    return urls[0] if urls else None
 
 
 async def _signal_total(session: AsyncSession) -> int:

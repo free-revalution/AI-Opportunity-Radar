@@ -424,10 +424,21 @@ async def _execute_data_table_sync(
                 inserted = int(record.result_summary.get("inserted", 0))
                 skipped = int(record.result_summary.get("skipped_duplicate", 0))
                 scanned = int(record.result_summary.get("scanned", 0))
+                inserted_rows = int(record.result_summary.get("inserted_rows", 0))
+                targets_list = record.result_summary.get("targets") or []
+                # PR-35-D: 多目标时,在主消息后追加 per-target 简报
                 msg_text = (
                     f"✅ Data sync done "
                     f"({inserted} new, {skipped} dup, {scanned} scanned)"
                 )
+                if len(targets_list) > 1:
+                    msg_text += f"\n广播 {inserted_rows} 行到 {len(targets_list)} 张表:"
+                    for ts in targets_list[:5]:
+                        tok_short = (ts.get("app_token") or "?")[:10]
+                        ins = int(ts.get("inserted", 0))
+                        msg_text += f"\n  • {tok_short}… +{ins}"
+                    if len(targets_list) > 5:
+                        msg_text += f"\n  • …还有 {len(targets_list) - 5} 张"
             else:
                 msg_text = f"❌ Data sync failed: {record.error}"
             await FeishuAppClient(settings=settings).send_message(

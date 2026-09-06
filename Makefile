@@ -18,7 +18,7 @@ BACKEND_DIR  := backend
 
 .PHONY: help install-backend dev-backend test-backend migrate \
         docker-up docker-down docker-logs clean \
-        n8n-sync n8n-validate metrics-scrape
+        n8n-sync n8n-validate metrics-scrape e2e-smoke
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-22s\033[0m %s\n", $$1, $$2}'
@@ -58,3 +58,6 @@ n8n-sync: ## Push n8n/workflows/*.json into the running n8n container (activate)
 
 metrics-scrape: ## Curl the Prometheus metrics endpoint and grep for radar_*
 	@curl -sf http://localhost:8000/api/metrics | grep '^radar_' | head -40 || echo "(backend not running on localhost:8000)"
+
+e2e-smoke: ## Phase 35 PR-35-D: POST /data_table/sync + poll /task/{id}, verify all targets wrote
+	cd $(BACKEND_DIR) && $(PYTHON) -m scripts.e2e_smoke
