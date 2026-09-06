@@ -509,3 +509,132 @@ async def test_router_sources_handles_no_enabled_sources():
     router = _make_router(handler)
     reply = await router.route(BotCommand(kind="sources"))
     assert "当前没有启用的信息源" in reply.text
+
+
+# ---------------------------------------------------------------------------
+# Phase 36 — /top dispatcher (one-shot Top-N signal card)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "text,expected_kind,expected_args",
+    [
+        ("/top", "top", ""),
+        ("/top 3", "top", "3"),
+        ("/top 12", "top", "12"),
+        ("/热门", "top", ""),
+        ("/热点", "top", ""),
+    ],
+)
+def test_parse_command_top_aliases(text: str, expected_kind: str, expected_args: str):
+    cmd = parse_command(text)
+    assert cmd.kind == expected_kind
+    assert cmd.args == expected_args
+
+
+def _top_payload(n: int) -> dict:
+    return {
+        "items": [
+            {
+                "id": i + 1,
+                "title": f"Opportunity #{i + 1}",
+                "slug": f"opp-{i + 1}",
+                "total_score": 90.0 - i * 3,
+                "category": "ai",
+                "source_count": 3 + i,
+                "summary": f"Summary line for opp {i + 1}.",
+            }
+            for i in range(n)
+        ],
+        "count": n,
+    }
+
+
+async def test_router_top_returns_interactive_card():
+    """`/top` returns an interactive IM card with one button per opp."""
+
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["query"] = request.url.query.decode()
+        if request.url.path == "/api/internal/opportunities/top":
+            return _ok_json(_top_payload(3))
+        return httpx.Response(404)
+
+    router = _make_router(handler)
+    reply = await router.route(BotCommand(kind="top", args="3"))
+
+    assert seen["path"] == "/api/internal/opportunities/top"
+    assert "n=3" in seen["query"]
+    # — Card payload shape
+    assert reply.card is not None
+    card = reply.card
+    assert card["header"]["template"] == "blue"
+    assert "Top-N" in card["header"]["title"]["content"]
+    # — 3 rows × (1 div + 1 action) + 1 footer note
+    action_elements = [el for el in card["elements"] if el.get("tag") == "action"]
+    assert len(action_elements) == 3
+    for el in action_elements:
+        button = el["actions"][0]
+        assert button["tag"] == "button"
+        assert button["text"]["content"] == "生成报告"
+        assert button["value"]["action"] == "write_detail_docx"
+        assert button["value"]["opportunity_id"] in {1, 2, 3}
+    # — Metadata
+    assert reply.metadata["command"] == "top"
+    assert reply.metadata["items_count"] == 3
+    assert reply.metadata["n"] == 3
+    assert reply.metadata["via"] == "phase36_top_card"
+    # — Plain-text fallback still present
+    assert "Top-3" in reply.text
+
+
+async def test_router_top_clamps_n_to_endpoint_range():
+    """Non-numeric / out-of-range args fall back to defaults within [1, 20]."""
+
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["query"] = request.url.query.decode()
+        if request.url.path == "/api/internal/opportunities/top":
+            return _ok_json(_top_payload(5))
+        return httpx.Response(404)
+
+    router = _make_router(handler)
+
+    # — Garbage arg → default 5
+    reply = await router.route(BotCommand(kind="top", args="garbage"))
+    assert "n=5" in seen["query"]
+    assert reply.metadata["n"] == 5
+
+    # — n=99 → clamped to 20
+    await router.route(BotCommand(kind="top", args="99"))
+    assert "n=20" in seen["query"]
+
+    # — n=0 → clamped to 1
+    await router.route(BotCommand(kind="top", args="0"))
+    assert "n=1" in seen["query"]
+
+
+async def test_router_top_handles_empty_items():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/internal/opportunities/top":
+            return _ok_json({"items": [], "count": 0})
+        return httpx.Response(404)
+
+    router = _make_router(handler)
+    reply = await router.route(BotCommand(kind="top"))
+    assert reply.card is None
+    assert "没有可显示" in reply.text
+    assert reply.metadata["items_count"] == 0
+    assert reply.metadata.get("error") is not True
+
+
+async def test_router_top_handles_http_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"detail": "downstream unavailable"})
+
+    router = _make_router(handler)
+    reply = await router.route(BotCommand(kind="top"))
+    assert reply.card is None
+    assert "暂时无法获取" in reply.text
+    assert reply.metadata.get("error") is True

@@ -61,13 +61,13 @@ def upgrade() -> None:
             "created_at",
             sa.DateTime(timezone=True),
             nullable=False,
-            server_default=sa.text("now()"),
+            server_default=sa.func.current_timestamp(),
         ),
         sa.Column(
             "updated_at",
             sa.DateTime(timezone=True),
             nullable=False,
-            server_default=sa.text("now()"),
+            server_default=sa.func.current_timestamp(),
         ),
     )
 
@@ -97,7 +97,7 @@ def upgrade() -> None:
             "created_at",
             sa.DateTime(timezone=True),
             nullable=False,
-            server_default=sa.text("now()"),
+            server_default=sa.func.current_timestamp(),
         ),
         sa.Column("used_at", sa.DateTime(timezone=True), nullable=True),
     )
@@ -125,7 +125,7 @@ def upgrade() -> None:
             "created_at",
             sa.DateTime(timezone=True),
             nullable=False,
-            server_default=sa.text("now()"),
+            server_default=sa.func.current_timestamp(),
             index=True,
         ),
     )

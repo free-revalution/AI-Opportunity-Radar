@@ -52,7 +52,7 @@ def upgrade() -> None:
             "added_at",
             sa.DateTime(timezone=True),
             nullable=False,
-            server_default=sa.text("now()"),
+            server_default=sa.func.current_timestamp(),
         ),
     )
     op.create_index("ix_signal_sources_signal", "signal_sources", ["signal_id"])
@@ -95,13 +95,13 @@ def upgrade() -> None:
             "created_at",
             sa.DateTime(timezone=True),
             nullable=False,
-            server_default=sa.text("now()"),
+            server_default=sa.func.current_timestamp(),
         ),
         sa.Column(
             "updated_at",
             sa.DateTime(timezone=True),
             nullable=False,
-            server_default=sa.text("now()"),
+            server_default=sa.func.current_timestamp(),
         ),
     )
     op.create_index(

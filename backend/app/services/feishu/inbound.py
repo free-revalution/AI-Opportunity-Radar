@@ -420,6 +420,10 @@ _COMMAND_ALK: dict[str, str] = {
     # in both English and Chinese.
     "/docs": "docs",
     "/文档": "docs",
+    # Phase 36 — /top — one-shot Top-N signal card (no pipeline run).
+    "/top": "top",
+    "/热门": "top",
+    "/热点": "top",
 }
 
 
@@ -695,6 +699,8 @@ class FeishuCommandRouter:
             reply = await self._status()
         elif command.kind == "sources":
             reply = await self._sources()
+        elif command.kind == "top":
+            reply = await self._top(command.args)
         elif command.kind == "docs":
             reply = await self._docs(command.args)
         else:
@@ -987,6 +993,66 @@ class FeishuCommandRouter:
         return CommandReply(
             text="\n".join(lines),
             metadata={"command": "sources", "count": len(items)},
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 36 — /top (one-shot Top-N signal card)
+    # ------------------------------------------------------------------
+    async def _top(self, args: str) -> CommandReply:
+        """`/top [n]` — synchronous Top-N opportunities → IM 交互卡片.
+
+        Phase 36 设计意图:
+          * 不跑 pipeline,直接 GET ``/api/internal/opportunities/top?n=N``
+            (默认 5,限制 1..20),把结果渲染成 ``task_runner._build_top_n_signal_card``
+            的 IM 卡片,带 ``[生成报告]`` 按钮 — 按钮 callback 复用 Phase 30 PR-4b
+            的 ``card_actions.handle_card_action_trigger``.
+          * 失败回退纯文本,不让用户对着 bot 干瞪眼。
+
+        ``/top`` 与 ``/today`` 的区别:
+          * ``/today`` 走 ``view_top_signals`` 配额(SADD-distinct)且只
+            返回纯文本 + 单行 summary;
+          * ``/top`` 直接出可点按钮的卡片(让运营一键写详情 Docx)。
+        """
+        from app.services.feishu.task_runner import (
+            _build_top_n_signal_card,
+        )
+
+        # — Parse optional `n` arg (default 5, capped at 20 to match the
+        # endpoint's clamp). Non-numeric args fall back to default.
+        n = 5
+        if args:
+            try:
+                n = int(args.strip().split()[0])
+            except (TypeError, ValueError):
+                n = 5
+        n = max(1, min(n, 20))
+
+        result = await self._get(f"/api/internal/opportunities/top?n={n}")
+        if result.get("_status", 200) >= 400:
+            return CommandReply(
+                text="⚠️ 暂时无法获取 Top 机会,请稍后重试。",
+                metadata={"command": "top", "error": True},
+            )
+        items = result.get("items") or []
+        if not items:
+            return CommandReply(
+                text="📭 当前没有可显示的 Top 机会(可能尚未跑过 /run)。",
+                metadata={"command": "top", "items_count": 0},
+            )
+
+        card = _build_top_n_signal_card(
+            opportunities=items,
+            task_id="sync-top",
+        )
+        return CommandReply(
+            text=f"🔥 Top-{len(items)} 机会信号",
+            card=card,
+            metadata={
+                "command": "top",
+                "items_count": len(items),
+                "n": n,
+                "via": "phase36_top_card",
+            },
         )
 
     async def _docs(self, args: str) -> CommandReply:
