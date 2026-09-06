@@ -83,6 +83,38 @@ class FakeDrive:
         self.created.append(result)
         return result
 
+    async def list_children(self, *, folder_token: str) -> list[dict[str, Any]]:
+        # — (folder_token, name) → token 里查 folder_token 下的 child
+        # Fake 用 ensure_folder_path 注册的 key 是 (cur, name);要反查 cur
+        # 下的 name 是 (cur, *) 的所有 key,需要从 folder_token 反查到
+        # 所有 parent 是 folder_token 的 key。最简单:扫描所有 keys。
+        out: list[dict[str, Any]] = []
+        # — 反向索引:token → (parent, name)
+        if not hasattr(self, "_rev"):
+            self._rev = {tok: (p, n) for (p, n), tok in self._folders.items()}
+        for (parent, name), tok in self._folders.items():
+            if parent == folder_token:
+                out.append({"token": tok, "name": name})
+        return out
+
+    async def delete_file(
+        self, *, file_token: str, file_type: str = "folder"
+    ) -> dict[str, Any]:
+        # 反向删
+        to_drop: list[tuple[str, str]] = []
+        for (parent, name), tok in self._folders.items():
+            if tok == file_token:
+                to_drop.append((parent, name))
+        for key in to_drop:
+            self._folders.pop(key, None)
+        self._counter += 1
+        return {"task_id": f"task_{self._counter}", "file_token": file_token}
+
+    async def poll_delete_task(
+        self, *, task_id: str, timeout: float = 5.0
+    ) -> dict[str, Any]:
+        return {"task_id": task_id, "status": "success"}
+
 
 class FakeRedis:
     """Tiny SETNX/GET fake — same surface as the Redis client wrapper."""

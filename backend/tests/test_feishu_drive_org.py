@@ -98,11 +98,38 @@ class FakeDriveClient:
         folder_token: str | None = None,
     ) -> dict[str, Any]:
         self._doc_counter += 1
+        # — 注册 docx 到 folder_token 的 children 里,这样 list_children
+        # 看见非空,``cleanup_empty_day_folders`` 才不会误删。
+        if folder_token and folder_token != self.folder_token:
+            self._folders.setdefault(
+                (folder_token, f"{title}.docx"), f"doc_{self._doc_counter}"
+            )
         return {
             "doc_id": f"doc_{self._doc_counter}_{title[:10]}",
             "url": f"https://feishu.cn/docx/doc_{self._doc_counter}",
             "folder_token": folder_token or self.folder_token,
         }
+
+    async def delete_file(
+        self, *, file_token: str, file_type: str = "folder"
+    ) -> dict[str, Any]:
+        # — 删 folder:把 _folders 里 (parent, name) → token 的对应项 drop。
+        # 任意 parent 下 name 是 file_token 的(即 token 当 name 用)找不到 —
+        # 我们的 fake 是 (parent, name) 主键,token 是 value,所以反查:
+        to_drop: list[tuple[str, str]] = []
+        for (parent, name), tok in self._folders.items():
+            if tok == file_token:
+                to_drop.append((parent, name))
+        for key in to_drop:
+            self._folders.pop(key, None)
+        self._counter += 1
+        return {"task_id": f"task_{self._counter}", "file_token": file_token}
+
+    async def poll_delete_task(
+        self, *, task_id: str, timeout: float = 5.0
+    ) -> dict[str, Any]:
+        # Fake — 永远 immediate success
+        return {"task_id": task_id, "status": "success"}
 
 
 def _fake_settings(root: str = "root_folder_token") -> Any:
@@ -447,6 +474,120 @@ async def test_seconds_until_midnight_utc_basic() -> None:
     late = datetime(2026, 8, 31, 23, 59, 30, tzinfo=timezone.utc)
     secs = _seconds_until_midnight_utc(now=late)
     assert secs == 60  # 30s 不到 → 兜底 60s
+
+
+# ---------------------------------------------------------------------------
+# Phase 35 PR-follow-up: 空 day-folder 清理(用户原话:空日期目录)
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_delete_day_folder_if_empty_deletes_when_no_children() -> None:
+    """空 day_folder(0 children) → 删除成功,return True。"""
+    drive = FakeDriveClient()
+    # 预建一个 2026-09-05 的空子目录(没文件)
+    daily_root = await drive.create_folder(
+        name=SECTION_DAILY, parent_token="root_folder_token"
+    )
+    await drive.create_folder(
+        name="2026-09-05", parent_token=daily_root
+    )
+
+    service = DriveOrgService(drive=drive)
+    deleted = await service.delete_day_folder_if_empty(day=date(2026, 9, 5))
+    assert deleted is True
+
+    # 文件夹已不在了
+    children = await drive.list_children(folder_token=daily_root)
+    names = {c["name"] for c in children}
+    assert "2026-09-05" not in names
+
+
+@pytest.mark.asyncio
+async def test_delete_day_folder_if_empty_keeps_when_has_children() -> None:
+    """非空 day_folder(里面有 docx) → 不删,return False。"""
+    drive = FakeDriveClient()
+    service = DriveOrgService(drive=drive, session=None)
+    # 写入 daily digest → 自动建 folder + 1 个 docx
+    await service.write_daily_digest(
+        day=date(2026, 9, 5),
+        markdown="# hello",
+    )
+    # folder 里现在有 1 个 docx → 不该被删
+    deleted = await service.delete_day_folder_if_empty(day=date(2026, 9, 5))
+    assert deleted is False
+
+
+@pytest.mark.asyncio
+async def test_write_daily_digest_docx_failure_cleans_up_empty_folder() -> None:
+    """用户原话场景: ``create_docx_from_markdown`` 失败 → 自动清空 day_folder。"""
+    drive = FakeDriveClient()
+    service = DriveOrgService(drive=drive, session=None)
+
+    # 1) 让 docx 创建抛异常
+    async def _boom(**_kwargs):
+        raise FeishuContentError("feishu 502 from docx api")
+
+    drive.create_docx_from_markdown = _boom  # type: ignore[assignment]
+
+    # 2) write_daily_digest 应该抛 — 关键是别让空 folder 留下
+    with pytest.raises(FeishuContentError, match="feishu 502"):
+        await service.write_daily_digest(
+            day=date(2026, 9, 5),
+            markdown="# hello",
+        )
+
+    # 3) 验证空 day_folder 已自动清理
+    daily_root = await drive.ensure_folder_path(
+        parent_token="root_folder_token", path=[SECTION_DAILY]
+    )
+    children = await drive.list_children(folder_token=daily_root)
+    names = {c["name"] for c in children}
+    # 2026-09-05 不应在(已删)
+    assert "2026-09-05" not in names
+
+
+@pytest.mark.asyncio
+async def test_cleanup_empty_day_folders_bulk_mixed() -> None:
+    """bulk 模式:扫到 N 个日期目录,只删空的,保留非空的。"""
+    drive = FakeDriveClient()
+    service = DriveOrgService(drive=drive, session=None)
+
+    # — 准备场景:
+    #   2026-09-01: 空 (手动建)
+    #   2026-09-02: 有 docx (来自 write_daily_digest)
+    #   2026-09-03: 空 (手动建)
+    #   README:   非日期名,忽略
+    daily_root = await drive.create_folder(
+        name=SECTION_DAILY, parent_token="root_folder_token"
+    )
+    await drive.create_folder(name="2026-09-01", parent_token=daily_root)
+    await drive.create_folder(name="2026-09-03", parent_token=daily_root)
+    await drive.create_folder(name="README.md", parent_token=daily_root)
+    await service.write_daily_digest(
+        day=date(2026, 9, 2), markdown="# 9-2"
+    )
+
+    summary = await service.cleanup_empty_day_folders()
+    assert summary["scanned"] == 3  # 3 个日期目录
+    assert summary["deleted"] == 2  # 09-01 + 09-03
+    assert summary["kept_with_children"] == 1  # 09-02 (有 docx)
+
+    # 验证 09-02 还在,09-01/03 不在了
+    remaining = await drive.list_children(folder_token=daily_root)
+    remaining_names = {c["name"] for c in remaining}
+    assert "2026-09-02" in remaining_names
+    assert "2026-09-01" not in remaining_names
+    assert "2026-09-03" not in remaining_names
+    # README.md (非日期格式) 不动
+    assert "README.md" in remaining_names
+
+
+@pytest.mark.asyncio
+async def test_cleanup_empty_day_folders_noop_when_daily_missing() -> None:
+    """📁 每日报告 段都还没建 → 安全 noop(返回 0/0/0)。"""
+    drive = FakeDriveClient()  # root 空
+    service = DriveOrgService(drive=drive)
+    summary = await service.cleanup_empty_day_folders()
+    assert summary == {"scanned": 0, "deleted": 0, "kept_with_children": 0}
 
 
 # ---------------------------------------------------------------------------

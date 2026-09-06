@@ -355,11 +355,25 @@ class DriveOrgService:
 
         # — Docx title — operators read this in the cloud drive UI.
         effective_title = (title or f"{day_str} AI 商业日报").strip()[:200]
-        created = await self.drive.create_docx_from_markdown(
-            title=effective_title,
-            markdown=markdown,
-            folder_token=day_folder,
-        )
+        try:
+            created = await self.drive.create_docx_from_markdown(
+                title=effective_title,
+                markdown=markdown,
+                folder_token=day_folder,
+            )
+        except Exception:
+            # Phase 35 PR-follow-up: docx 创建失败 → day_folder 可能空着留下来
+            # (用户原话:"云文档每日报告目录下确实新建了个 XXXX-XX-XX 的日期目录,
+            # 但是目录中没有对应文件,是个空目录")。 best-effort 清理,不影响
+            # 主异常继续往上抛 — 调用方根据 exc 决定要不要走 fallback。
+            try:
+                await self.delete_day_folder_if_empty(day=day)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "drive_org_cleanup_after_docx_failure_swallowed",
+                    day=day_str,
+                )
+            raise
 
         ref = DailyDocRef(
             date=day,
@@ -381,6 +395,218 @@ class DriveOrgService:
             run_id=run_id,
         )
         return ref
+
+    # ------------------------------------------------------------------
+    # Empty day-folder cleanup (PR-follow-up to 用户原话)
+    # ------------------------------------------------------------------
+    async def delete_day_folder_if_empty(self, *, day: date) -> bool:
+        """如果 ``📁 每日报告/<day>/`` 子文件夹存在且**没有任何 children**,
+        就把它删掉,避免运营看到空目录。
+
+        用户原话:"云文档每日报告目录下确实新建了个 2026-08-31 的日期目录,
+        但是目录中没有对应文件,是个空目录。"  — Phase 35 PR-follow-up 修这个。
+
+        Returns:
+            True  = 找到空文件夹并成功删除
+            False = 没找到 / 文件夹非空 / 删除失败(任何失败都不抛 — 静默清理)
+
+        设计:
+          * 调用方负责传 day(date 类型),内部用与 ``get_or_create_day_folder``
+            同一套 Redis 缓存定位 token,避免再多一次 HTTP roundtrip。
+          * 如果 day_folder **有 children**(说明里面有别的文件 — 比如详情 docx),
+            不删 — 删了就把别的文件也带走了。
+          * 任何异常(list_children / delete_file 失败)都吞掉,log warning,
+            主流程(digest 写入失败 / 详情写入失败)不被 cleanup 拖累。
+        """
+        if not self.drive.is_configured:
+            return False
+
+        day_str = day.strftime("%Y-%m-%d")
+        cache_key = f"{DAY_FOLDER_CACHE_PREFIX}{day_str}"
+        day_folder: Optional[str] = None
+
+        # 1) 优先从 Redis cache 拿 token
+        try:
+            redis = await get_redis()
+            if redis is not None:
+                cached = await redis.get(cache_key)
+                if cached:
+                    day_folder = str(cached)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "drive_day_folder_cache_read_failed_on_cleanup",
+                day=day_str,
+                error=str(exc)[:200],
+            )
+
+        # 2) cache miss → 走 ensure_folder_path 拿 token(可能新建空文件夹,但
+        #    后面 list_children 发现里面没东西照样删掉)
+        if not day_folder:
+            try:
+                daily_root = await self.drive.ensure_folder_path(
+                    parent_token=self.drive.folder_token, path=[SECTION_DAILY]
+                )
+                day_folder = await self.drive.ensure_folder_path(
+                    parent_token=daily_root, path=[day_str]
+                )
+            except FeishuContentError as exc:
+                logger.warning(
+                    "drive_day_folder_resolve_failed_on_cleanup",
+                    day=day_str,
+                    error=str(exc)[:200],
+                )
+                return False
+
+        # 3) 列出 children,如果空才删
+        try:
+            children = await self.drive.list_children(folder_token=day_folder)
+        except FeishuContentError as exc:
+            logger.warning(
+                "drive_day_folder_list_children_failed_on_cleanup",
+                day=day_str,
+                error=str(exc)[:200],
+            )
+            return False
+
+        if children:
+            logger.info(
+                "drive_day_folder_skip_cleanup_has_children",
+                day=day_str,
+                n_children=len(children),
+            )
+            return False
+
+        # 4) 删空文件夹 + 失效 Redis cache
+        try:
+            await self.drive.delete_file(
+                file_token=day_folder, file_type="folder"
+            )
+        except FeishuContentError as exc:
+            logger.warning(
+                "drive_day_folder_delete_failed",
+                day=day_str,
+                error=str(exc)[:200],
+            )
+            return False
+
+        try:
+            redis = await get_redis()
+            if redis is not None:
+                await redis.delete(cache_key)
+        except Exception:  # noqa: BLE001 — best-effort cache invalidation
+            pass
+
+        logger.info(
+            "drive_day_folder_cleaned_up",
+            day=day_str,
+            folder_token=day_folder[:24],
+        )
+        return True
+
+    async def cleanup_empty_day_folders(self) -> dict[str, int]:
+        """遍历 ``📁 每日报告/`` 下所有 ``YYYY-MM-DD/`` 子文件夹,
+        删掉空的那个。
+
+        给 ``/docs cleanup-empty`` 运营命令用 — 处理历史积压的空目录
+        (那些是 docx 写入失败留下来的,write_daily_digest 自动清理
+        只覆盖失败的那次,过去的还得手工扫一遍)。
+
+        Returns:
+            ``{"scanned": N, "deleted": M, "kept_with_children": K}``
+        """
+        if not self.drive.is_configured:
+            return {"scanned": 0, "deleted": 0, "kept_with_children": 0}
+
+        try:
+            daily_root = await self.drive.ensure_folder_path(
+                parent_token=self.drive.folder_token, path=[SECTION_DAILY]
+            )
+            children = await self.drive.list_children(folder_token=daily_root)
+        except FeishuContentError as exc:
+            logger.warning(
+                "drive_cleanup_empty_list_failed",
+                error=str(exc)[:200],
+            )
+            return {"scanned": 0, "deleted": 0, "kept_with_children": 0}
+
+        # 只挑出名字像 YYYY-MM-DD 的子项
+        import re
+        date_re = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+        scanned = 0
+        deleted = 0
+        kept = 0
+        for child in children:
+            name = (child.get("name") or "").strip()
+            if not date_re.match(name):
+                continue
+            try:
+                day_date = date.fromisoformat(name)
+            except ValueError:
+                continue
+            scanned += 1
+            try:
+                # 用 list_children + 0 个子项 → 删
+                inner = await self.drive.list_children(
+                    folder_token=child["token"]
+                )
+                if inner:
+                    kept += 1
+                    continue
+                await self.drive.delete_file(
+                    file_token=child["token"], file_type="folder"
+                )
+            except FeishuContentError as exc:
+                logger.warning(
+                    "drive_cleanup_empty_day_failed",
+                    day=name,
+                    error=str(exc)[:200],
+                )
+                kept += 1
+                continue
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "drive_cleanup_empty_unexpected",
+                    day=name,
+                    error=str(exc)[:200],
+                )
+                kept += 1
+                continue
+
+            # —— 主删除成功 —— 失效对应 day 的 Redis 缓存(best-effort,
+            # 隔离在独立 try 里,Redis 异常不应影响 "deleted" 计数)
+            try:
+                redis = await get_redis()
+                if redis is not None:
+                    await redis.delete(
+                        f"{DAY_FOLDER_CACHE_PREFIX}{name}"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "drive_cleanup_empty_cache_invalidate_failed",
+                    day=name,
+                    error=str(exc)[:200],
+                )
+            deleted += 1
+            logger.info(
+                "drive_cleanup_empty_deleted",
+                day=name,
+                folder_token=child["token"][:24],
+            )
+            # Mark day_date as used (pyright/lint hint)
+            _ = day_date
+
+        logger.info(
+            "drive_cleanup_empty_done",
+            scanned=scanned,
+            deleted=deleted,
+            kept_with_children=kept,
+        )
+        return {
+            "scanned": scanned,
+            "deleted": deleted,
+            "kept_with_children": kept,
+        }
 
     async def persist_daily_doc(self, ref: DailyDocRef) -> None:
         """Upsert a ``DailyDigestDoc`` row for ``ref``.

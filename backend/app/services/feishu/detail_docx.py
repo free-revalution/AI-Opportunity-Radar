@@ -335,11 +335,24 @@ class DetailDocxService:
         day_folder = await org.get_or_create_day_folder(day=day)
         title_slug = _slugify_for_docx_title(opp.slug)
         doc_title = f"{title_slug} 详情报告"
-        result = await self.drive.create_docx_from_markdown(
-            title=doc_title,
-            markdown=markdown,
-            folder_token=day_folder,
-        )
+        try:
+            result = await self.drive.create_docx_from_markdown(
+                title=doc_title,
+                markdown=markdown,
+                folder_token=day_folder,
+            )
+        except Exception:
+            # Phase 35 PR-follow-up: 详情 docx 写入失败 → 防止空 day_folder 残留
+            # (用户原话: "云文档每日报告目录下确实新建了个 XXXX-XX-XX 的日期目录,
+            # 但是目录中没有对应文件,是个空目录")。best-effort 清理后继续抛。
+            try:
+                await org.delete_day_folder_if_empty(day=day)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "detail_docx_cleanup_after_failure_swallowed",
+                    day=day_str,
+                )
+            raise
 
         # — Replace lock with the actual doc_id ----------------------------
         cache_value = f"{result['doc_id']}|{result['url']}"

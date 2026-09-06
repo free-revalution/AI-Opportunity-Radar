@@ -115,7 +115,27 @@ class _FakeDriveManager:
         self.mkdir_calls: list[str] = []
         self.mv_calls: list[dict[str, Any]] = []
         self.rename_calls: list[dict[str, Any]] = []
+        self.cleanup_empty_calls = 0
         self._confirm_store: Any = None
+        # — Phase 35 PR-follow-up: 给 /docs cleanup-empty 提供 fake drive,
+        # 内含 list_children / delete_file,能完整跑 DriveOrgService 路径。
+        self._fake_drive = _FakeCleanupDrive()
+
+    @property
+    def is_configured(self) -> bool:
+        return True
+
+    @property
+    def drive(self) -> Any:
+        # 当外部需要的是完整 FeishuDriveClient 时返回 _FakeCleanupDrive(支持
+        # list_children / delete_file / ensure_folder_path);否则(老路径)
+        # 返回只含 get_file_meta 的 _MiniDrive。
+        if getattr(self, "_return_mini_drive", False):
+            class _MiniDrive:
+                async def get_file_meta(self, *, file_tokens, file_type="folder"):
+                    return [{"token": t, "type": file_type, "url": f"https://x/{t}"}]
+            return _MiniDrive()
+        return self._fake_drive
 
     async def ensure_tree(self) -> dict[str, str]:
         self.ensure_tree_calls += 1
@@ -181,12 +201,61 @@ class _FakeDriveManager:
     def confirm_store(self) -> Any:
         return self._confirm_store
 
+
+class _FakeCleanupDrive:
+    """Mini drive fake — supports list_children / delete_file / ensure_folder_path.
+
+    Used by ``/docs cleanup-empty`` handler to exercise the real
+    DriveOrgService.cleanup_empty_day_folders path without HTTP.
+    """
+
+    def __init__(self) -> None:
+        # _folders: (parent, name) → token
+        self._folders: dict[tuple[str, str], str] = {}
+        self._counter = 0
+
     @property
-    def drive(self) -> Any:
-        class _MiniDrive:
-            async def get_file_meta(self, *, file_tokens, file_type="folder"):
-                return [{"token": t, "type": file_type, "url": f"https://x/{t}"}]
-        return _MiniDrive()
+    def is_configured(self) -> bool:
+        return True
+
+    @property
+    def folder_token(self) -> str:
+        return "root_folder_token"
+
+    async def ensure_folder_path(
+        self, *, parent_token: str, path: list[str]
+    ) -> str:
+        cur = parent_token
+        for name in path:
+            key = (cur, name)
+            if key not in self._folders:
+                self._counter += 1
+                self._folders[key] = f"fld_{self._counter}_{name[:6]}"
+            cur = self._folders[key]
+        return cur
+
+    async def list_children(self, *, folder_token: str) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for (parent, name), tok in self._folders.items():
+            if parent == folder_token:
+                out.append({"token": tok, "name": name})
+        return out
+
+    async def delete_file(
+        self, *, file_token: str, file_type: str = "folder"
+    ) -> dict[str, Any]:
+        to_drop: list[tuple[str, str]] = []
+        for (parent, name), tok in self._folders.items():
+            if tok == file_token:
+                to_drop.append((parent, name))
+        for key in to_drop:
+            self._folders.pop(key, None)
+        return {"task_id": "fake_task", "file_token": file_token}
+
+    async def poll_delete_task(
+        self, *, task_id: str, timeout: float = 5.0
+    ) -> dict[str, Any]:
+        return {"task_id": task_id, "status": "success"}
 
 
 class _FakeBitableManager:
@@ -422,3 +491,82 @@ async def test_run_confirm_unknown_token(ctx: DocsContext) -> None:
     ctx.bitable_manager._confirm_store = store  # type: ignore[attr-defined]
     reply = await run_docs_subcommand(args="confirm missing00", ctx=ctx)
     assert "已过期或不存在" in reply.text
+
+
+# ---------------------------------------------------------------------------
+# Phase 35 PR-follow-up: /docs cleanup-empty — 删空日期目录(用户原话)
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_run_cleanup_empty_dry(ctx: DocsContext) -> None:
+    """``/docs cleanup-empty`` 扫描 📁 每日报告 下空目录并删掉。
+
+    Pre-seed 3 个日期目录:2 个空 + 1 个有内容。期望 deleted=2,
+    kept_with_children=1,scanned=3。
+    """
+    drive = ctx.drive_manager.drive  # _FakeCleanupDrive
+    # 准备场景
+    daily_root = await drive.ensure_folder_path(
+        parent_token="root_folder_token", path=["📁 每日报告"]
+    )
+    await drive.ensure_folder_path(
+        parent_token=daily_root, path=["2026-09-01"]
+    )
+    await drive.ensure_folder_path(
+        parent_token=daily_root, path=["2026-09-03"]
+    )
+    # 09-02 有"内容" — list_children 返回非空列表
+    tok_02 = await drive.ensure_folder_path(
+        parent_token=daily_root, path=["2026-09-02"]
+    )
+    drive._folders[(tok_02, "real_docx.docx")] = "doc_xyz"
+
+    reply = await run_docs_subcommand(args="cleanup-empty", ctx=ctx)
+    assert reply.metadata["subcommand"] == "cleanup-empty"
+    assert reply.metadata["scanned"] == 3
+    assert reply.metadata["deleted"] == 2
+    assert reply.metadata["kept_with_children"] == 1
+    # IM 文本里给出统计数字
+    assert "删除 2 个空目录" in reply.text
+    assert "保留 1 个" in reply.text
+
+
+@pytest.mark.asyncio
+async def test_run_cleanup_empty_alias(ctx: DocsContext) -> None:
+    """``/docs cleanup`` 是 ``/docs cleanup-empty`` 的简短别名。"""
+    reply = await run_docs_subcommand(args="cleanup", ctx=ctx)
+    assert reply.metadata["subcommand"] == "cleanup-empty"
+
+
+@pytest.mark.asyncio
+async def test_run_cleanup_empty_noop_when_daily_missing(ctx: DocsContext) -> None:
+    """📁 每日报告 段都还没建 → 友好提示,无副作用。"""
+    reply = await run_docs_subcommand(args="cleanup-empty", ctx=ctx)
+    assert "无需清理" in reply.text
+    assert reply.metadata["scanned"] == 0
+    assert reply.metadata["deleted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_cleanup_empty_not_configured(ctx: DocsContext) -> None:
+    """drive 未配置 → 友好错误,不抛异常。"""
+    ctx.drive_manager._configured = False
+
+    class _UnconfiguredDrive:
+        @property
+        def is_configured(self) -> bool:
+            return False
+
+        folder_token = ""
+
+    # 临时替换 drive property 返回的 inner client
+    class _UnconfiguredManager:
+        is_configured = False
+
+        @property
+        def drive(self):
+            return _UnconfiguredDrive()
+
+    ctx.drive_manager = _UnconfiguredManager()  # type: ignore[assignment]
+    reply = await run_docs_subcommand(args="cleanup-empty", ctx=ctx)
+    assert "未配置" in reply.text
+    assert reply.metadata.get("error") is True

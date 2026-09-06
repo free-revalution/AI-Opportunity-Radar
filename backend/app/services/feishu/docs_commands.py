@@ -70,6 +70,7 @@ class DocsSubcommand(str, Enum):
     RENAME = "rename"
     RM = "rm"
     CONFIRM = "confirm"
+    CLEANUP_EMPTY = "cleanup-empty"
     BITABLE_LS = "bitable:ls"
     BITABLE_FIND = "bitable:find"
     BITABLE_ADD = "bitable:add"
@@ -96,6 +97,8 @@ _SUBCOMMAND_ALK: dict[str, DocsSubcommand] = {
     "rm": DocsSubcommand.RM,
     "delete": DocsSubcommand.RM,
     "confirm": DocsSubcommand.CONFIRM,
+    "cleanup-empty": DocsSubcommand.CLEANUP_EMPTY,
+    "cleanup": DocsSubcommand.CLEANUP_EMPTY,
     "bitable:ls": DocsSubcommand.BITABLE_LS,
     "bitable:list": DocsSubcommand.BITABLE_LS,
     "bitable:find": DocsSubcommand.BITABLE_FIND,
@@ -188,6 +191,8 @@ async def run_docs_subcommand(
             return await _handle_rm(args=rest, ctx=ctx)
         if sub == DocsSubcommand.CONFIRM:
             return await _handle_confirm(args=rest, ctx=ctx)
+        if sub == DocsSubcommand.CLEANUP_EMPTY:
+            return await _handle_cleanup_empty(args=rest, ctx=ctx)
         if sub == DocsSubcommand.BITABLE_LS:
             return await _handle_bitable_ls(args=rest, ctx=ctx)
         if sub == DocsSubcommand.BITABLE_FIND:
@@ -648,6 +653,67 @@ async def _handle_confirm(*, args: str, ctx: DocsContext):
     )
 
 
+async def _handle_cleanup_empty(*, args: str, ctx: DocsContext):
+    """``/docs cleanup-empty`` — 扫描 ``📁 每日报告/`` 下所有 YYYY-MM-DD 子目录,
+    删除空的那些(那些是 docx 写入失败留下的)。
+
+    Phase 35 PR-follow-up:用户原话"云文档每日报告目录下确实新建了个
+    XXXX-XX-XX 的日期目录,但是目录中没有对应文件,是个空目录"。运营
+    觉得空目录干扰面板,所以加这个命令随时清理历史积压。
+
+    写入失败时的自动清理(``delete_day_folder_if_empty``)只覆盖失败的
+    那次 — 过去的空目录还得手工扫一遍,这就是本命令的用途。
+
+    跟 ``rm`` 不同:本命令**没有二次确认** — 它只删"绝对空"的目录
+    (没有 children),即使误删也丢不了东西。运营用起来不卡手。
+    """
+    from app.services.feishu.drive_org import DriveOrgService
+
+    if not ctx.drive_manager.is_configured:
+        return _err_reply(
+            sub=DocsSubcommand.CLEANUP_EMPTY,
+            error=(
+                "飞书云盘未配置,无法清理空目录 "
+                "(FEISHU_DRIVE_ROOT_FOLDER_TOKEN 为空)。"
+            ),
+        )
+
+    # DriveManager.drive 直接就是 FeishuDriveClient 实例 — 复用现有连接池,
+    # 不另外起一个(避免双 client + 重复 token 缓存)。
+    drive_client = ctx.drive_manager.drive
+    settings = ctx.settings
+
+    org = DriveOrgService(drive=drive_client, settings=settings)
+    summary = await org.cleanup_empty_day_folders()
+
+    scanned = summary.get("scanned", 0)
+    deleted = summary.get("deleted", 0)
+    kept = summary.get("kept_with_children", 0)
+
+    if scanned == 0:
+        body = "📁 每日报告下没有日期子目录,无需清理。"
+    elif deleted == 0:
+        body = (
+            f"📁 扫描了 {scanned} 个日期目录,没有空目录需要删除 "
+            f"({kept} 个非空已保留)。"
+        )
+    else:
+        body = (
+            f"🧹 扫描 {scanned} 个日期目录,删除 {deleted} 个空目录,"
+            f"保留 {kept} 个有内容的。"
+        )
+
+    return _reply(
+        body,
+        sub=DocsSubcommand.CLEANUP_EMPTY,
+        metadata={
+            "scanned": scanned,
+            "deleted": deleted,
+            "kept_with_children": kept,
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Bitable handlers
 # ---------------------------------------------------------------------------
@@ -837,6 +903,7 @@ def _help_reply():
                 "/docs rename <路径> <新名> — 重命名",
                 "/docs rm <路径> — 准备删除（返 token）",
                 "/docs confirm <token> — 执行删除",
+                "/docs cleanup-empty — 删 📁 每日报告 下所有空日期目录",
                 "",
                 "**多维表格（Bitable）**",
                 "/docs bitable ls — 列表",
