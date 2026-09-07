@@ -5,8 +5,9 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app import __version__
 from app.api.health import router as health_router
@@ -128,6 +129,56 @@ def create_app() -> FastAPI:
     # Mounted at `/api/feishu/event` — uses Feishu's own Verification Token,
     # NOT the shared `X-Radar-Webhook` (that's for outbound internal calls).
     app.include_router(feishu_inbound_router, prefix="/api/feishu", tags=["feishu"])
+
+    # Phase 36+ — surface unhandled exceptions back to the caller.
+    # FastAPI's default 500 handler returns ``{"detail": "Internal
+    # Server Error"}`` with zero context, which makes ``POST
+    # /api/internal/pipeline/run`` failures show up in the Feishu bot
+    # as a useless "Internal Server Error" message. We override it so
+    # dev/staging operators see the exception type + first line; prod
+    # still gets the safe generic message.
+    import traceback as _tb
+
+    @app.exception_handler(Exception)
+    async def _unhandled_exception_handler(
+        request: Request, exc: Exception
+    ) -> JSONResponse:
+        # — HTTPException 是 FastAPI 自己 raise 的(404/422/...),
+        # 走它自己的 handler,我们不插手。
+        from fastapi import HTTPException as _HTTPException
+
+        if isinstance(exc, _HTTPException):
+            # — 借用默认 handler: 返回 exc.detail + status_code
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": exc.detail},
+            )
+
+        tb_str = _tb.format_exc()
+        first_line = str(exc).strip().splitlines()[0] if str(exc).strip() else exc.__class__.__name__
+        logger.error(
+            "unhandled_exception",
+            path=str(request.url.path),
+            method=request.method,
+            exc_type=exc.__class__.__name__,
+            error=first_line[:300],
+            exc_info=True,
+        )
+        if settings.app_env == "prod":
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Internal Server Error"},
+            )
+        # — dev / staging: 把异常类型 + 第一行 error 贴回去,operator
+        # 不用去翻 docker logs 就能定位。
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": "Internal Server Error",
+                "error": f"{exc.__class__.__name__}: {first_line[:280]}",
+                "trace_tail": tb_str.splitlines()[-12:],
+            },
+        )
 
     return app
 

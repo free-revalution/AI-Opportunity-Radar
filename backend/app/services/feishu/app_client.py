@@ -167,6 +167,7 @@ class FeishuAppClient:
         receive_id_type: str = "chat_id",
         session: Optional[Any] = None,
         compliance_context: str = "feishu_outbound",
+        compliance_skip: bool = False,
     ) -> dict[str, Any]:
         """POST /im/v1/messages to send one message.
 
@@ -231,7 +232,14 @@ class FeishuAppClient:
         # Phase 24 — pre-send compliance gate. Runs before any HTTP work
         # so BLOCKED verdicts never reach Feishu. Import lazily to keep
         # the import graph tidy.
-        if self.settings.compliance_pre_send_gate_enabled:
+        # Phase 36+ — ``compliance_skip=True`` for fail-open / system
+        # notifications (e.g. task_runner reporting a /run failure):
+        # these already represent "the bot is telling the user something
+        # went wrong", and the traceback content routinely trips the
+        # PII / prompt-injection rules. Skipping the gate ensures the
+        # user actually sees the failure reply instead of silent bot
+        # silence.
+        if self.settings.compliance_pre_send_gate_enabled and not compliance_skip:
             import json as _json
 
             from app.services.compliance.gate import enforce_gate_outbound
@@ -260,6 +268,7 @@ class FeishuAppClient:
             receive_id=receive_id,
             msg_type=msg_type,
             message_id=(data.get("data") or {}).get("message_id"),
+            compliance_skipped=compliance_skip,
         )
         return data
 

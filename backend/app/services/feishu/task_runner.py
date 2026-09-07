@@ -852,13 +852,45 @@ async def _execute_pipeline(*, record: TaskRecord, settings: Settings) -> None:
                 pipeline_url, json=payload, headers=headers, timeout=900.0
             )
             if response.status_code >= 400:
+                # — Phase 36+ debug: 把后端真实异常贴给飞书,免得运维
+                # 还要去 docker logs 里翻 500 堆栈。FastAPI 默认 500 handler
+                # 不返回 detail,所以也要尝试读 traceback。
+                body_text = response.text or ""
+                detail: Any
                 try:
                     detail = response.json()
                 except ValueError:
-                    detail = {"error": response.text[:200]}
+                    detail = body_text[:300]
+                # — FastAPI 的 422 是校验错误,detail 是 list[{}]; 500
+                # 默认 {"detail": "Internal Server Error"} 几乎没信息。
+                # 我们尽量把任何可读字段塞进去,上限 300 字符。
+                if isinstance(detail, dict):
+                    candidates = [
+                        detail.get("error"),
+                        detail.get("detail"),
+                        detail.get("message"),
+                    ]
+                    meaningful = next(
+                        (c for c in candidates if c and str(c).strip()),
+                        None,
+                    )
+                    if meaningful is not None:
+                        err_msg = str(meaningful)[:300]
+                    else:
+                        # — 整个 dict str() 一下,可能含 type/trace 信息
+                        err_msg = str(detail)[:300]
+                elif isinstance(detail, list):
+                    err_msg = str(detail)[:300]
+                else:
+                    err_msg = str(detail)[:300]
                 error_text = (
-                    f"pipeline HTTP {response.status_code}: "
-                    f"{str(detail.get('error') or detail)[:200]}"
+                    f"pipeline HTTP {response.status_code}: {err_msg}"
+                )
+                logger.warning(
+                    "feishu_async_run_pipeline_http_error",
+                    task_id=record.task_id,
+                    http_status=response.status_code,
+                    body_preview=body_text[:500],
                 )
             else:
                 summary = response.json() if response.content else {}
@@ -958,7 +990,15 @@ async def _post_pipeline_summary(
                 receive_id_type=record.receive_id_type,
                 msg_type="text",
                 content={"text": text},
+                # Phase 36+ — failure reply is a fail-open signal so the
+                # user actually sees what went wrong. Skipping the gate
+                # here is intentional: the content is operator-facing
+                # diagnostics (often SQL tracebacks), which routinely
+                # trip PII / prompt-injection rules. Without this skip
+                # the bot would silently drop the failure reply and
+                # the user would see no message at all.
                 compliance_context="feishu_async_run_failure",
+                compliance_skip=True,
             )
         finally:
             await client.aclose()

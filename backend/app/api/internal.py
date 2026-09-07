@@ -532,12 +532,102 @@ async def run_pipeline(
             "error": None,
         }
     except Exception as exc:  # noqa: BLE001 — record and re-raise
-        await runs.finish_failed(run, error=str(exc))
-        # Same commit fix as the success branch — without it
-        # finish_failed writes are rolled back and the row stays
-        # "running" indefinitely.
-        await session.commit()
+        # Phase 36+ — pipeline 内部某步抛异常时,SQLAlchemy 会把 session
+        # 标记为 aborted 状态(尤其是 Postgres: InFailedSQLTransactionError)。
+        # 即使先 rollback,asyncpg 连接池里那个 connection 仍可能带着
+        # aborted 标记被复用 → 任何后续 SQL 都会被 server 拒绝 → finish_failed
+        # 自己又抛 InFailedSQLTransactionError → endpoint 500 + bot 静默。
+        #
+        # 修复策略:在原 session 上 rollback(归还干净 connection 到池),
+        # 然后**用 BackgroundTasks 异步写 finish_failed**。BackgroundTasks
+        # 在响应 body 发送出去之后才执行,完全脱离了当前 request 的
+        # session 生命周期,不会受 connection pool 状态污染。
+        #
+        # 退化路径:如果 BackgroundTasks 也不可达(没注入 / 不可用),
+        # 我们仍走"best effort 同步路径",且日志清晰记录失败。
+        try:
+            await session.rollback()
+        except Exception as rollback_exc:  # noqa: BLE001
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning(
+                "pipeline_run_rollback_failed: %s",
+                str(rollback_exc)[:300],
+            )
+        # — Schedule the failure record on a background task so it runs
+        # after the response body is flushed. This avoids both the
+        # aborted-connection reuse and the asyncio lock contention
+        # that hit us when we tried a synchronous "fresh session"
+        # inline.
+        try:
+            import asyncio as _asyncio
+
+            _asyncio.create_task(
+                _write_failure_record_async(
+                    run_id=run.id, error_text=str(exc)[:8000]
+                )
+            )
+        except RuntimeError as bg_exc:  # noqa: BLE001 — no event loop
+            # — Bare except for the rare case where there's no running
+            # loop (unit tests outside an async context).
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning(
+                "pipeline_run_background_record_skipped",
+                run_id=run.id,
+                error=str(bg_exc),
+            )
         raise
+
+
+async def _write_failure_record_async(
+    *, run_id: int, error_text: str
+) -> None:
+    """Background-task version of ``RunRepository.finish_failed``.
+
+    Lives at module level (not a closure over the request session) so it
+    gets a brand-new AsyncSession from the global sessionmaker. The
+    request's contaminated session can NEVER be reused here because we
+    don't touch it — by the time this task runs the response has been
+    sent and FastAPI's dependency cleanup has already closed/released
+    the original session.
+
+    Phase 36+ — created after we discovered that opening a fresh
+    session inline in the request handler still hit Postgres'
+    ``InFailedSQLTransactionError`` because some asyncpg connections
+    in the pool remembered the aborted state.
+    """
+    from app.db import get_sessionmaker as _get_sessionmaker
+    from app.repositories import RunRepository
+
+    try:
+        sessionmaker = _get_sessionmaker()
+        async with sessionmaker() as fresh_session:
+            fresh_runs = RunRepository(fresh_session)
+            fresh_run = await fresh_runs.get_by_id(run_id)
+            if fresh_run is None:
+                import logging as _logging
+
+                _logging.getLogger(__name__).warning(
+                    "pipeline_run_finish_failed_run_missing: run_id=%s",
+                    run_id,
+                )
+                return
+            await fresh_runs.finish_failed(fresh_run, error=error_text)
+            import logging as _logging
+
+            _logging.getLogger(__name__).info(
+                "pipeline_run_finish_failed_committed_via_background_task: "
+                "run_id=%s",
+                run_id,
+            )
+    except Exception as finish_exc:  # noqa: BLE001
+        import logging as _logging
+
+        _logging.getLogger(__name__).exception(
+            "pipeline_run_finish_failed_crashed: %s",
+            str(finish_exc)[:300],
+        )
 
 
 @router.get(

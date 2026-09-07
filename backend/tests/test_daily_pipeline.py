@@ -14,6 +14,9 @@ Runs fully offline (mock_external_services=True).
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import select
+
+from app.models import Run
 
 pytestmark = pytest.mark.asyncio
 
@@ -78,34 +81,60 @@ async def test_daily_pipeline_end_to_end(client, sqlite_session, monkeypatch):
 
 
 async def test_daily_pipeline_run_records_failure(client, monkeypatch):
-    """If one step raises, the Run row is marked failed with the error."""
+    """If one step raises, the Run row is marked failed with the error.
+
+    Phase 36+ v3 — failure record is now written by a background
+    asyncio task spawned at error-handling time. We need to wait
+    for that task to commit before reading; TestClient is sync and
+    would otherwise race the commit. We also read through a fresh
+    session to avoid TestClient's session cache.
+    """
+    import asyncio as _asyncio
+
     from app.services.research import ResearchService
+
+    task_done = _asyncio.Event()
+    from app.api import internal as _internal_mod
+
+    orig_write = _internal_mod._write_failure_record_async
+
+    async def _spied(*, run_id, error_text):
+        try:
+            await orig_write(run_id=run_id, error_text=error_text)
+        finally:
+            task_done.set()
+
+    monkeypatch.setattr(
+        _internal_mod, "_write_failure_record_async", _spied
+    )
 
     async def _boom(self):
         raise RuntimeError("simulated research outage")
 
     monkeypatch.setattr(ResearchService, "run_once", _boom)
 
-    # Starlette's TestClient has ``raise_server_exceptions=True`` by
-    # default, so the endpoint's ``raise`` propagates out of
-    # ``client.post`` instead of becoming a 500 response. The behaviour
-    # we want to verify is two-fold:
-    #
-    #   1. the exception is propagated (so n8n / the bot sees a failure)
-    #   2. the Run row has been marked failed with the error message
     with pytest.raises(RuntimeError, match="simulated research outage"):
         client.post(
             "/api/internal/pipeline/run",
             json={"send_digest": False},
         )
 
-    # The Run row should still exist and be marked failed.
-    r2 = client.get("/api/internal/status")
-    assert r2.status_code == 200
-    last = r2.json()["last_run"]
+    try:
+        await _asyncio.wait_for(task_done.wait(), timeout=5.0)
+    except _asyncio.TimeoutError:
+        pytest.fail("Background finish_failed task didn't complete within 5s")
+
+    # Read directly through sessionmaker to bypass TestClient's session
+    # cache (which would otherwise return a stale snapshot of the row).
+    last = None
+    async with client.sessionmaker() as verify_session:  # type: ignore[attr-defined]
+        result = await verify_session.execute(
+            select(Run).order_by(Run.started_at.desc()).limit(1)
+        )
+        last = result.scalar_one_or_none()
     assert last is not None
-    assert last["status"] == "failed"
-    assert "simulated research outage" in (last["error"] or "")
+    assert last.status == "failed"
+    assert "simulated research outage" in (last.error or "")
 
 
 # ---------------------------------------------------------------------------
@@ -326,8 +355,36 @@ async def test_pipeline_run_persists_run_row_status_to_db(client, monkeypatch):
 async def test_pipeline_run_failed_branch_commits_run_row(client, monkeypatch):
     """The except branch must also commit — otherwise the Run row
     stays at status='running' after a real failure and ``/status``
-    can't tell the user anything went wrong."""
+    can't tell the user anything went wrong.
+
+    Phase 36+ v3 — the failure record is written from a background
+    asyncio task spawned at error-handling time. TestClient is
+    synchronous so we need to wait for that task to finish before
+    querying /status; otherwise we'd race the commit and see the
+    stale "running" status.
+    """
+    import asyncio as _asyncio
+
     from app.services.research import ResearchService
+
+    task_done = _asyncio.Event()
+
+    orig_write = None
+    from app.api import internal as _internal_mod
+
+    orig_write = _internal_mod._write_failure_record_async
+
+    async def _spied_write_failure_record(*, run_id, error_text):
+        try:
+            await orig_write(run_id=run_id, error_text=error_text)
+        finally:
+            task_done.set()
+
+    monkeypatch.setattr(
+        _internal_mod,
+        "_write_failure_record_async",
+        _spied_write_failure_record,
+    )
 
     async def _boom(self):
         raise RuntimeError("simulated research outage")
@@ -340,17 +397,28 @@ async def test_pipeline_run_failed_branch_commits_run_row(client, monkeypatch):
             json={"send_digest": False},
         )
 
-    # Independent read — same path the bot uses for /status.
-    status_resp = client.get("/api/internal/status")
-    assert status_resp.status_code == 200
-    last = status_resp.json()["last_run"]
+    # Wait for the background task to commit before reading /status.
+    try:
+        await _asyncio.wait_for(task_done.wait(), timeout=5.0)
+    except _asyncio.TimeoutError:
+        pytest.fail(
+            "Background finish_failed task didn't complete within 5s"
+        )
+
+    # Independent read — bypass TestClient's session cache by querying
+    # through the test sessionmaker directly. Each request would get
+    # a fresh session in production; TestClient reuses one.
+    last = None
+    async with client.sessionmaker() as verify_session:  # type: ignore[attr-defined]
+        result = await verify_session.execute(
+            select(Run).order_by(Run.started_at.desc()).limit(1)
+        )
+        last = result.scalar_one_or_none()
     assert last is not None
-    assert last["status"] == "failed", (
-        "Failure branch never committed — /status still sees "
-        "status='running' even though /run raised."
+    assert last.status == "failed", (
+        f"Failure branch never committed — latest Run is status={last.status!r}"
     )
-    assert last["error"] is not None
-    assert "simulated research outage" in last["error"]
+    assert "simulated research outage" in (last.error or "")
 
 
 # ---------------------------------------------------------------------------
@@ -385,3 +453,122 @@ async def test_pipeline_drive_not_configured_returns_soft_skip(
         f"drive not configured should be soft skip, got error: {docx.get('error')}"
     )
     assert docx.get("skipped") == "drive_not_configured"
+
+
+# ---------------------------------------------------------------------------
+# Phase 36+ — pipeline 异常分支的 rollback + finish_failed 兜底
+# ---------------------------------------------------------------------------
+async def test_pipeline_exception_branch_finishes_failed_run(
+    client, monkeypatch
+) -> None:
+    """pipeline 早期某步抛异常时,run_pipeline 的 except 分支必须:
+      1. 调用 ``session.rollback()`` 清掉 SQLAlchemy 的 aborted-transaction
+         状态(否则 Postgres 后续 SQL 全部失败)
+      2. 调度 BackgroundTask 写 ``RunRepository.finish_failed`` 把 Run row
+         标 failed
+
+    Phase 36+ v3: 改用 BackgroundTasks — 在响应 body 发出之后才跑,
+    彻底绕开 contaminated session / connection pool 污染。
+
+    SQLite 测试不模拟 aborted transaction(SQLite 没这个语义),但我们
+    可以验证 **调用顺序 + 行最终状态**: rollback → background task →
+    finish_failed,确保 Phase 36+ 修复逻辑就位。
+    """
+    import asyncio as _asyncio
+
+    from app.services.research import ResearchService
+    from app.repositories import RunRepository
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    call_order: list[str] = []
+    task_done = _asyncio.Event()
+
+    real_rollback = AsyncSession.rollback
+
+    async def _spied_rollback(self, *a, **kw):
+        call_order.append("rollback")
+        return await real_rollback(self, *a, **kw)
+
+    real_finish_failed = RunRepository.finish_failed
+
+    async def _spied_finish_failed(self, run, *, error):
+        call_order.append(f"finish_failed:{run.id}:{error[:60]}")
+        result = await real_finish_failed(self, run, error=error)
+        task_done.set()
+        return result
+
+    monkeypatch.setattr(AsyncSession, "rollback", _spied_rollback)
+    monkeypatch.setattr(RunRepository, "finish_failed", _spied_finish_failed)
+
+    # — Patch research.run_once 抛 RuntimeError,pipeline 一定走 except 分支
+    async def _boom(self):
+        raise RuntimeError("simulated pipeline abort for phase36+ rollback test")
+
+    monkeypatch.setattr(ResearchService, "run_once", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated pipeline abort"):
+        client.post(
+            "/api/internal/pipeline/run",
+            json={"send_digest": False, "write_docx": False},
+        )
+
+    # — 等 background task 跑完(最多 5s)
+    try:
+        await _asyncio.wait_for(task_done.wait(), timeout=5.0)
+    except _asyncio.TimeoutError:
+        pytest.fail(
+            f"Background finish_failed task 没在 5s 内完成。"
+            f"call_order={call_order}"
+        )
+
+    # — 关键断言 1:rollback 至少被调一次
+    assert "rollback" in call_order, (
+        f"Phase 36+ 修复: pipeline 异常分支必须先 session.rollback() 再 "
+        f"finish_failed,否则 Postgres 后续 SQL 全部失败。"
+        f"call_order={call_order}"
+    )
+    # — 关键断言 2:finish_failed 真的被调到了,且原 pipeline 异常被记录
+    finish_failed_calls = [c for c in call_order if c.startswith("finish_failed:")]
+    assert len(finish_failed_calls) == 1, (
+        f"finish_failed 应被调一次,实为 {len(finish_failed_calls)}: {call_order}"
+    )
+    assert "simulated pipeline abort" in finish_failed_calls[0]
+
+    # — 关键断言 3:Run row 真的被标 failed 了(用户能在 /status 看到)
+    # 注意:TestClient 内部 session 缓存,即使 row 真的被 commit 了,
+    # 同一个 session 内的 SELECT 可能看到旧快照。给 session expire
+    # 一下强制重读,模拟生产环境"下一个 HTTP request"。
+    from sqlalchemy.ext.asyncio import AsyncSession as _AS
+
+    # — 直接通过 SQLite engine 查,绕开 SQLAlchemy session 缓存,
+    # 这是最稳的验证方式(也是生产环境的真实路径 — 每个新 request
+    # 都是新 session)。
+    last = None
+    try:
+        from app.models import Run as _Run
+
+        # — 使用 conftest 暴露的 sessionmaker
+        async with client.sessionmaker() as verify_session:  # type: ignore[attr-defined]
+            result = await verify_session.execute(
+                select(_Run).order_by(_Run.started_at.desc()).limit(1)
+            )
+            last = result.scalar_one_or_none()
+    except Exception:  # noqa: BLE001
+        pass
+
+    if last is None:
+        # — 回退到 /status(老路径,有 session 缓存问题)
+        r = client.get("/api/internal/status")
+        assert r.status_code == 200
+        last_dict = r.json().get("last_run")
+        assert last_dict is not None
+        assert last_dict["status"] == "failed", (
+            f"Background task 路径下 Run row 应被标 failed,实际: {last_dict}"
+        )
+        assert "simulated pipeline abort" in (last_dict.get("error") or "")
+    else:
+        assert last is not None
+        assert last.status == "failed", (
+            f"Background task 路径下 Run row 应被标 failed,实际: {last.status}"
+        )
+        assert "simulated pipeline abort" in (last.error or "")

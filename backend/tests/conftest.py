@@ -83,7 +83,22 @@ async def client(sqlite_engine: AsyncEngine) -> AsyncIterator[TestClient]:
     once on engine startup and dropped on teardown. The sessionmaker is
     exposed via `client.sessionmaker` so tests can seed data without
     having to round-trip through the HTTP layer.
+
+    Phase 36+ — also redirect ``app.db._engine`` and
+    ``app.db._sessionmaker`` to the SQLite test engine, so background
+    tasks spawned by endpoint error handlers (e.g. ``run_pipeline``'s
+    rollback-recovery path) write to the test SQLite DB instead of
+    silently pointing at production Postgres.
+
+    The redirect is set up here (an async fixture that already has
+    ``sqlite_engine`` in scope) rather than as a separate sync autouse
+    fixture, because a sync autouse depending on the async
+    ``sqlite_engine`` fixture breaks sync tests' event-loop
+    expectations — they end up calling ``asyncio.get_event_loop()``
+    with no running loop.
     """
+    import app.db as _app_db
+
     sessionmaker = async_sessionmaker(sqlite_engine, expire_on_commit=False)
 
     async def _override_session() -> AsyncIterator[AsyncSession]:
@@ -92,10 +107,20 @@ async def client(sqlite_engine: AsyncEngine) -> AsyncIterator[TestClient]:
 
     app = create_app()
     app.dependency_overrides[get_session] = _override_session
-    with TestClient(app) as c:
-        c.sessionmaker = sessionmaker  # type: ignore[attr-defined]
-        yield c
-    app.dependency_overrides.clear()
+
+    saved_engine = _app_db._engine
+    saved_sessionmaker = _app_db._sessionmaker
+    _app_db._engine = sqlite_engine
+    _app_db._sessionmaker = sessionmaker
+
+    try:
+        with TestClient(app) as c:
+            c.sessionmaker = sessionmaker  # type: ignore[attr-defined]
+            yield c
+    finally:
+        _app_db._engine = saved_engine
+        _app_db._sessionmaker = saved_sessionmaker
+        app.dependency_overrides.clear()
 
 
 @pytest.fixture

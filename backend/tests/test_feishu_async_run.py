@@ -107,6 +107,34 @@ async def _reset_task_state():
         _TASKS.clear()
 
 
+@pytest.fixture(autouse=True)
+async def _reset_shared_http_client():
+    """Reset task_runner's lazy shared httpx.AsyncClient between tests.
+
+    The shared client is a module-level singleton. If a previous test
+    has triggered its creation (e.g. ``test_failure_path_records_failed...``),
+    subsequent tests that monkeypatch ``httpx.AsyncClient`` won't affect
+    the already-instantiated client — their fake transport gets bypassed
+    and the request hits a real (non-listening) port, producing either
+    a ConnectionError or an empty 5xx response that confuses assertions.
+
+    Resetting on every test boundary keeps each test isolated.
+    """
+    from app.services.feishu import task_runner as _tr
+
+    saved = _tr._SHARED_HTTP_CLIENT
+    _tr._SHARED_HTTP_CLIENT = None
+    try:
+        yield
+    finally:
+        if _tr._SHARED_HTTP_CLIENT is not None:
+            try:
+                await _tr._SHARED_HTTP_CLIENT.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+        _tr._SHARED_HTTP_CLIENT = saved
+
+
 @pytest.fixture
 def monkey_httpx(monkeypatch):
     """Replace httpx clients in task_runner + app_client with our transport.
@@ -513,3 +541,111 @@ def test_task_retention_extended_to_30_minutes() -> None:
         f"retention 应为 1800s(n8n 30-min),实为 "
         f"{task_runner_mod._TASK_RETENTION_SEC}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 36+ — pipeline HTTP error detail extraction
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_pipeline_500_with_detail_message_surfaces_to_bot(
+    monkeypatch,
+) -> None:
+    """FastAPI 默认 500 handler 返回 ``{"detail": "Internal Server Error"}``;
+    但 dev/staging 我们已经 override 成 ``{"detail":..., "error": exc_type: msg}``。
+    task_runner 应该能把 ``error`` 字段抠出来,而不是只贴 "Internal Server Error"。
+    """
+
+    class _DetailTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/api/internal/pipeline/run"):
+                # — 模拟 dev 模式 exception_handler 抛出来的真实错误
+                return httpx.Response(
+                    500,
+                    json={
+                        "detail": "Internal Server Error",
+                        "error": "OpenAIError: Rate limit reached (429)",
+                    },
+                    request=request,
+                )
+            if request.url.path.endswith("/auth/v3/tenant_access_token/internal"):
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "tenant_access_token": "tok-y", "expire": 7200},
+                    request=request,
+                )
+            if request.url.path.endswith("/im/v1/messages"):
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"message_id": "om_det"}},
+                    request=request,
+                )
+            return httpx.Response(404, request=request)
+
+    transport = _DetailTransport()
+    original = httpx.AsyncClient
+
+    def _factory(*args, **kwargs):
+        if "transport" not in kwargs and not args:
+            kwargs["transport"] = transport
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr("app.services.feishu.task_runner.httpx.AsyncClient", _factory)
+    monkeypatch.setattr("app.services.feishu.app_client.httpx.AsyncClient", _factory)
+
+    rec = await submit_pipeline_run(
+        chat_id="oc_det", sender_open_id="ou_det", settings=_settings()
+    )
+    assert rec._asyncio_task is not None
+    await rec._asyncio_task
+    assert rec.status == "failed"
+    # — 真实异常类型应该穿透到 bot,而不是被吞成 "Internal Server Error"
+    assert rec.error and "OpenAIError" in rec.error
+    assert rec.error and "Rate limit" in rec.error
+    assert "HTTP 500" in rec.error
+
+
+@pytest.mark.asyncio
+async def test_pipeline_500_with_only_detail_message(monkeypatch) -> None:
+    """prod 环境 exception_handler 只返回 ``{"detail": "..."}`` — 也得能抠出来。"""
+
+    class _ProdTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/api/internal/pipeline/run"):
+                return httpx.Response(
+                    500,
+                    json={"detail": "Internal Server Error"},
+                    request=request,
+                )
+            if request.url.path.endswith("/auth/v3/tenant_access_token/internal"):
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "tenant_access_token": "tok-y", "expire": 7200},
+                    request=request,
+                )
+            if request.url.path.endswith("/im/v1/messages"):
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"message_id": "om_prod"}},
+                    request=request,
+                )
+            return httpx.Response(404, request=request)
+
+    transport = _ProdTransport()
+    original = httpx.AsyncClient
+
+    def _factory(*args, **kwargs):
+        if "transport" not in kwargs and not args:
+            kwargs["transport"] = transport
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr("app.services.feishu.task_runner.httpx.AsyncClient", _factory)
+    monkeypatch.setattr("app.services.feishu.app_client.httpx.AsyncClient", _factory)
+
+    rec = await submit_pipeline_run(
+        chat_id="oc_prod", sender_open_id="ou_prod", settings=_settings()
+    )
+    assert rec._asyncio_task is not None
+    await rec._asyncio_task
+    assert rec.status == "failed"
+    # — prod 模式安全:detail 还是 "Internal Server Error",不会泄漏内部信息
+    assert rec.error and "HTTP 500" in rec.error
